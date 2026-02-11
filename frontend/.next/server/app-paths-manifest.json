@@ -1,7 +1,0 @@
-{
-  "/dashboard/page": "app/dashboard/page.js",
-  "/dashboard/settings/page": "app/dashboard/settings/page.js",
-  "/dashboard/bulk-message/page": "app/dashboard/bulk-message/page.js",
-  "/dashboard/file-forward/page": "app/dashboard/file-forward/page.js",
-  "/dashboard/chatbot/page": "app/dashboard/chatbot/page.js"
-}
