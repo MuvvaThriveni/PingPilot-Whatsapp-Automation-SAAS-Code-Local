@@ -4,7 +4,7 @@ import datetime
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from store import settings_store, chatbot_settings, message_logs, conversations
+from store import settings_store, chatbot_settings, save_conversation, save_message_log
 from services.whatsapp import WhatsAppService
 from services.chatgpt import get_chatgpt_service
 
@@ -46,7 +46,8 @@ async def handle_webhook(body: dict):
                 message_text = message.get("text", {}).get("body", "")
                 now = datetime.datetime.now().isoformat()
 
-                conversations.append({
+                # Save incoming message to Firebase
+                save_conversation({
                     "sender_phone": sender_phone,
                     "sender_name": sender_name,
                     "message_text": message_text,
@@ -73,15 +74,17 @@ async def handle_webhook(body: dict):
                         settings_store["access_token"],
                     )
                     result = await whatsapp.send_text_message(sender_phone, response_text)
+                    print(f"[WEBHOOK] Send result to={sender_phone}: {result}")
 
-                    conversations.append({
+                    # Save outgoing message to Firebase
+                    save_conversation({
                         "sender_phone": sender_phone,
                         "sender_name": sender_name,
                         "message_text": response_text,
                         "direction": "outgoing",
                         "created_at": datetime.datetime.now().isoformat(),
                     })
-                    message_logs.append({
+                    save_message_log({
                         "product_type": "chatbot",
                         "recipient": sender_phone,
                         "message_id": result.get("messageId"),

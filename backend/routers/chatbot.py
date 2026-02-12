@@ -99,3 +99,45 @@ async def get_conversations():
             conversations, key=lambda x: x.get("created_at", ""), reverse=True
         )[:100]
     }
+
+
+@router.get("/users")
+async def get_chat_users():
+    """Get list of unique users with their latest message."""
+    users_map = {}
+    for conv in conversations:
+        phone = conv.get("sender_phone", "")
+        if not phone:
+            continue
+        if phone not in users_map:
+            users_map[phone] = {
+                "phone": phone,
+                "name": conv.get("sender_name", "Unknown"),
+                "last_message": conv.get("message_text", ""),
+                "last_message_at": conv.get("created_at", ""),
+                "direction": conv.get("direction", "incoming"),
+            }
+        else:
+            # Update if this message is newer
+            if conv.get("created_at", "") > users_map[phone]["last_message_at"]:
+                users_map[phone]["last_message"] = conv.get("message_text", "")
+                users_map[phone]["last_message_at"] = conv.get("created_at", "")
+                users_map[phone]["direction"] = conv.get("direction", "incoming")
+            # Update name if we have a better one
+            if conv.get("sender_name") and conv.get("sender_name") != "Unknown":
+                users_map[phone]["name"] = conv.get("sender_name")
+    
+    # Sort by last message time (newest first)
+    users_list = sorted(users_map.values(), key=lambda x: x["last_message_at"], reverse=True)
+    return {"users": users_list}
+
+
+@router.get("/conversations/{phone}")
+async def get_user_conversations(phone: str):
+    """Get all conversations for a specific user."""
+    user_convs = [c for c in conversations if c.get("sender_phone") == phone]
+    return {
+        "conversations": sorted(
+            user_convs, key=lambda x: x.get("created_at", ""), reverse=False
+        )
+    }

@@ -80,6 +80,8 @@ export const chatbot = {
     api.put(`/chatbot/rules/${id}`, data),
   deleteRule: (id: number) => api.delete(`/chatbot/rules/${id}`),
   getConversations: () => api.get('/chatbot/conversations'),
+  getUsers: () => api.get('/chatbot/users'),
+  getUserConversations: (phone: string) => api.get(`/chatbot/conversations/${phone}`),
 };
 
 export const logs = {
