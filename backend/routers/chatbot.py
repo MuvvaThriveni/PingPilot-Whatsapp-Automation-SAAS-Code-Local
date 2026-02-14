@@ -1,14 +1,27 @@
-"""Chatbot routes – auto-reply settings, rules, and conversations."""
+"""Chatbot routes – auto-reply settings, rules, and conversations (Phase-3: multi-tenant)."""
 
 import datetime
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 
-from store import chatbot_settings, chatbot_rules, conversations, save_to_disk
+from store import get_chatbot_settings as _get_chatbot_settings, save_chatbot_settings as _save_chatbot_settings, get_chatbot_rules as _get_chatbot_rules
+from db_layer.chatbot import chatbot_rules as _db_rules
+from db_layer.chat_messages import chat_messages as _db_chat_messages
 
 router = APIRouter(prefix="/api/chatbot", tags=["chatbot"])
+
+
+def _remap_chat_msg(m: dict) -> dict:
+    """Remap db_layer chat_messages fields to legacy API format."""
+    return {
+        "sender_phone": m.get("contact_phone", ""),
+        "sender_name": m.get("contact_name", "Unknown"),
+        "message_text": m.get("message_text", ""),
+        "direction": m.get("direction", ""),
+        "created_at": m.get("created_at", ""),
+    }
 
 
 class ChatbotSettingsModel(BaseModel):
@@ -27,85 +40,109 @@ class ChatbotRuleModel(BaseModel):
 
 
 @router.get("/settings")
-async def get_chatbot_settings():
-    return {"settings": chatbot_settings}
+async def get_chatbot_settings(request: Request):
+    tenant_id = request.state.tenant_id
+    return {"settings": _get_chatbot_settings(tenant_id)}
 
 
 @router.put("/settings")
-async def update_chatbot_settings(data: ChatbotSettingsModel):
-    chatbot_settings["is_enabled"] = data.is_enabled
-    chatbot_settings["fallback_message"] = data.fallback_message
+async def update_chatbot_settings(request: Request, data: ChatbotSettingsModel):
+    tenant_id = request.state.tenant_id
+    current = _get_chatbot_settings(tenant_id)
+    current["is_enabled"] = data.is_enabled
+    current["fallback_message"] = data.fallback_message
     if data.use_ai is not None:
-        chatbot_settings["use_ai"] = data.use_ai
+        current["use_ai"] = data.use_ai
     if data.ai_system_prompt is not None:
-        chatbot_settings["ai_system_prompt"] = data.ai_system_prompt
+        current["ai_system_prompt"] = data.ai_system_prompt
     if data.openai_api_key is not None:
-        chatbot_settings["openai_api_key"] = data.openai_api_key.strip()
-    save_to_disk()
+        current["openai_api_key"] = data.openai_api_key.strip()
+    _save_chatbot_settings(tenant_id, current)
     return {"success": True, "message": "Settings updated"}
 
 
 @router.get("/rules")
-async def get_chatbot_rules():
-    return {"rules": chatbot_rules}
+async def get_chatbot_rules(request: Request):
+    tenant_id = request.state.tenant_id
+    rules = _get_chatbot_rules(tenant_id)
+    return {"rules": rules}
 
 
 @router.post("/rules")
-async def create_chatbot_rule(rule: ChatbotRuleModel):
+async def create_chatbot_rule(request: Request, rule: ChatbotRuleModel):
+    tenant_id = request.state.tenant_id
+    existing_rules = _get_chatbot_rules(tenant_id)
+    max_id = max((r.get("id", 0) for r in existing_rules), default=0)
     new_rule = {
-        "id": (max((r["id"] for r in chatbot_rules), default=0)) + 1,
+        "id": max_id + 1,
         "keyword": rule.keyword.lower().strip(),
         "response": rule.response,
         "priority": rule.priority,
         "is_active": 1,
         "created_at": datetime.datetime.now().isoformat(),
     }
-    chatbot_rules.append(new_rule)
-    save_to_disk()
-    return {"rule": new_rule}
+    result = _db_rules.create(tenant_id, new_rule)
+    return {"rule": result}
 
 
 @router.put("/rules/{rule_id}")
-async def update_chatbot_rule(rule_id: int, rule: ChatbotRuleModel):
-    existing = next((r for r in chatbot_rules if r["id"] == rule_id), None)
+async def update_chatbot_rule(request: Request, rule_id: int, rule: ChatbotRuleModel):
+    tenant_id = request.state.tenant_id
+    existing_rules = _get_chatbot_rules(tenant_id)
+    existing = next((r for r in existing_rules if r.get("id") == rule_id), None)
     if not existing:
         return JSONResponse(status_code=404, content={"error": "Rule not found"})
 
-    existing["keyword"] = rule.keyword.lower().strip()
-    existing["response"] = rule.response
-    existing["priority"] = rule.priority
+    doc_id = existing.get("_doc_id")
+    if not doc_id:
+        return JSONResponse(status_code=404, content={"error": "Rule not found in Firestore"})
+
+    update_data = {
+        "keyword": rule.keyword.lower().strip(),
+        "response": rule.response,
+        "priority": rule.priority,
+    }
     if rule.is_active is not None:
-        existing["is_active"] = 1 if rule.is_active else 0
-    save_to_disk()
+        update_data["is_active"] = 1 if rule.is_active else 0
+
+    _db_rules.update(doc_id, update_data)
+
+    # Return the merged rule for API compat
+    existing.update(update_data)
     return {"rule": existing}
 
 
 @router.delete("/rules/{rule_id}")
-async def delete_chatbot_rule(rule_id: int):
-    global chatbot_rules
-    idx = next((i for i, r in enumerate(chatbot_rules) if r["id"] == rule_id), None)
-    if idx is None:
+async def delete_chatbot_rule(request: Request, rule_id: int):
+    tenant_id = request.state.tenant_id
+    existing_rules = _get_chatbot_rules(tenant_id)
+    existing = next((r for r in existing_rules if r.get("id") == rule_id), None)
+    if not existing:
         return JSONResponse(status_code=404, content={"error": "Rule not found"})
-    from store import chatbot_rules as cr
-    cr.pop(idx)
-    save_to_disk()
+
+    doc_id = existing.get("_doc_id")
+    if doc_id:
+        _db_rules.delete(doc_id)
+
     return {"success": True, "message": "Rule deleted"}
 
 
 @router.get("/conversations")
-async def get_conversations():
-    return {
-        "conversations": sorted(
-            conversations, key=lambda x: x.get("created_at", ""), reverse=True
-        )[:100]
-    }
+async def get_conversations(request: Request, limit: int = 50, cursor: str = None):
+    tenant_id = request.state.tenant_id
+    db_msgs, next_cursor = _db_chat_messages.get_conversation_list(tenant_id, limit=limit, cursor=cursor)
+    return {"conversations": [_remap_chat_msg(m) for m in db_msgs], "next_cursor": next_cursor}
 
 
 @router.get("/users")
-async def get_chat_users():
+async def get_chat_users(request: Request):
     """Get list of unique users with their latest message."""
+    tenant_id = request.state.tenant_id
+    raw, _ = _db_chat_messages.get_conversation_list(tenant_id, limit=500)
+    source = [_remap_chat_msg(m) for m in raw]
+
     users_map = {}
-    for conv in conversations:
+    for conv in source:
         phone = conv.get("sender_phone", "")
         if not phone:
             continue
@@ -118,26 +155,20 @@ async def get_chat_users():
                 "direction": conv.get("direction", "incoming"),
             }
         else:
-            # Update if this message is newer
             if conv.get("created_at", "") > users_map[phone]["last_message_at"]:
                 users_map[phone]["last_message"] = conv.get("message_text", "")
                 users_map[phone]["last_message_at"] = conv.get("created_at", "")
                 users_map[phone]["direction"] = conv.get("direction", "incoming")
-            # Update name if we have a better one
             if conv.get("sender_name") and conv.get("sender_name") != "Unknown":
                 users_map[phone]["name"] = conv.get("sender_name")
     
-    # Sort by last message time (newest first)
     users_list = sorted(users_map.values(), key=lambda x: x["last_message_at"], reverse=True)
     return {"users": users_list}
 
 
 @router.get("/conversations/{phone}")
-async def get_user_conversations(phone: str):
+async def get_user_conversations(request: Request, phone: str, limit: int = 100, cursor: str = None):
     """Get all conversations for a specific user."""
-    user_convs = [c for c in conversations if c.get("sender_phone") == phone]
-    return {
-        "conversations": sorted(
-            user_convs, key=lambda x: x.get("created_at", ""), reverse=False
-        )
-    }
+    tenant_id = request.state.tenant_id
+    db_msgs, next_cursor = _db_chat_messages.get_user_messages(tenant_id, phone, limit=limit, cursor=cursor)
+    return {"conversations": [_remap_chat_msg(m) for m in db_msgs], "next_cursor": next_cursor}

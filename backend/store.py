@@ -1,11 +1,23 @@
-"""Shared data store for WappFlow – settings persist to Firebase Firestore."""
+"""Shared data store for WappFlow – Multi-tenant Firestore-only (Phase-3).
 
-import json
+All reads and writes go exclusively through db_layer.
+Every function requires an explicit `tenant_id` parameter derived from
+the authenticated Firebase Auth UID (set by auth_middleware).
+
+The only runtime state is `active_campaigns` — an ephemeral dict used to signal
+stop requests to in-flight campaign tasks within a single process.  It is NOT
+persisted; campaign resume after restart is handled via Firestore campaign status.
+"""
+
 import os
-from typing import List, Dict
-from firebase_config import get_db
+from typing import Dict
 
-_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
+# db_layer imports — sole Firestore abstraction
+from db_layer.tenants import tenants as _db_tenants
+from db_layer.chatbot import chatbot_config as _db_chatbot_config, chatbot_rules as _db_chatbot_rules
+from db_layer.chat_messages import chat_messages as _db_chat_messages
+from db_layer.messages import messages as _db_messages
+from db_layer.secrets import secrets as _secrets
 
 _DEFAULT_SETTINGS: Dict = {
     "business_account_id": "",
@@ -24,150 +36,76 @@ _DEFAULT_CHATBOT: Dict = {
 }
 
 
-def _load_from_firestore(collection: str, doc_id: str, defaults: Dict) -> Dict:
-    """Load document from Firestore, falling back to defaults."""
-    db = get_db()
-    if db:
-        try:
-            doc = db.collection(collection).document(doc_id).get()
-            if doc.exists:
-                return {**defaults, **doc.to_dict()}
-        except Exception as e:
-            print(f"[WARN] Failed to load {collection}/{doc_id} from Firestore: {e}")
-    return dict(defaults)
+# ── Accessor functions (Firestore-only, tenant-scoped) ──
 
-
-def _load_list_from_firestore(collection: str) -> List[dict]:
-    """Load all documents from a Firestore collection as a list."""
-    db = get_db()
-    if db:
-        try:
-            docs = db.collection(collection).stream()
-            return [doc.to_dict() for doc in docs]
-        except Exception as e:
-            print(f"[WARN] Failed to load {collection} from Firestore: {e}")
-    return []
-
-
-def _load_settings() -> Dict:
-    """Load settings from Firestore, falling back to local file then defaults."""
-    # Try Firestore first
-    result = _load_from_firestore("config", "settings", _DEFAULT_SETTINGS)
-    if result != _DEFAULT_SETTINGS:
-        return result
-    
-    # Fallback to local file
-    if os.path.exists(_SETTINGS_FILE):
-        try:
-            with open(_SETTINGS_FILE, "r") as f:
-                data = json.load(f)
-            merged = {**_DEFAULT_SETTINGS, **data.get("settings", {})}
-            return merged
-        except Exception:
-            pass
+def get_settings(tenant_id: str) -> Dict:
+    """Read WhatsApp settings for a specific tenant from Firestore."""
+    tenant = _db_tenants.get(tenant_id)
+    if tenant:
+        return {
+            "business_account_id": tenant.get("business_account_id", ""),
+            "phone_number_id": tenant.get("phone_number_id", ""),
+            "access_token": _secrets.resolve_wa_token(tenant),
+            "webhook_verify_token": tenant.get("webhook_verify_token", ""),
+            "is_configured": tenant.get("is_configured", False),
+        }
     return dict(_DEFAULT_SETTINGS)
 
 
-def _load_chatbot() -> Dict:
-    """Load chatbot settings from Firestore, falling back to local file then defaults."""
-    result = _load_from_firestore("config", "chatbot", _DEFAULT_CHATBOT)
-    if result != _DEFAULT_CHATBOT:
-        return result
-    
-    if os.path.exists(_SETTINGS_FILE):
-        try:
-            with open(_SETTINGS_FILE, "r") as f:
-                data = json.load(f)
-            return {**_DEFAULT_CHATBOT, **data.get("chatbot", {})}
-        except Exception:
-            pass
+def get_chatbot_settings(tenant_id: str) -> Dict:
+    """Read chatbot config for a specific tenant from Firestore."""
+    cfg = _db_chatbot_config.get(tenant_id)
+    if cfg:
+        return {
+            "is_enabled": cfg.get("is_enabled", False),
+            "fallback_message": cfg.get("fallback_message", _DEFAULT_CHATBOT["fallback_message"]),
+            "use_ai": cfg.get("use_ai", True),
+            "ai_system_prompt": cfg.get("ai_system_prompt", _DEFAULT_CHATBOT["ai_system_prompt"]),
+            "openai_api_key": _secrets.resolve_openai_key(cfg),
+        }
     return dict(_DEFAULT_CHATBOT)
 
 
-def _load_chatbot_rules() -> List[dict]:
-    """Load chatbot rules from Firestore."""
-    rules = _load_list_from_firestore("chatbot_rules")
-    if rules:
-        return rules
-    
-    if os.path.exists(_SETTINGS_FILE):
-        try:
-            with open(_SETTINGS_FILE, "r") as f:
-                data = json.load(f)
-            return data.get("chatbot_rules", [])
-        except Exception:
-            pass
-    return []
+def get_chatbot_rules(tenant_id: str) -> list:
+    """Read chatbot rules for a specific tenant from Firestore."""
+    return _db_chatbot_rules.list(tenant_id)
 
 
-def _load_conversations() -> List[dict]:
-    """Load conversations from Firestore."""
-    db = get_db()
-    if db:
-        try:
-            docs = db.collection("conversations").order_by("created_at").limit(500).stream()
-            return [doc.to_dict() for doc in docs]
-        except Exception as e:
-            print(f"[WARN] Failed to load conversations from Firestore: {e}")
-    return []
+# ── Write functions (Firestore-only via db_layer, tenant-scoped) ──
+
+def save_settings(tenant_id: str, settings_data: Dict):
+    """Persist WhatsApp settings for a tenant. Secrets stored as refs."""
+    access_token = settings_data.get("access_token", "")
+    _db_tenants.upsert(tenant_id, {
+        "business_account_id": settings_data.get("business_account_id", ""),
+        "phone_number_id": settings_data.get("phone_number_id", ""),
+        "webhook_verify_token": settings_data.get("webhook_verify_token", ""),
+        "is_configured": settings_data.get("is_configured", False),
+        "token_ref": _secrets.make_ref(f"WHATSAPP_ACCESS_TOKEN_{tenant_id}"),
+    })
+    # Set env var so resolve works immediately in this process
+    if access_token:
+        os.environ[f"WHATSAPP_ACCESS_TOKEN_{tenant_id}"] = access_token
+    print(f"[STORE] save_settings tenant={tenant_id} → firestore")
 
 
-def save_to_disk():
-    """Persist current settings, chatbot config to Firestore (and local backup)."""
-    db = get_db()
-    
-    # Save to Firestore
-    if db:
-        try:
-            db.collection("config").document("settings").set(dict(settings_store))
-            db.collection("config").document("chatbot").set(dict(chatbot_settings))
-            print("[INFO] Saved to Firestore")
-        except Exception as e:
-            print(f"[WARN] Failed to save to Firestore: {e}")
-    
-    # Also save local backup
-    data = {
-        "settings": {k: v for k, v in settings_store.items()},
-        "chatbot": {k: v for k, v in chatbot_settings.items()},
-        "chatbot_rules": chatbot_rules,
-    }
-    try:
-        with open(_SETTINGS_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"[WARN] Failed to save local backup: {e}")
+def save_chatbot_settings(tenant_id: str, chatbot_data: Dict):
+    """Persist chatbot config for a tenant."""
+    openai_key = chatbot_data.get("openai_api_key", "")
+    _db_chatbot_config.upsert(tenant_id, {
+        "is_enabled": chatbot_data.get("is_enabled", False),
+        "fallback_message": chatbot_data.get("fallback_message", ""),
+        "use_ai": chatbot_data.get("use_ai", True),
+        "ai_system_prompt": chatbot_data.get("ai_system_prompt", ""),
+        "openai_key_ref": _secrets.make_ref(f"OPENAI_API_KEY_{tenant_id}"),
+    })
+    if openai_key:
+        os.environ[f"OPENAI_API_KEY_{tenant_id}"] = openai_key
+    print(f"[STORE] save_chatbot_settings tenant={tenant_id} → firestore")
 
 
-def save_conversation(conv: dict):
-    """Save a single conversation to Firestore."""
-    db = get_db()
-    if db:
-        try:
-            db.collection("conversations").add(conv)
-        except Exception as e:
-            print(f"[WARN] Failed to save conversation to Firestore: {e}")
-    # Also keep in memory
-    conversations.append(conv)
-
-
-def save_message_log(log: dict):
-    """Save a message log to Firestore."""
-    db = get_db()
-    if db:
-        try:
-            db.collection("message_logs").add(log)
-        except Exception as e:
-            print(f"[WARN] Failed to save message log to Firestore: {e}")
-    message_logs.append(log)
-
-
-# Initialize from Firestore (with local fallback)
-settings_store: Dict = _load_settings()
-chatbot_settings: Dict = _load_chatbot()
-chatbot_rules: List[dict] = _load_chatbot_rules()
-conversations: List[dict] = _load_conversations()
-
-message_logs: List[dict] = []
-bulk_campaigns: List[dict] = []
+# ── Ephemeral runtime state (NOT persisted — process-local only) ──
+# Used to signal stop requests to in-flight campaign asyncio tasks.
+# Campaign resume after restart is handled by querying Firestore for
+# campaigns with status="running".
 active_campaigns: Dict = {}
-template_cache: Dict = {}  # key: "name|lang" -> raw template components from Meta API

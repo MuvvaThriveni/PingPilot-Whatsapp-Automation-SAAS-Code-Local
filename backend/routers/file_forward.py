@@ -1,14 +1,16 @@
-"""File Forwarding routes – single and bulk."""
+"""File Forwarding routes – single and bulk (Phase-3: multi-tenant)."""
 
 import io
 import datetime
 import asyncio
-from fastapi import APIRouter, UploadFile, File, Form
+from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import pandas as pd
 
-from store import settings_store, message_logs
+from store import get_settings
 from services.whatsapp import WhatsAppService
+from db_layer.messages import messages as _db_messages
+from db_layer.usage_events import usage_events as _db_usage
 
 router = APIRouter(prefix="/api/file-forward", tags=["file-forward"])
 
@@ -61,28 +63,30 @@ async def parse_contacts_file(contactsFile: UploadFile = File(...)):
 
 @router.post("/send")
 async def send_file(
+    request: Request,
     file: UploadFile = File(...),
     recipient: str = Form(...),
     message: str = Form(""),
 ):
-    if not settings_store["is_configured"]:
+    tenant_id = request.state.tenant_id
+    settings = get_settings(tenant_id)
+    if not settings["is_configured"]:
         return JSONResponse(
             status_code=400,
             content={"error": "WhatsApp not configured. Please configure in Settings."},
         )
 
-    whatsapp = WhatsAppService(settings_store["phone_number_id"], settings_store["access_token"])
+    whatsapp = WhatsAppService(settings["phone_number_id"], settings["access_token"])
     file_content = await file.read()
     now = datetime.datetime.now().isoformat()
 
     # Step 1: Upload media to WhatsApp
     upload_result = await whatsapp.upload_media(file_content, file.content_type or "application/octet-stream")
     if not upload_result["success"]:
-        message_logs.append({
-            "product_type": "file_forward",
-            "recipient": recipient,
-            "status": "failed",
-            "error_message": upload_result["error"],
+        _db_messages.add(tenant_id, {
+            "direction": "outgoing", "product_type": "file_forward",
+            "contact_phone": recipient, "message_type": "document",
+            "status": "failed", "error_message": upload_result["error"],
             "created_at": now,
         })
         return JSONResponse(status_code=400, content={"error": upload_result["error"]})
@@ -96,25 +100,29 @@ async def send_file(
             recipient, upload_result["mediaId"], file.filename or "file", message
         )
 
+    msg_type = "image" if content_type.startswith("image/") else "document"
+
     if send_result["success"]:
-        message_logs.append({
-            "product_type": "file_forward",
-            "recipient": recipient,
-            "message_id": send_result["messageId"],
-            "status": "sent",
-            "created_at": now,
+        _db_messages.add(tenant_id, {
+            "direction": "outgoing", "product_type": "file_forward",
+            "contact_phone": recipient, "message_type": msg_type,
+            "wa_message_id": send_result["messageId"],
+            "media_id": upload_result["mediaId"],
+            "status": "sent", "created_at": now,
         })
+        _db_usage.record(tenant_id, "message_sent", "file_forward",
+                         contact_phone=recipient)
         return {
             "success": True,
             "message": "File sent successfully",
             "messageId": send_result["messageId"],
         }
 
-    message_logs.append({
-        "product_type": "file_forward",
-        "recipient": recipient,
-        "status": "failed",
-        "error_message": send_result["error"],
+    _db_messages.add(tenant_id, {
+        "direction": "outgoing", "product_type": "file_forward",
+        "contact_phone": recipient, "message_type": msg_type,
+        "media_id": upload_result["mediaId"],
+        "status": "failed", "error_message": send_result["error"],
         "created_at": now,
     })
     return JSONResponse(status_code=400, content={"error": send_result["error"]})
@@ -122,12 +130,15 @@ async def send_file(
 
 @router.post("/send-bulk")
 async def send_file_bulk(
+    request: Request,
     file: UploadFile = File(...),
     contactsFile: UploadFile = File(...),
     message: str = Form(""),
 ):
     """Send a file to multiple recipients from an Excel/CSV contact list."""
-    if not settings_store["is_configured"]:
+    tenant_id = request.state.tenant_id
+    settings = get_settings(tenant_id)
+    if not settings["is_configured"]:
         return JSONResponse(
             status_code=400,
             content={"error": "WhatsApp not configured. Please configure in Settings."},
@@ -148,7 +159,7 @@ async def send_file_bulk(
     if not contacts:
         return JSONResponse(status_code=400, content={"error": "No valid contacts found in file"})
 
-    whatsapp = WhatsAppService(settings_store["phone_number_id"], settings_store["access_token"])
+    whatsapp = WhatsAppService(settings["phone_number_id"], settings["access_token"])
     file_content = await file.read()
     content_type = file.content_type or ""
     file_name = file.filename or "file"
@@ -164,7 +175,6 @@ async def send_file_bulk(
     sent_count = 0
     failed_count = 0
 
-    # Send to all contacts concurrently in batches
     async def send_to_contact(contact):
         nonlocal sent_count, failed_count
         phone = contact["phone"]
@@ -175,23 +185,24 @@ async def send_file_bulk(
         else:
             result = await whatsapp.send_document(phone, media_id, file_name, message)
 
+        msg_type = "image" if is_image else "document"
         if result["success"]:
             sent_count += 1
-            message_logs.append({
-                "product_type": "file_forward_bulk",
-                "recipient": phone,
-                "message_id": result["messageId"],
-                "status": "sent",
-                "created_at": now,
+            _db_messages.add(tenant_id, {
+                "direction": "outgoing", "product_type": "file_forward_bulk",
+                "contact_phone": phone, "message_type": msg_type,
+                "wa_message_id": result["messageId"],
+                "media_id": media_id, "status": "sent", "created_at": now,
             })
+            _db_usage.record(tenant_id, "message_sent", "file_forward_bulk",
+                             contact_phone=phone)
         else:
             failed_count += 1
-            message_logs.append({
-                "product_type": "file_forward_bulk",
-                "recipient": phone,
-                "status": "failed",
-                "error_message": result["error"],
-                "created_at": now,
+            _db_messages.add(tenant_id, {
+                "direction": "outgoing", "product_type": "file_forward_bulk",
+                "contact_phone": phone, "message_type": msg_type,
+                "media_id": media_id, "status": "failed",
+                "error_message": result["error"], "created_at": now,
             })
 
     # Process in batches of 10

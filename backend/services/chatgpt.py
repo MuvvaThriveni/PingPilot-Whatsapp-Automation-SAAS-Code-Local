@@ -1,11 +1,16 @@
-"""ChatGPT service for AI-powered auto-replies."""
+"""ChatGPT service for AI-powered auto-replies (Phase-3: multi-tenant).
+
+Conversation context is always loaded from the Firestore `chat_messages`
+collection via db_layer.  No in-memory persistence — fully stateless,
+safe for multi-worker deployments.
+"""
 
 import os
 import httpx
 from typing import List, Dict
 
-# In-memory conversation history per phone number (session memory)
-_conversation_memory: Dict[str, List[Dict]] = {}
+from db_layer.chat_messages import chat_messages as _db_chat_messages
+
 MAX_MEMORY_MESSAGES = 10  # Keep last 10 messages per conversation
 
 
@@ -21,30 +26,21 @@ class ChatGPTService:
             "If you don't know something, politely say so and offer to connect them with a human agent."
         )
 
-    def _get_conversation_history(self, phone: str) -> List[Dict]:
-        """Get conversation history for a phone number."""
-        return _conversation_memory.get(phone, [])
+    def _get_conversation_history(self, tenant_id: str, phone: str) -> List[Dict]:
+        """Load conversation history from Firestore chat_messages."""
+        try:
+            context = _db_chat_messages.build_ai_context(
+                tenant_id, phone, limit=MAX_MEMORY_MESSAGES
+            )
+            return context or []
+        except Exception as e:
+            print(f"[WARN] Failed to load AI context from Firestore: {e}")
+            return []
 
-    def _add_to_history(self, phone: str, role: str, content: str):
-        """Add a message to conversation history."""
-        if phone not in _conversation_memory:
-            _conversation_memory[phone] = []
-        
-        _conversation_memory[phone].append({"role": role, "content": content})
-        
-        # Keep only last N messages to avoid token limits
-        if len(_conversation_memory[phone]) > MAX_MEMORY_MESSAGES:
-            _conversation_memory[phone] = _conversation_memory[phone][-MAX_MEMORY_MESSAGES:]
-
-    def clear_history(self, phone: str):
-        """Clear conversation history for a phone number."""
-        if phone in _conversation_memory:
-            del _conversation_memory[phone]
-
-    async def get_response(self, phone: str, message: str) -> Dict:
+    async def get_response(self, tenant_id: str, phone: str, message: str) -> Dict:
         """
         Get an AI response for the given message.
-        Maintains conversation context per phone number.
+        Conversation context is loaded from Firestore on every call.
         """
         if not self.api_key:
             return {
@@ -52,12 +48,12 @@ class ChatGPTService:
                 "error": "OpenAI API key not configured. Set OPENAI_API_KEY in environment.",
             }
 
-        # Add user message to history
-        self._add_to_history(phone, "user", message)
-
         # Build messages array with system prompt + conversation history
+        # Note: the incoming user message is already persisted to chat_messages
+        # by the webhook handler BEFORE this method is called, so it will be
+        # included in the context returned by build_ai_context.
         messages = [{"role": "system", "content": self.system_prompt}]
-        messages.extend(self._get_conversation_history(phone))
+        messages.extend(self._get_conversation_history(tenant_id, phone))
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -82,9 +78,6 @@ class ChatGPTService:
                     return {"success": False, "error": f"OpenAI API error: {error_msg}"}
 
                 assistant_message = data["choices"][0]["message"]["content"].strip()
-                
-                # Add assistant response to history
-                self._add_to_history(phone, "assistant", assistant_message)
 
                 return {"success": True, "response": assistant_message}
 

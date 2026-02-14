@@ -4,6 +4,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Phase-4: Fail fast on missing environment configuration
+from startup_checks import validate_environment
+validate_environment(strict=False)
+
 app = FastAPI(title="WappFlow API", version="1.0.0")
 
 # CORS
@@ -14,6 +18,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Firebase Auth middleware — enforces tenant_id on every non-public route
+from auth_middleware import FirebaseAuthMiddleware
+app.add_middleware(FirebaseAuthMiddleware)
 
 # Register routers
 from routers.settings import router as settings_router
