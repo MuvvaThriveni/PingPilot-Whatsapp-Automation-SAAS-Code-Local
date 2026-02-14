@@ -19,6 +19,7 @@ from db_layer.webhook_events import webhook_events as _db_webhook
 from db_layer.chat_messages import chat_messages as _db_chat_messages
 from db_layer.messages import messages as _db_messages
 from db_layer.usage_events import usage_events as _db_usage
+from db_layer.chatbot import chatbot_rules as _db_chatbot_rules
 
 router = APIRouter(prefix="/api/webhook", tags=["webhook"])
 
@@ -159,20 +160,32 @@ async def handle_webhook(body: dict):
 
                 if chatbot["is_enabled"] and settings["is_configured"]:
                     response_text = chatbot["fallback_message"]
+                    matched_rule = False
                     
-                    # Use ChatGPT for AI-powered responses
-                    api_key = chatbot.get("openai_api_key", "")
-                    system_prompt = chatbot.get("ai_system_prompt", "")
-                    if api_key:
-                        chatgpt = get_chatgpt_service(api_key, system_prompt)
-                        ai_result = await chatgpt.get_response(tenant_id, sender_phone, message_text)
-                        if ai_result["success"]:
-                            response_text = ai_result["response"]
-                            _db_usage.record(tenant_id, "ai_reply", "chatbot",
-                                             contact_phone=sender_phone)
-                        else:
-                            log_event("chatgpt_error", tenant_id=tenant_id, phone=sender_phone,
-                                      detail=ai_result['error'], level="WARN")
+                    # Step 1: Check rule-based keyword matches (fast, no API cost)
+                    rules = _db_chatbot_rules.get_active(tenant_id)
+                    message_lower = message_text.lower().strip()
+                    for rule in rules:
+                        keywords = [k.strip().lower() for k in rule.get("keywords", "").split(",") if k.strip()]
+                        if any(kw in message_lower for kw in keywords):
+                            response_text = rule.get("response", chatbot["fallback_message"])
+                            matched_rule = True
+                            break
+                    
+                    # Step 2: Use AI only if no rule matched and use_ai is enabled
+                    if not matched_rule and chatbot.get("use_ai", True):
+                        api_key = chatbot.get("openai_api_key", "")
+                        system_prompt = chatbot.get("ai_system_prompt", "")
+                        if api_key:
+                            chatgpt = get_chatgpt_service(api_key, system_prompt)
+                            ai_result = await chatgpt.get_response(tenant_id, sender_phone, message_text)
+                            if ai_result["success"]:
+                                response_text = ai_result["response"]
+                                _db_usage.record(tenant_id, "ai_reply", "chatbot",
+                                                 contact_phone=sender_phone)
+                            else:
+                                log_event("chatgpt_error", tenant_id=tenant_id, phone=sender_phone,
+                                          detail=ai_result['error'], level="WARN")
 
                     whatsapp = WhatsAppService(
                         settings["phone_number_id"],

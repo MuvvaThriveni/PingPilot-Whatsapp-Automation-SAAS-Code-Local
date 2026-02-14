@@ -47,9 +47,15 @@ class _Secrets:
         ref = tenant_doc.get("token_ref", "")
         resolved = resolve(ref)
         if resolved:
+            # Strip "Bearer " prefix if present (safety for tokens saved before prefix stripping)
+            if resolved.lower().startswith("bearer "):
+                resolved = resolved[7:].strip()
             return resolved
         # Fallback: check legacy field still in memory during migration
-        return tenant_doc.get("access_token", "")
+        token = tenant_doc.get("access_token", "")
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        return token
 
     @staticmethod
     def resolve_openai_key(chatbot_doc: dict) -> str:

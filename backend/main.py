@@ -8,6 +8,10 @@ load_dotenv()
 from startup_checks import validate_environment
 validate_environment(strict=False)
 
+# Initialize Firebase before creating the app (required for auth middleware)
+from firebase_config import init_firebase
+init_firebase()
+
 app = FastAPI(title="WappFlow API", version="1.0.0")
 
 # CORS
