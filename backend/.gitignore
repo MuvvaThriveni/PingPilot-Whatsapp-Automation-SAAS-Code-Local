@@ -2,3 +2,4 @@ settings.json
 __pycache__/
 *.pyc
 firebase-service-account.json
+frontend/.env.local
