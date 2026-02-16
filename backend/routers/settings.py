@@ -1,13 +1,13 @@
-"""Settings routes – WhatsApp Business API configuration."""
+"""Settings routes – WhatsApp Business API configuration (Phase-3: multi-tenant)."""
 
-import datetime
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 
-from store import settings_store, message_logs, save_to_disk
+from store import get_settings, save_settings
 from services.whatsapp import WhatsAppService
+from db_layer.messages import messages as _db_messages
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -20,38 +20,45 @@ class WhatsAppSettings(BaseModel):
 
 
 @router.get("/whatsapp")
-async def get_whatsapp_settings():
+async def get_whatsapp_settings(request: Request):
+    tenant_id = request.state.tenant_id
+    settings = get_settings(tenant_id)
     return {
         "settings": {
-            "business_account_id": settings_store["business_account_id"],
-            "phone_number_id": settings_store["phone_number_id"],
-            "webhook_verify_token": settings_store["webhook_verify_token"],
-            "is_configured": settings_store["is_configured"],
+            "business_account_id": settings["business_account_id"],
+            "phone_number_id": settings["phone_number_id"],
+            "webhook_verify_token": settings["webhook_verify_token"],
+            "is_configured": settings["is_configured"],
         }
     }
 
 
 @router.post("/whatsapp")
-async def save_whatsapp_settings(data: WhatsAppSettings):
+async def save_whatsapp_settings(request: Request, data: WhatsAppSettings):
+    tenant_id = request.state.tenant_id
     access_token = (data.access_token or "").strip()
     if access_token.lower().startswith("bearer "):
         access_token = access_token[7:].strip()
 
-    settings_store["business_account_id"] = (data.business_account_id or "").strip()
-    settings_store["phone_number_id"] = (data.phone_number_id or "").strip()
-    settings_store["access_token"] = access_token
-    settings_store["webhook_verify_token"] = (data.webhook_verify_token or "").strip()
-    settings_store["is_configured"] = True
-    save_to_disk()
+    settings_data = {
+        "business_account_id": (data.business_account_id or "").strip(),
+        "phone_number_id": (data.phone_number_id or "").strip(),
+        "access_token": access_token,
+        "webhook_verify_token": (data.webhook_verify_token or "").strip(),
+        "is_configured": True,
+    }
+    save_settings(tenant_id, settings_data)
     return {"message": "Settings saved successfully"}
 
 
 @router.post("/whatsapp/test")
-async def test_whatsapp_connection():
-    if not settings_store["is_configured"]:
+async def test_whatsapp_connection(request: Request):
+    tenant_id = request.state.tenant_id
+    settings = get_settings(tenant_id)
+    if not settings["is_configured"]:
         return JSONResponse(status_code=400, content={"error": "WhatsApp settings not configured"})
 
-    whatsapp = WhatsAppService(settings_store["phone_number_id"], settings_store["access_token"])
+    whatsapp = WhatsAppService(settings["phone_number_id"], settings["access_token"])
     result = await whatsapp.test_connection()
 
     if result["success"]:
@@ -66,19 +73,6 @@ async def test_whatsapp_connection():
 
 
 @router.get("/usage")
-async def get_usage_stats():
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    today_logs = [l for l in message_logs if l.get("created_at", "").startswith(today)]
-    return {
-        "today": {
-            "total": len(today_logs),
-            "successful": len([l for l in today_logs if l.get("status") in ["sent", "delivered"]]),
-            "failed": len([l for l in today_logs if l.get("status") == "failed"]),
-        },
-        "month": {
-            "total": len(message_logs),
-            "successful": len([l for l in message_logs if l.get("status") in ["sent", "delivered"]]),
-            "failed": len([l for l in message_logs if l.get("status") == "failed"]),
-        },
-        "byProduct": [],
-    }
+async def get_usage_stats(request: Request):
+    tenant_id = request.state.tenant_id
+    return _db_messages.get_usage(tenant_id)

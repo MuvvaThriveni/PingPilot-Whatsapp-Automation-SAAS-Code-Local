@@ -1,38 +1,60 @@
-"""Logs routes – message log retrieval and export."""
+"""Logs routes – message log retrieval and export (Phase-3: multi-tenant)."""
 
 import io
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from store import message_logs
+from db_layer.messages import messages as _db_messages
 
 router = APIRouter(prefix="/api/logs", tags=["logs"])
 
 
+def _remap_db_log(doc: dict) -> dict:
+    """Remap db_layer field names to legacy API format."""
+    return {
+        "product_type": doc.get("product_type", ""),
+        "recipient": doc.get("contact_phone", doc.get("recipient", "")),
+        "message_id": doc.get("wa_message_id", doc.get("message_id", "")),
+        "template_name": doc.get("template_name", ""),
+        "status": doc.get("status", ""),
+        "error_message": doc.get("error_message", ""),
+        "campaign_id": doc.get("campaign_id", ""),
+        "created_at": doc.get("created_at", ""),
+    }
+
+
 @router.get("")
 async def get_logs(
+    request: Request,
     product_type: str = None,
     status: str = None,
-    limit: int = 100,
-    offset: int = 0,
+    limit: int = 25,
+    cursor: str = None,
 ):
-    filtered = message_logs
-    if product_type:
-        filtered = [l for l in filtered if l.get("product_type") == product_type]
-    if status:
-        filtered = [l for l in filtered if l.get("status") == status]
-    sorted_logs = sorted(filtered, key=lambda x: x.get("created_at", ""), reverse=True)
-    paginated = sorted_logs[offset : offset + limit]
-    return {"logs": paginated, "total": len(filtered), "limit": limit, "offset": offset}
+    tenant_id = request.state.tenant_id
+    db_docs, next_cursor = _db_messages.list(tenant_id, product_type=product_type,
+                                              status=status, limit=limit, cursor=cursor)
+    return {
+        "logs": [_remap_db_log(d) for d in db_docs],
+        "total": len(db_docs),
+        "limit": limit,
+        "next_cursor": next_cursor,
+    }
 
 
 @router.get("/export")
-async def export_logs(product_type: str = None, status: str = None):
-    filtered = message_logs
-    if product_type:
-        filtered = [l for l in filtered if l.get("product_type") == product_type]
-    if status:
-        filtered = [l for l in filtered if l.get("status") == status]
+async def export_logs(request: Request, product_type: str = None, status: str = None):
+    tenant_id = request.state.tenant_id
+    # Paginate through up to 5000 records for export
+    all_docs: list[dict] = []
+    cur = None
+    while len(all_docs) < 5000:
+        batch, cur = _db_messages.list(tenant_id, product_type=product_type,
+                                       status=status, limit=100, cursor=cur)
+        all_docs.extend(batch)
+        if not cur:
+            break
+    filtered = [_remap_db_log(d) for d in all_docs]
 
     headers = [
         "Product Type", "Recipient", "Message ID", "Template",
@@ -61,9 +83,7 @@ async def export_logs(product_type: str = None, status: str = None):
 
 
 @router.get("/stats")
-async def get_log_stats():
-    stats = {}
-    for log in message_logs:
-        key = f"{log.get('product_type', 'unknown')}_{log.get('status', 'unknown')}"
-        stats[key] = stats.get(key, 0) + 1
-    return {"stats": stats, "dailyStats": []}
+async def get_log_stats(request: Request):
+    tenant_id = request.state.tenant_id
+    db_stats = _db_messages.get_stats(tenant_id)
+    return {"stats": db_stats, "dailyStats": []}
