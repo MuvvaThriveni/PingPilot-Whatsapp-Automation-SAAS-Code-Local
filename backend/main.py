@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from starlette.middleware import Middleware
 
 load_dotenv()
 
@@ -12,20 +13,28 @@ validate_environment(strict=False)
 from firebase_config import init_firebase
 init_firebase()
 
-app = FastAPI(title="WappFlow API", version="1.0.0")
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Firebase Auth middleware — enforces tenant_id on every non-public route
 from auth_middleware import FirebaseAuthMiddleware
-app.add_middleware(FirebaseAuthMiddleware)
+
+origins = [
+    "https://wappflow-1.onrender.com",
+    "http://localhost:3000",
+]
+
+app = FastAPI(
+    title="WappFlow API",
+    version="1.0.0",
+    middleware=[
+        Middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        ),
+        Middleware(FirebaseAuthMiddleware),
+    ],
+)
 
 # Register routers
 from routers.settings import router as settings_router
