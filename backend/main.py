@@ -14,14 +14,21 @@ init_firebase()
 
 app = FastAPI(title="WappFlow API", version="1.0.0")
 
-# CORS
+
+#CORS
+origins = [
+    "https://wappflow-1.onrender.com/",
+    "http://localhost:3000",  # keep for local dev
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Firebase Auth middleware — enforces tenant_id on every non-public route
 from auth_middleware import FirebaseAuthMiddleware
