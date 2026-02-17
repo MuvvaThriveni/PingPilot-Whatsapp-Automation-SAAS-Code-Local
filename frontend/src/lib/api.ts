@@ -1,7 +1,28 @@
 import axios from 'axios';
 import { auth } from '@/lib/firebase';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api';
+export const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
+
+const normalizeApiBaseUrl = (baseUrl: string) => {
+  let url = (baseUrl || '').trim();
+  if (!url) {
+    return 'http://localhost:5000/api';
+  }
+
+  url = url.replace(/\/+$/, '');
+  if (url.endsWith('/docs')) {
+    url = url.slice(0, -'/docs'.length);
+    url = url.replace(/\/+$/, '');
+  }
+
+  if (url.endsWith('/api')) {
+    return url;
+  }
+
+  return `${url}/api`;
+};
+
+const API_URL = normalizeApiBaseUrl(API);
 
 const api = axios.create({
   baseURL: API_URL,
