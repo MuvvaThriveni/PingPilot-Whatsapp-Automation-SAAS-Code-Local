@@ -1,7 +1,8 @@
-"""Firestore data access layer for WappFlow.
+"""Firestore data access layer for WappFlow (Phase-5: cached).
 
 All Firestore reads/writes go through this module.
 Uses the existing firebase_config.get_db() client — does NOT reinitialize Firebase.
+Reads are cached via the centralized cache module to reduce quota usage.
 """
 
 from db_layer.tenants import tenants

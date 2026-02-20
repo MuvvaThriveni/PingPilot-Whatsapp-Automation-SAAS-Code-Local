@@ -51,7 +51,6 @@ export default function BulkMessagePage() {
   const [activeCampaignId, setActiveCampaignId] = useState<string | null>(null)
   const [templates, setTemplates] = useState<Template[]>([])
   const [loadingTemplates, setLoadingTemplates] = useState(false)
-  const [headerImageUrl, setHeaderImageUrl] = useState('')
   const selectedTemplate = templates.find(t => t.display === templateName)
   const templateHasParams = selectedTemplate && selectedTemplate.param_count > 0
 
@@ -67,7 +66,7 @@ export default function BulkMessagePage() {
         try {
           const res = await bulkMessage.status(activeCampaignId)
           const campaign = res.data.campaign
-          setCampaigns(prev => prev.map(c => 
+          setCampaigns(prev => prev.map(c =>
             c.campaign_id === activeCampaignId ? campaign : c
           ))
           if (campaign.status !== 'running') {
@@ -143,12 +142,6 @@ export default function BulkMessagePage() {
       toast({ title: 'Error', description: 'Please upload a file and enter template name', variant: 'destructive' })
       return
     }
-    
-    // Require image URL for templates with parameters
-    if (templateHasParams && !headerImageUrl.trim()) {
-      toast({ title: 'Error', description: 'Please provide a header image URL for this template', variant: 'destructive' })
-      return
-    }
 
     setLoading(true)
 
@@ -158,22 +151,18 @@ export default function BulkMessagePage() {
       formData.append('templateName', templateName)
       formData.append('campaignName', campaignName || `Campaign ${new Date().toLocaleDateString()}`)
       formData.append('delayMs', delayMs)
-      if (headerImageUrl) {
-        formData.append('headerImageUrl', headerImageUrl)
-      }
 
       const res = await bulkMessage.start(formData)
       setActiveCampaignId(res.data.campaignId)
-      
+
       toast({ title: 'Campaign started', description: `Sending to ${res.data.totalContacts} contacts` })
-      
+
       setFile(null)
       setContacts([])
       setTotalContacts(0)
       setTemplateName('')
       setCampaignName('')
-      setHeaderImageUrl('')
-      
+
       fetchCampaigns()
     } catch (error: any) {
       toast({
@@ -313,22 +302,6 @@ export default function BulkMessagePage() {
               )}
             </div>
 
-            {/* Header Image URL for templates with IMAGE header */}
-            {templateHasParams && (
-              <div className="space-y-2">
-                <Label htmlFor="headerImageUrl">Header Image URL (Required)</Label>
-                <Input
-                  id="headerImageUrl"
-                  placeholder="https://example.com/image.jpg"
-                  value={headerImageUrl}
-                  onChange={(e) => setHeaderImageUrl(e.target.value)}
-                />
-                <p className="text-xs text-amber-600">
-                  This template requires an image. Provide a publicly accessible image URL.
-                </p>
-              </div>
-            )}
-
             {/* Campaign Name */}
             <div className="space-y-2">
               <Label htmlFor="campaignName">Campaign Name (Optional)</Label>
@@ -357,8 +330,8 @@ export default function BulkMessagePage() {
             </div>
 
             {/* Start Button */}
-            <Button 
-              className="w-full" 
+            <Button
+              className="w-full"
               onClick={handleStartCampaign}
               disabled={loading || !file || !templateName}
             >
@@ -439,8 +412,8 @@ export default function BulkMessagePage() {
                       {campaign.sent_count + campaign.failed_count} / {campaign.total_contacts}
                     </div>
                     {campaign.status === 'running' && (
-                      <Button 
-                        variant="outline" 
+                      <Button
+                        variant="outline"
                         size="sm"
                         onClick={() => handleStopCampaign(campaign.campaign_id)}
                       >

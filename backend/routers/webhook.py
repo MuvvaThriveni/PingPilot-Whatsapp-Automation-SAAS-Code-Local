@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-"""Webhook routes – WhatsApp incoming message handling (Phase-3: multi-tenant).
+"""Webhook routes – WhatsApp incoming message handling (Phase-5: cached).
 
 Webhooks are unauthenticated (called by Meta). Tenant is resolved from the
 phone_number_id in the payload via db_layer.tenants.get_by_phone_number_id().
 """
 
+import os
 import datetime
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -20,6 +21,7 @@ from db_layer.chat_messages import chat_messages as _db_chat_messages
 from db_layer.messages import messages as _db_messages
 from db_layer.usage_events import usage_events as _db_usage
 from db_layer.chatbot import chatbot_rules as _db_chatbot_rules
+from cache import cache, chat_users_key
 
 router = APIRouter(prefix="/api/webhook", tags=["webhook"])
 
@@ -35,6 +37,12 @@ def _resolve_tenant_from_payload(value: dict) -> str | None:
     return None
 
 
+# ── Webhook verify token ─────────────────────────────────────────────
+# Set WEBHOOK_VERIFY_TOKEN in your backend .env file.
+# Use the same value in Meta App Dashboard → Webhooks → Verify Token.
+VERIFY_TOKEN: str = os.environ.get("WEBHOOK_VERIFY_TOKEN", "verify123")
+
+
 @router.get("")
 async def verify_webhook(
     hub_mode: str = Query(None, alias="hub.mode"),
@@ -43,15 +51,25 @@ async def verify_webhook(
 ):
     """Verify webhook for Meta/WhatsApp.
 
-    Iterates all tenants to find one whose webhook_verify_token matches.
+    Accepts the token if:
+      1. It matches the hardcoded VERIFY_TOKEN (verify123), OR
+      2. It matches a tenant's webhook_verify_token stored in Firestore.
+
+    Returns the hub.challenge as plain text on success — required by Meta.
     """
     log_event("webhook_verify", detail=f"mode={hub_mode}")
+
     if hub_mode != "subscribe" or not hub_verify_token:
+        log_event("webhook_verify", status="failed", level="WARN",
+                  detail="Missing hub.mode or hub.verify_token")
         return JSONResponse(status_code=403, content={"error": "Verification failed"})
 
-    # Try to find a tenant whose verify token matches
-    from db_layer.tenants import tenants as _t
-    # For verification we need to check all tenants — this is a rare operation
+    # ── Check 1: hardcoded fallback token (always works) ───────────
+    if hub_verify_token == VERIFY_TOKEN:
+        log_event("webhook_verify", status="success", detail="hardcoded token matched")
+        return PlainTextResponse(content=hub_challenge or "")
+
+    # ── Check 2: per-tenant token stored in Firestore ──────────────
     from firebase_config import get_db
     db = get_db()
     if db:
@@ -65,7 +83,8 @@ async def verify_webhook(
         except Exception as e:
             log_event("webhook_verify", level="WARN", detail=str(e))
 
-    log_event("webhook_verify", status="failed", level="WARN")
+    log_event("webhook_verify", status="failed", level="WARN",
+              detail=f"token did not match any tenant")
     return JSONResponse(status_code=403, content={"error": "Verification failed"})
 
 
@@ -113,24 +132,22 @@ async def handle_webhook(body: dict):
                     .get("profile", {})
                     .get("name", "Unknown")
                 )
-                message_text = message.get("text", {}).get("body", "")
+                message_text = message.get("text", {}).get("body", "").strip()
                 now = datetime.datetime.now().isoformat()
 
+                # Skip non-text messages (images, audio, etc.) with no text body
+                if not message_text:
+                    log_event("webhook_skip", tenant_id=tenant_id, detail="non-text or empty message")
+                    continue
+
                 # --- Deduplication check ---
-                if wa_message_id and _db_webhook.exists(wa_message_id, "message"):
+                if wa_message_id and _db_webhook.exists(wa_message_id):
                     log_event("webhook_dedup", tenant_id=tenant_id, phone=sender_phone, detail=wa_message_id)
                     continue
 
-                # Record webhook event (mark not-yet-processed)
+                # Record webhook event for deduplication
                 if wa_message_id:
-                    _db_webhook.record(
-                        tenant_id=tenant_id,
-                        wa_message_id=wa_message_id,
-                        event_type="message",
-                        sender_phone=sender_phone,
-                        raw_payload=message,
-                        processed=False,
-                    )
+                    _db_webhook.record(wa_message_id, tenant_id, {"event_type": "message"})
 
                 # Save incoming message to chat_messages
                 _db_chat_messages.add(tenant_id, {
@@ -158,6 +175,15 @@ async def handle_webhook(body: dict):
                 _db_usage.record(tenant_id, "message_received", "chatbot",
                                  contact_phone=sender_phone, billable=False)
 
+                # Invalidate cached user list so frontend picks up new conversations
+                cache.invalidate(chat_users_key(tenant_id))
+
+                # ── Debug: show decision context ──────────────────────────
+                print(f"[WEBHOOK] chatbot_enabled={chatbot.get('is_enabled')} "
+                      f"is_configured={settings.get('is_configured')} "
+                      f"phone_number_id={settings.get('phone_number_id')!r} "
+                      f"has_token={bool(settings.get('access_token'))}")
+
                 if chatbot["is_enabled"] and settings["is_configured"]:
                     response_text = chatbot["fallback_message"]
                     matched_rule = False
@@ -165,17 +191,21 @@ async def handle_webhook(body: dict):
                     # Step 1: Check rule-based keyword matches (fast, no API cost)
                     rules = _db_chatbot_rules.get_active(tenant_id)
                     message_lower = message_text.lower().strip()
+                    print(f"[WEBHOOK] {len(rules)} active rules, checking: {message_lower!r}")
                     for rule in rules:
-                        keywords = [k.strip().lower() for k in rule.get("keywords", "").split(",") if k.strip()]
-                        if any(kw in message_lower for kw in keywords):
+                        # Field is "keyword" (singular) as stored by chatbot rules
+                        keyword = rule.get("keyword", "").strip().lower()
+                        if keyword and keyword in message_lower:
                             response_text = rule.get("response", chatbot["fallback_message"])
                             matched_rule = True
+                            print(f"[WEBHOOK] keyword rule matched: {keyword!r}")
                             break
                     
                     # Step 2: Use AI only if no rule matched and use_ai is enabled
                     if not matched_rule and chatbot.get("use_ai", True):
                         api_key = chatbot.get("openai_api_key", "")
                         system_prompt = chatbot.get("ai_system_prompt", "")
+                        print(f"[WEBHOOK] no rule matched → use_ai={chatbot.get('use_ai')} has_key={bool(api_key)}")
                         if api_key:
                             chatgpt = get_chatgpt_service(api_key, system_prompt)
                             ai_result = await chatgpt.get_response(tenant_id, sender_phone, message_text)
@@ -184,16 +214,20 @@ async def handle_webhook(body: dict):
                                 _db_usage.record(tenant_id, "ai_reply", "chatbot",
                                                  contact_phone=sender_phone)
                             else:
+                                print(f"[WEBHOOK] AI error: {ai_result['error']}")
                                 log_event("chatgpt_error", tenant_id=tenant_id, phone=sender_phone,
                                           detail=ai_result['error'], level="WARN")
 
+                    print(f"[WEBHOOK] → sending to {sender_phone}: {response_text!r}")
                     whatsapp = WhatsAppService(
                         settings["phone_number_id"],
                         settings["access_token"],
                     )
                     result = await whatsapp.send_text_message(sender_phone, response_text)
+                    print(f"[WEBHOOK] WA API result: {result}")
                     log_event("webhook_reply", tenant_id=tenant_id, phone=sender_phone,
-                              status="sent" if result["success"] else "failed")
+                              status="sent" if result["success"] else "failed",
+                              detail=result.get("error", ""))
 
                     out_now = datetime.datetime.now().isoformat()
 
@@ -223,7 +257,7 @@ async def handle_webhook(body: dict):
 
                 # Mark webhook event as processed
                 if wa_message_id:
-                    _db_webhook.mark_processed(wa_message_id, "message")
+                    _db_webhook.mark_processed(wa_message_id)
 
     return {"status": "ok"}
 

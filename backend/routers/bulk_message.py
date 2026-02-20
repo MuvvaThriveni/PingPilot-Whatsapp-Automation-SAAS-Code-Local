@@ -1,4 +1,4 @@
-"""Bulk WhatsApp Messaging routes (Firestore-first, Phase-2).
+"""Bulk WhatsApp Messaging routes (SQLite-backed).
 
 Mirrors the n8n "WhatsApp Image Marketing Automation" workflow:
   1. Read contacts from uploaded Excel/CSV (columns: Name, Phone Number, ImageURL)
@@ -12,24 +12,28 @@ import re
 import uuid
 import asyncio
 import datetime
+import httpx
 from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import pandas as pd
 
-from store import get_settings, active_campaigns
+from store import get_settings, active_campaigns, add_message
 from services.whatsapp import WhatsAppService
 from observability import log_event
-from db_layer.campaigns import campaigns as _db_campaigns
-from db_layer.campaign_recipients import campaign_recipients as _db_recipients
-from db_layer.campaign_counters import campaign_counters as _db_counters
-from db_layer.messages import messages as _db_messages
-from db_layer.template_cache import template_cache_db as _db_template_cache
-from db_layer.usage_events import usage_events as _db_usage
 
 router = APIRouter(prefix="/api/bulk-message", tags=["bulk-message"])
 
-# Process-local template component cache (rebuilt from Firestore on miss)
+# Process-local template component cache (rebuilt on miss from WhatsApp API)
 _template_components: dict = {}
+
+# Process-local campaign cache for status polling when Firestore is unavailable.
+# Stores recently finished campaigns for a short period to avoid 404s in the UI.
+_recent_campaign_status: dict = {}
+_RECENT_CAMPAIGN_TTL_SECONDS = 60 * 10
+
+# Process-local campaign store (Firestore disabled)
+_local_campaigns: dict[str, dict] = {}
+_local_campaign_counters: dict[str, dict[str, int]] = {}
 
 
 @router.get("/templates")
@@ -57,17 +61,26 @@ async def get_templates(request: Request):
         cache_key = f"{name}|{lang}"
         _template_components[cache_key] = components
 
+        header_format = ""
+        requires_header_media = False
+        has_example_header_media = False
+
         # Count parameters in HEADER and BODY components
         param_count = 0
         for comp in components:
             comp_type = comp.get("type", "")
             if comp_type == "HEADER":
                 fmt = comp.get("format", "TEXT")
+                header_format = fmt
                 if fmt == "TEXT":
                     params = re.findall(r"\{\{\d+\}\}", comp.get("text", ""))
                     param_count += len(params)
                 elif fmt in ("IMAGE", "VIDEO", "DOCUMENT"):
                     param_count += 1
+                    requires_header_media = True
+                    example = comp.get("example", {}) or {}
+                    handle = (example.get("header_handle") or [""])[0]
+                    has_example_header_media = bool((handle or "").strip())
             elif comp_type == "BODY":
                 params = re.findall(r"\{\{\d+\}\}", comp.get("text", ""))
                 param_count += len(params)
@@ -78,44 +91,30 @@ async def get_templates(request: Request):
             "status": status,
             "display": cache_key,
             "param_count": param_count,
+            "header_format": header_format,
+            "requires_header_media": requires_header_media,
+            "has_example_header_media": has_example_header_media,
         })
 
     approved = [t for t in templates if t["status"] == "APPROVED"]
-
-    # Persist template metadata to Firestore
-    try:
-        _db_template_cache.upsert_batch(tenant_id, [
-            {"name": t["name"], "language": t["language"], "status": t["status"],
-             "components": _template_components.get(f"{t['name']}|{t['language']}", []),
-             "param_count": t["param_count"]}
-            for t in approved
-        ])
-    except Exception as e:
-        print(f"[WARN] db_layer template_cache upsert_batch failed: {e}")
 
     return {"templates": approved}
 
 
 def _get_template_components(template_key: str, tenant_id: str = "") -> list:
-    """Get cached template components — process-local first, then Firestore."""
+    """Get cached template components (process-local cache)."""
     if template_key in _template_components:
         return _template_components[template_key]
-    # Firestore fallback
-    if not tenant_id:
-        return []
-    comps = _db_template_cache.get_components(tenant_id, template_key)
-    if comps:
-        _template_components[template_key] = comps
-        print(f"[BULK] Template cache rebuilt from Firestore for '{template_key}'")
-    return comps
+    return []
 
 
-def _build_template_components(template_key: str, contact: dict = None) -> list:
+def _build_template_components(template_key: str, contact: dict = None, header_media_id: str = "") -> list:
     """Auto-build the components array for a template based on cached metadata.
 
-    Inspects the cached template components and fills in parameter placeholders
-    with contact data (name, phone) or the template's own example values as
-    fallback so the user doesn't have to specify them manually.
+    Priority for media headers:
+      1. header_media_id     — pre-uploaded permanent WhatsApp media ID (no URL needed)
+      2. contact imageUrl    — per-contact URL from spreadsheet or headerImageUrl field
+      3. Nothing             — header component is omitted (text-only templates)
     """
     cached = _get_template_components(template_key, contact.get("_tenant_id", "") if contact else "")
     if not cached:
@@ -147,26 +146,51 @@ def _build_template_components(template_key: str, contact: dict = None) -> list:
                         "parameters": parameters,
                     })
             elif header_format == "IMAGE":
-                image_link = (contact or {}).get("imageUrl", "") or (example.get("header_handle") or [""])[0]
-                if image_link:
+                if header_media_id:
+                    # Use pre-uploaded permanent media ID (preferred — no URL expiry issues)
                     components.append({
                         "type": "header",
-                        "parameters": [{"type": "image", "image": {"link": image_link}}],
+                        "parameters": [{"type": "image", "image": {"id": header_media_id}}],
                     })
+                else:
+                    image_link = (contact or {}).get("imageUrl", "").strip()
+                    if image_link:
+                        components.append({
+                            "type": "header",
+                            "parameters": [{"type": "image", "image": {"link": image_link}}],
+                        })
+                    else:
+                        print(f"[BULK] WARNING: Template has IMAGE header but no mediaId or imageUrl. Skipping header component.")
             elif header_format == "VIDEO":
-                video_link = (contact or {}).get("videoUrl", "") or (example.get("header_handle") or [""])[0]
-                if video_link:
+                if header_media_id:
                     components.append({
                         "type": "header",
-                        "parameters": [{"type": "video", "video": {"link": video_link}}],
+                        "parameters": [{"type": "video", "video": {"id": header_media_id}}],
                     })
+                else:
+                    video_link = (contact or {}).get("videoUrl", "").strip()
+                    if video_link:
+                        components.append({
+                            "type": "header",
+                            "parameters": [{"type": "video", "video": {"link": video_link}}],
+                        })
+                    else:
+                        print(f"[BULK] WARNING: Template has VIDEO header but no mediaId or videoUrl. Skipping header component.")
             elif header_format == "DOCUMENT":
-                doc_link = (contact or {}).get("documentUrl", "") or (example.get("header_handle") or [""])[0]
-                if doc_link:
+                if header_media_id:
                     components.append({
                         "type": "header",
-                        "parameters": [{"type": "document", "document": {"link": doc_link}}],
+                        "parameters": [{"type": "document", "document": {"id": header_media_id}}],
                     })
+                else:
+                    doc_link = (contact or {}).get("documentUrl", "").strip()
+                    if doc_link:
+                        components.append({
+                            "type": "header",
+                            "parameters": [{"type": "document", "document": {"link": doc_link}}],
+                        })
+                    else:
+                        print(f"[BULK] WARNING: Template has DOCUMENT header but no mediaId or documentUrl. Skipping header component.")
 
         # BODY component
         elif comp_type == "BODY":
@@ -212,9 +236,20 @@ def _parse_contacts(df):
 
     contacts = []
     for idx, row in df.iterrows():
-        # n8n AI Transform: convert phone number to string, strip non-digits
-        phone = str(row[phone_col]).strip()
-        phone = "".join(filter(str.isdigit, phone))
+        # Excel often stores phone numbers as floats (e.g. 9346775705.0)
+        raw = row[phone_col]
+        if isinstance(raw, float) and raw == int(raw):
+            phone_str = str(int(raw))
+        else:
+            phone_str = str(raw).strip()
+            if phone_str.endswith('.0'):
+                phone_str = phone_str[:-2]
+
+        phone = "".join(filter(str.isdigit, phone_str))
+        # Auto-add India country code for exactly 10-digit mobile numbers
+        if len(phone) == 10 and phone[0] in ('6', '7', '8', '9'):
+            phone = '91' + phone
+
         if len(phone) >= 10:
             contacts.append({
                 "index": idx,
@@ -269,21 +304,18 @@ async def start_bulk_campaign(
 
     campaign_id = str(uuid.uuid4())
 
-    # Create campaign in Firestore (single source of truth)
-    _db_campaigns.create(campaign_id, tenant_id, {
+    now = datetime.datetime.now().isoformat()
+    _local_campaigns[campaign_id] = {
+        "campaign_id": campaign_id,
+        "tenant_id": tenant_id,
         "name": campaignName or f"Campaign {datetime.datetime.now().strftime('%Y-%m-%d')}",
-        "campaign_type": "bulk_template",
         "template_name": templateName,
         "header_image_url": headerImageUrl.strip() if headerImageUrl else "",
         "total_contacts": len(contacts),
         "status": "running",
-        "delay_ms": delayMs,
-        "batch_size": BATCH_SIZE,
-        "last_processed_index": 0,
-    })
-    _db_counters.init_shards(campaign_id)
-    _db_campaigns.update_heartbeat(campaign_id)
-    _db_recipients.create_batch(campaign_id, tenant_id, contacts)
+        "created_at": now,
+    }
+    _local_campaign_counters[campaign_id] = {"sent": 0, "failed": 0}
 
     # Ephemeral process-local state for stop signaling + in-flight data
     active_campaigns[campaign_id] = {
@@ -304,118 +336,190 @@ async def start_bulk_campaign(
 BATCH_SIZE = 10  # send up to 10 messages concurrently per batch
 
 
-async def _send_one(whatsapp: WhatsAppService, contact: dict, template_str: str, campaign_id: str, tenant_id: str, header_image_url: str = ""):
-    """Send a single template message and record the result (Firestore-only)."""
-    if header_image_url and not contact.get("imageUrl"):
-        contact = {**contact, "imageUrl": header_image_url}
-    components = _build_template_components(template_str, contact)
-    result = await whatsapp.send_template_message(
-        contact["phone"], template_str, components=components if components else None
-    )
+async def _send_one(whatsapp: WhatsAppService, contact: dict, template_str: str, campaign_id: str, tenant_id: str, header_image_url: str = "", header_media_id: str = ""):
+    """Send a single template message and record the result (local store only)."""
     phone = contact["phone"]
     now = datetime.datetime.now().isoformat()
+    try:
+        # Priority: per-contact imageUrl > global headerImageUrl field (both as links)
+        if header_image_url and not contact.get("imageUrl"):
+            contact = {**contact, "imageUrl": header_image_url}
+        # Build components — header_media_id (permanent WhatsApp media ID) takes top priority
+        components = _build_template_components(template_str, contact, header_media_id=header_media_id)
+        print(f"[BULK] Sending template='{template_str}' to={phone} components={components}")
+        result = await whatsapp.send_template_message(
+            phone, template_str, components=components if components else None
+        )
+        print(f"[BULK] Result for {phone}: success={result.get('success')} messageId={result.get('messageId')} error={result.get('error')}")
 
-    if result["success"]:
-        _db_messages.add(tenant_id, {
-            "direction": "outgoing",
-            "product_type": "bulk_message",
-            "contact_phone": phone,
-            "message_type": "template",
-            "wa_message_id": result["messageId"],
-            "campaign_id": campaign_id,
-            "status": "sent",
-            "template_name": template_str,
-            "created_at": now,
-        })
-        _db_recipients.update_status(campaign_id, phone, "sent",
-                                     wa_message_id=result["messageId"])
-        _db_counters.increment_sent(campaign_id)
-        _db_usage.record(tenant_id, "message_sent", "bulk_message",
-                         campaign_id=campaign_id, contact_phone=phone)
-    else:
+        if result["success"]:
+            add_message(tenant_id, {
+                "direction": "outgoing",
+                "product_type": "bulk_message",
+                "contact_phone": phone,
+                "message_type": "template",
+                "wa_message_id": result["messageId"],
+                "campaign_id": campaign_id,
+                "status": "sent",
+                "template_name": template_str,
+                "created_at": now,
+            })
+            _local_campaign_counters.setdefault(campaign_id, {"sent": 0, "failed": 0})
+            _local_campaign_counters[campaign_id]["sent"] += 1
+        else:
+            err = result.get("error", "Unknown error")
+            print(f"[BULK] FAILED to send to {phone}: {err}")
+            log_event("send_fail", tenant_id=tenant_id, campaign_id=campaign_id,
+                      phone=phone, detail=err, level="WARN")
+            add_message(tenant_id, {
+                "direction": "outgoing",
+                "product_type": "bulk_message",
+                "contact_phone": phone,
+                "message_type": "template",
+                "campaign_id": campaign_id,
+                "status": "failed",
+                "error_message": err,
+                "template_name": template_str,
+                "created_at": now,
+            })
+            _local_campaign_counters.setdefault(campaign_id, {"sent": 0, "failed": 0})
+            _local_campaign_counters[campaign_id]["failed"] += 1
+    except Exception as exc:
+        print(f"[BULK] EXCEPTION while sending to {phone}: {exc}")
         log_event("send_fail", tenant_id=tenant_id, campaign_id=campaign_id,
-                  phone=phone, detail=result["error"], level="WARN")
-        _db_messages.add(tenant_id, {
+                  phone=phone, detail=str(exc), level="WARN")
+        add_message(tenant_id, {
             "direction": "outgoing",
             "product_type": "bulk_message",
             "contact_phone": phone,
             "message_type": "template",
             "campaign_id": campaign_id,
             "status": "failed",
-            "error_message": result["error"],
+            "error_message": str(exc),
             "template_name": template_str,
             "created_at": now,
         })
-        _db_recipients.update_status(campaign_id, phone, "failed",
-                                     error_message=result["error"])
-        _db_counters.increment_failed(campaign_id)
+        _local_campaign_counters.setdefault(campaign_id, {"sent": 0, "failed": 0})
+        _local_campaign_counters[campaign_id]["failed"] += 1
 
 
 async def _process_campaign(campaign_id: str):
-    """Process a bulk campaign – sends messages in concurrent batches (Firestore-first)."""
+    """Process a bulk campaign – sends messages in concurrent batches (Firestore disabled)."""
     state = active_campaigns.get(campaign_id)
     if not state:
-        print(f"[BULK] Campaign {campaign_id} not found in active_campaigns, checking Firestore for resume")
-        campaign_doc = _db_campaigns.get(campaign_id)
-        if not campaign_doc or campaign_doc.get("status") != "running":
-            return
-        # Resume support: rebuild state from Firestore
-        pending = _db_recipients.get_pending(campaign_id, limit=10000)
-        state = {
-            "running": True,
-            "contacts": [{"phone": r["contact_phone"], "name": r.get("contact_name", ""),
-                          "index": r.get("recipient_index", 0)} for r in pending],
-            "template": campaign_doc.get("template_name", ""),
-            "delay": campaign_doc.get("delay_ms", 1000),
-            "header_image_url": campaign_doc.get("header_image_url", ""),
-            "tenant_id": campaign_doc.get("tenant_id", ""),
-        }
-        active_campaigns[campaign_id] = state
-        log_event("campaign_resume", tenant_id=state.get('tenant_id', ''),
-                 campaign_id=campaign_id, detail=f"pending={len(state['contacts'])}")
+        return
 
     tenant_id = state.get("tenant_id", "")
     settings = get_settings(tenant_id)
-    whatsapp = WhatsAppService(settings["phone_number_id"], settings["access_token"])
     template_str = state["template"]
     contacts = state["contacts"]
 
-    # Ensure template metadata is cached (fetch from Firestore or API if missing)
-    if not _get_template_components(template_str, tenant_id) and settings.get("business_account_id"):
-        result = await whatsapp.get_templates(settings["business_account_id"])
-        if result["success"]:
-            for t in result["templates"]:
+    print(f"[BULK] Starting campaign={campaign_id} template='{template_str}' contacts={len(contacts)} phone_number_id='{settings.get('phone_number_id')}' token_set={bool(settings.get('access_token'))}")
+
+    if not settings.get("phone_number_id") or not settings.get("access_token"):
+        print(f"[BULK] ABORT campaign={campaign_id}: WhatsApp not configured (phone_number_id or access_token missing)")
+        if campaign_id in _local_campaigns:
+            _local_campaigns[campaign_id]["status"] = "failed"
+        active_campaigns.pop(campaign_id, None)
+        return
+
+    whatsapp = WhatsAppService(settings["phone_number_id"], settings["access_token"])
+
+    # Ensure template metadata is cached (fetch from WhatsApp API if missing)
+    if template_str not in _template_components:
+        print(f"[BULK] Template '{template_str}' not in cache — fetching from WhatsApp API...")
+        tmpl_result = await whatsapp.get_templates(settings["business_account_id"])
+        if tmpl_result["success"]:
+            for t in tmpl_result["templates"]:
                 key = f"{t['name']}|{t['language']}"
                 _template_components[key] = t.get("components", [])
+            print(f"[BULK] Cached {len(tmpl_result['templates'])} templates. Target key '{template_str}' found={template_str in _template_components}")
+        else:
+            print(f"[BULK] WARNING: Could not fetch templates: {tmpl_result.get('error')} — sending without components")
+    else:
+        print(f"[BULK] Template '{template_str}' found in cache.")
 
-    # Process contacts in batches of BATCH_SIZE concurrently
-    for i in range(0, len(contacts), BATCH_SIZE):
-        if not active_campaigns.get(campaign_id, {}).get("running"):
-            _db_campaigns.update_status(campaign_id, "stopped")
-            log_event("campaign_stopped", tenant_id=tenant_id, campaign_id=campaign_id)
-            break
+    # ── Auto-upload template header media ────────────────────────────────────────
+    # If the template has an IMAGE/VIDEO/DOCUMENT header with an example image (set
+    # in Meta), we download it once and re-upload via WhatsApp media API to get a
+    # permanent media_id. This is used for ALL sends in this campaign so the user
+    # never needs to provide a URL manually.
+    header_media_id = ""  # will be populated by auto-upload below if template has example media
+    if template_str in _template_components:
+        for comp in _template_components[template_str]:
+            if comp.get("type") == "HEADER" and comp.get("format") in ("IMAGE", "VIDEO", "DOCUMENT"):
+                handle_list = (comp.get("example") or {}).get("header_handle") or []
+                handle_url = handle_list[0] if handle_list else ""
+                if handle_url:
+                    print(f"[BULK] Auto-uploading template header media from example handle...")
+                    try:
+                        async with httpx.AsyncClient(timeout=30.0) as client:
+                            dl = await client.get(handle_url)
+                        if dl.status_code == 200:
+                            mime = dl.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                            upload_result = await whatsapp.upload_media(dl.content, mime)
+                            if upload_result["success"]:
+                                header_media_id = upload_result["mediaId"]
+                                print(f"[BULK] ✅ Template header media uploaded. mediaId={header_media_id} mime={mime}")
+                            else:
+                                print(f"[BULK] WARNING: Media upload failed: {upload_result.get('error')} — will try without header")
+                        else:
+                            print(f"[BULK] WARNING: Could not download example media (status={dl.status_code}) — will try without header")
+                    except Exception as exc:
+                        print(f"[BULK] WARNING: Exception auto-uploading header media: {exc} — will try without header")
+                break  # only process the first HEADER component
 
-        batch = contacts[i : i + BATCH_SIZE]
-        header_image_url = state.get("header_image_url", "")
-        tasks = [
-            _send_one(whatsapp, contact, template_str, campaign_id, tenant_id, header_image_url)
-            for contact in batch
-        ]
-        await asyncio.gather(*tasks)
+    try:
+        # Process contacts in batches of BATCH_SIZE concurrently
+        for i in range(0, len(contacts), BATCH_SIZE):
+            if not active_campaigns.get(campaign_id, {}).get("running"):
+                log_event("campaign_stopped", tenant_id=tenant_id, campaign_id=campaign_id)
+                if campaign_id in _local_campaigns:
+                    _local_campaigns[campaign_id]["status"] = "stopped"
+                break
 
-        # Track resume point and heartbeat in Firestore
-        _db_campaigns.update_last_processed(campaign_id, i + len(batch))
-        _db_campaigns.update_heartbeat(campaign_id)
+            batch = contacts[i : i + BATCH_SIZE]
+            header_image_url = state.get("header_image_url", "")
+            tasks = [
+                _send_one(whatsapp, contact, template_str, campaign_id, tenant_id,
+                          header_image_url=header_image_url, header_media_id=header_media_id)
+                for contact in batch
+            ]
+            # return_exceptions=True prevents one failed send from aborting the entire batch
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for exc in results:
+                if isinstance(exc, Exception):
+                    print(f"[BULK] Unhandled exception in batch gather: {exc}")
 
-        # Small delay between batches to respect rate limits
-        if i + BATCH_SIZE < len(contacts):
-            await asyncio.sleep(state["delay"] / 1000)
+            # Small delay between batches to respect rate limits
+            if i + BATCH_SIZE < len(contacts):
+                await asyncio.sleep(state["delay"] / 1000)
 
-    if active_campaigns.get(campaign_id, {}).get("running"):
-        _db_campaigns.update_status(campaign_id, "completed",
-                                    completed_at=datetime.datetime.now().isoformat())
-        log_event("campaign_complete", tenant_id=tenant_id, campaign_id=campaign_id)
-    active_campaigns.pop(campaign_id, None)
+
+        if active_campaigns.get(campaign_id, {}).get("running"):
+            if campaign_id in _local_campaigns:
+                _local_campaigns[campaign_id]["status"] = "completed"
+            log_event("campaign_complete", tenant_id=tenant_id, campaign_id=campaign_id)
+            counters = _local_campaign_counters.get(campaign_id, {"sent": 0, "failed": 0})
+            print(f"[BULK] Campaign={campaign_id} completed. sent={counters.get('sent', 0)} failed={counters.get('failed', 0)}")
+
+    except Exception as exc:
+        print(f"[BULK] FATAL ERROR in campaign={campaign_id}: {exc}")
+        log_event("campaign_error", tenant_id=tenant_id, campaign_id=campaign_id, detail=str(exc), level="ERROR")
+        if campaign_id in _local_campaigns:
+            _local_campaigns[campaign_id]["status"] = "failed"
+
+    finally:
+        finished = active_campaigns.pop(campaign_id, None) or {}
+        _recent_campaign_status[campaign_id] = {
+            "campaign_id": campaign_id,
+            "tenant_id": finished.get("tenant_id", ""),
+            "template_name": finished.get("template", ""),
+            "total_contacts": len(finished.get("contacts", []) or []),
+            "status": _local_campaigns.get(campaign_id, {}).get("status", "completed"),
+            "created_at": datetime.datetime.now().isoformat(),
+            "cached_at": datetime.datetime.now().timestamp(),
+        }
 
 
 @router.post("/stop/{campaign_id}")
@@ -423,59 +527,76 @@ async def stop_campaign(campaign_id: str):
     # Signal in-flight task to stop
     if campaign_id in active_campaigns:
         active_campaigns[campaign_id]["running"] = False
-    # Always update Firestore status (works even if campaign is on another worker)
-    _db_campaigns.update_status(campaign_id, "stopped")
+    if campaign_id in _local_campaigns:
+        _local_campaigns[campaign_id]["status"] = "stopped"
     return {"success": True, "message": "Campaign stop requested"}
 
 
 @router.get("/status/{campaign_id}")
 async def get_campaign_status(request: Request, campaign_id: str):
-    campaign = _db_campaigns.get(campaign_id)
+    campaign = _local_campaigns.get(campaign_id)
     if not campaign:
+        cached = _recent_campaign_status.get(campaign_id)
+        if cached:
+            cached_at = float(cached.get("cached_at", 0) or 0)
+            if (datetime.datetime.now().timestamp() - cached_at) <= _RECENT_CAMPAIGN_TTL_SECONDS:
+                counters = _local_campaign_counters.get(campaign_id, {"sent": 0, "failed": 0})
+                return {
+                    "campaign": {
+                        "campaign_id": campaign_id,
+                        "name": cached.get("name", ""),
+                        "template_name": cached.get("template_name", ""),
+                        "total_contacts": cached.get("total_contacts", 0),
+                        "sent_count": counters.get("sent", 0),
+                        "failed_count": counters.get("failed", 0),
+                        "status": cached.get("status", "completed"),
+                        "created_at": cached.get("created_at", ""),
+                    }
+                }
+            _recent_campaign_status.pop(campaign_id, None)
         return JSONResponse(status_code=404, content={"error": "Campaign not found"})
-    # Enrich with distributed counter totals
-    totals = _db_counters.get_totals(campaign_id)
-    campaign["sent_count"] = totals.get("sent", 0)
-    campaign["failed_count"] = totals.get("failed", 0)
-    # Remap to legacy API format
-    result = {
-        "campaign_id": campaign.get("campaign_id", campaign_id),
-        "name": campaign.get("name", ""),
-        "template_name": campaign.get("template_name", ""),
-        "total_contacts": campaign.get("total_contacts", 0),
-        "sent_count": campaign["sent_count"],
-        "failed_count": campaign["failed_count"],
-        "status": campaign.get("status", ""),
-        "created_at": campaign.get("created_at", ""),
+
+    counters = _local_campaign_counters.get(campaign_id, {"sent": 0, "failed": 0})
+    return {
+        "campaign": {
+            "campaign_id": campaign.get("campaign_id", campaign_id),
+            "name": campaign.get("name", ""),
+            "template_name": campaign.get("template_name", ""),
+            "total_contacts": campaign.get("total_contacts", 0),
+            "sent_count": counters.get("sent", 0),
+            "failed_count": counters.get("failed", 0),
+            "status": campaign.get("status", ""),
+            "created_at": campaign.get("created_at", ""),
+        }
     }
-    return {"campaign": result}
 
 
 @router.delete("/campaigns/{campaign_id}")
 async def delete_campaign(request: Request, campaign_id: str):
-    campaign = _db_campaigns.get(campaign_id)
+    campaign = _local_campaigns.get(campaign_id)
     if not campaign:
         return JSONResponse(status_code=404, content={"error": "Campaign not found"})
     # Stop in-flight task if running locally
     if campaign_id in active_campaigns:
         active_campaigns[campaign_id]["running"] = False
         active_campaigns.pop(campaign_id, None)
-    # Firestore cleanup
-    _db_campaigns.delete(campaign_id)
-    _db_counters.delete(campaign_id)
-    _db_recipients.delete_by_campaign(campaign_id)
+    _local_campaigns.pop(campaign_id, None)
+    _local_campaign_counters.pop(campaign_id, None)
+    _recent_campaign_status.pop(campaign_id, None)
     return {"success": True, "message": "Campaign deleted"}
 
 
 @router.get("/campaigns")
 async def get_all_campaigns(request: Request, limit: int = 25, cursor: str = None):
     tenant_id = request.state.tenant_id
-    campaigns, next_cursor = _db_campaigns.list(tenant_id, limit=limit, cursor=cursor)
-    # Enrich each campaign with counter totals and remap to legacy format
+    campaigns = [c for c in _local_campaigns.values() if c.get("tenant_id") == tenant_id]
+    campaigns = sorted(campaigns, key=lambda x: x.get("created_at", ""), reverse=True)
+    campaigns = campaigns[: max(0, int(limit or 25))]
+
     result = []
     for c in campaigns:
         cid = c.get("campaign_id", "")
-        totals = _db_counters.get_totals(cid) if cid else {"sent": 0, "failed": 0}
+        totals = _local_campaign_counters.get(cid, {"sent": 0, "failed": 0})
         result.append({
             "campaign_id": cid,
             "name": c.get("name", ""),
@@ -488,5 +609,5 @@ async def get_all_campaigns(request: Request, limit: int = 25, cursor: str = Non
         })
     return {
         "campaigns": result,
-        "next_cursor": next_cursor,
+        "next_cursor": None,
     }

@@ -15,7 +15,7 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 class WhatsAppSettings(BaseModel):
     business_account_id: str
     phone_number_id: str
-    access_token: str
+    access_token: Optional[str] = ""   # optional — omit to keep existing token
     webhook_verify_token: Optional[str] = ""
 
 

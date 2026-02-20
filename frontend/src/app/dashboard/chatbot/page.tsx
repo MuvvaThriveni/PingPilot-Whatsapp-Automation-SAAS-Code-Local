@@ -40,8 +40,8 @@ export default function ChatbotPage() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
-  const [settings, setSettings] = useState<ChatbotSettings>({ 
-    is_enabled: 0, 
+  const [settings, setSettings] = useState<ChatbotSettings>({
+    is_enabled: 0,
     fallback_message: '',
     use_ai: true,
     ai_system_prompt: '',
@@ -55,13 +55,13 @@ export default function ChatbotPage() {
 
   useEffect(() => {
     fetchData()
-    // Auto-refresh every 5 seconds
+    // Auto-refresh every 30 seconds (reduced from 5s to cut Firestore quota)
     const interval = setInterval(() => {
       fetchUsersQuietly()
       if (selectedUser) {
         fetchUserConversationsQuietly(selectedUser.phone)
       }
-    }, 5000)
+    }, 30000)
     return () => clearInterval(interval)
   }, [selectedUser])
 
@@ -130,8 +130,8 @@ export default function ChatbotPage() {
 
   const handleToggle = async (enabled: boolean) => {
     try {
-      await chatbot.updateSettings({ 
-        is_enabled: enabled, 
+      await chatbot.updateSettings({
+        is_enabled: enabled,
         fallback_message: settings.fallback_message,
         use_ai: settings.use_ai,
         ai_system_prompt: settings.ai_system_prompt,
@@ -235,10 +235,16 @@ export default function ChatbotPage() {
                 value={settings.ai_system_prompt || ''}
                 onChange={(e) => setSettings({ ...settings, ai_system_prompt: e.target.value })}
                 rows={4}
+                maxLength={1500}
               />
-              <p className="text-xs text-gray-500">
-                Instructions for how the AI should behave and respond
-              </p>
+              <div className="flex justify-between">
+                <p className="text-xs text-gray-500">
+                  Instructions for how the AI should behave and respond
+                </p>
+                <p className="text-xs text-gray-500">
+                  {(settings.ai_system_prompt || '').length}/1500
+                </p>
+              </div>
             </div>
 
             <div className="space-y-2">
@@ -279,11 +285,10 @@ export default function ChatbotPage() {
                     <div
                       key={user.phone}
                       onClick={() => handleSelectUser(user)}
-                      className={`p-3 rounded-lg cursor-pointer transition-colors ${
-                        selectedUser?.phone === user.phone
-                          ? 'bg-blue-100 border-blue-300 border'
-                          : 'bg-gray-50 hover:bg-gray-100'
-                      }`}
+                      className={`p-3 rounded-lg cursor-pointer transition-colors ${selectedUser?.phone === user.phone
+                        ? 'bg-blue-100 border-blue-300 border'
+                        : 'bg-gray-50 hover:bg-gray-100'
+                        }`}
                     >
                       <div className="flex items-center gap-2">
                         <User className="h-8 w-8 p-1.5 bg-gray-200 rounded-full text-gray-600" />
@@ -339,11 +344,10 @@ export default function ChatbotPage() {
                         {userConversations.map((conv, index) => (
                           <div
                             key={index}
-                            className={`p-3 rounded-lg max-w-[85%] ${
-                              conv.direction === 'incoming'
-                                ? 'bg-gray-100'
-                                : 'bg-green-100 ml-auto'
-                            }`}
+                            className={`p-3 rounded-lg max-w-[85%] ${conv.direction === 'incoming'
+                              ? 'bg-gray-100'
+                              : 'bg-green-100 ml-auto'
+                              }`}
                           >
                             <p className="text-sm">{conv.message_text}</p>
                             <p className="text-xs text-gray-400 mt-1">

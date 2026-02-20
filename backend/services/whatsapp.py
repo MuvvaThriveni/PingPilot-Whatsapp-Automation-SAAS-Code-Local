@@ -105,6 +105,7 @@ class WhatsAppService:
             }
             if components:
                 payload["template"]["components"] = components
+            print(f"[WA-SEND] Payload: {payload}")
             response = await self._request_with_retry(
                 "POST", f"{self.base_url}/messages",
                 headers={"Authorization": f"Bearer {self.access_token}"},
@@ -112,6 +113,7 @@ class WhatsAppService:
                 label=f"send_template to={to} tpl={template_name}",
             )
             data = response.json()
+            print(f"[WA-RESULT] Response (Status {response.status_code}): {data}")
             if response.status_code == 200:
                 return {"success": True, "messageId": data.get("messages", [{}])[0].get("id")}
             api_error = data.get("error", {})
