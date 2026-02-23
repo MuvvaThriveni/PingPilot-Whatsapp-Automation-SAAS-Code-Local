@@ -134,6 +134,10 @@ async def periodical_cleanup():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(periodical_cleanup())
+    
+    # Start the bulk message scheduler
+    from routers.bulk_message import periodical_scheduler
+    asyncio.create_task(periodical_scheduler())
 
 
 @app.get("/api/health")

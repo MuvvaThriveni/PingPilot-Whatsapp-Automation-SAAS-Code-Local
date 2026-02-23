@@ -101,5 +101,18 @@ class _CampaignCounters:
         except Exception as e:
             print(f"[db_layer.campaign_counters] delete({campaign_id}) failed: {e}")
 
+    @staticmethod
+    def get(campaign_id: str) -> dict:
+        """Alias for get_totals."""
+        return _CampaignCounters.get_totals(campaign_id)
+
+    @staticmethod
+    def increment(campaign_id: str, type: str, count: int = 1):
+        """Generic increment router."""
+        if type == "sent":
+            _CampaignCounters.increment_sent(campaign_id, count)
+        elif type == "failed":
+            _CampaignCounters.increment_failed(campaign_id, count)
+
 
 campaign_counters = _CampaignCounters()

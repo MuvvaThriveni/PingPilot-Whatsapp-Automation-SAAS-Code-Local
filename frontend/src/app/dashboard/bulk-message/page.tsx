@@ -6,6 +6,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import { Switch } from '@/components/ui/switch'
 import { bulkMessage } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
 import { Upload, FileSpreadsheet, X, Play, Square, Loader2, CheckCircle, XCircle, Clock, Trash2 } from 'lucide-react'
@@ -35,6 +37,7 @@ interface Campaign {
   failed_count: number
   status: string
   created_at: string
+  scheduled_at?: string
 }
 
 export default function BulkMessagePage() {
@@ -49,6 +52,8 @@ export default function BulkMessagePage() {
   const [delayMs, setDelayMs] = useState('1000')
   const [campaigns, setCampaigns] = useState<Campaign[]>([])
   const [activeCampaignId, setActiveCampaignId] = useState<string | null>(null)
+  const [isScheduled, setIsScheduled] = useState(false)
+  const [scheduledAt, setScheduledAt] = useState('')
   const [templates, setTemplates] = useState<Template[]>([])
   const [loadingTemplates, setLoadingTemplates] = useState(false)
   const selectedTemplate = templates.find(t => t.display === templateName)
@@ -57,6 +62,9 @@ export default function BulkMessagePage() {
   useEffect(() => {
     fetchCampaigns()
     fetchTemplates()
+    // Periodic fallback to refresh the whole list (e.g., for status changes not caught by active poller)
+    const interval = setInterval(fetchCampaigns, 10000)
+    return () => clearInterval(interval)
   }, [])
 
   useEffect(() => {
@@ -69,13 +77,15 @@ export default function BulkMessagePage() {
           setCampaigns(prev => prev.map(c =>
             c.campaign_id === activeCampaignId ? campaign : c
           ))
-          if (campaign.status !== 'running') {
+          // Keep polling if it's running OR still scheduled
+          if (campaign.status !== 'running' && campaign.status !== 'scheduled') {
             setActiveCampaignId(null)
           }
         } catch (error) {
           console.error('Failed to fetch campaign status:', error)
+          setActiveCampaignId(null) // stop on error
         }
-      }, 2000)
+      }, 3000)
     }
     return () => clearInterval(interval)
   }, [activeCampaignId])
@@ -152,6 +162,11 @@ export default function BulkMessagePage() {
       formData.append('campaignName', campaignName || `Campaign ${new Date().toLocaleDateString()}`)
       formData.append('delayMs', delayMs)
 
+      if (isScheduled && scheduledAt) {
+        // Convert to ISO string for backend
+        formData.append('scheduledAt', new Date(scheduledAt).toISOString())
+      }
+
       const res = await bulkMessage.start(formData)
       setActiveCampaignId(res.data.campaignId)
 
@@ -162,6 +177,8 @@ export default function BulkMessagePage() {
       setTotalContacts(0)
       setTemplateName('')
       setCampaignName('')
+      setIsScheduled(false)
+      setScheduledAt('')
 
       fetchCampaigns()
     } catch (error: any) {
@@ -199,6 +216,7 @@ export default function BulkMessagePage() {
       case 'completed': return <CheckCircle className="h-4 w-4 text-green-500" />
       case 'running': return <Loader2 className="h-4 w-4 text-blue-500 animate-spin" />
       case 'stopped': return <XCircle className="h-4 w-4 text-red-500" />
+      case 'scheduled': return <Clock className="h-4 w-4 text-orange-500" />
       default: return <Clock className="h-4 w-4 text-gray-500" />
     }
   }
@@ -329,6 +347,35 @@ export default function BulkMessagePage() {
               </p>
             </div>
 
+            {/* Scheduling */}
+            <div className="space-y-3 p-4 border rounded-lg bg-gray-50/50">
+              <div className="flex items-center justify-between">
+                <div className="space-y-0.5">
+                  <Label className="text-base font-semibold">Schedule for later</Label>
+                  <p className="text-sm text-gray-500">Pick a time to automatically start sending</p>
+                </div>
+                <Switch
+                  checked={isScheduled}
+                  onCheckedChange={setIsScheduled}
+                />
+              </div>
+
+              {isScheduled && (
+                <div className="space-y-2 pt-2 animate-in fade-in slide-in-from-top-2 duration-300">
+                  <Input
+                    type="datetime-local"
+                    value={scheduledAt}
+                    onChange={(e) => setScheduledAt(e.target.value)}
+                    min={new Date().toISOString().slice(0, 16)}
+                  />
+                  <p className="text-xs text-orange-600 flex items-center gap-1">
+                    <Clock className="h-3 w-3" />
+                    Campaign status will remain "Scheduled" until the selected time.
+                  </p>
+                </div>
+              )}
+            </div>
+
             {/* Start Button */}
             <Button
               className="w-full"
@@ -399,7 +446,13 @@ export default function BulkMessagePage() {
                     <div>
                       <p className="font-medium">{campaign.name}</p>
                       <p className="text-sm text-gray-500">
-                        Template: {campaign.template_name} • {new Date(campaign.created_at).toLocaleDateString()}
+                        {campaign.status === 'scheduled' && campaign.scheduled_at ? (
+                          <span className="text-orange-600 font-medium">
+                            Scheduled: {new Date(campaign.scheduled_at).toLocaleString()}
+                          </span>
+                        ) : (
+                          <>Template: {campaign.template_name} • {new Date(campaign.created_at).toLocaleDateString()}</>
+                        )}
                       </p>
                     </div>
                   </div>
