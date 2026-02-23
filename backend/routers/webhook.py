@@ -21,6 +21,7 @@ from db_layer.chat_messages import chat_messages as _db_chat_messages
 from db_layer.messages import messages as _db_messages
 from db_layer.usage_events import usage_events as _db_usage
 from db_layer.chatbot import chatbot_rules as _db_chatbot_rules
+from db_layer.users import users_db
 from cache import cache, chat_users_key
 
 router = APIRouter(prefix="/api/webhook", tags=["webhook"])
@@ -132,12 +133,28 @@ async def handle_webhook(body: dict):
                     .get("profile", {})
                     .get("name", "Unknown")
                 )
-                message_text = message.get("text", {}).get("body", "").strip()
+                
+                message_type = message.get("type", "text")
+                message_text = ""
+                
+                if message_type == "text":
+                    message_text = message.get("text", {}).get("body", "").strip()
+                elif message_type == "button":
+                    # For template buttons, Meta sends text in 'text' or 'payload'
+                    message_text = message.get("button", {}).get("text", "").strip()
+                    if not message_text:
+                        message_text = message.get("button", {}).get("payload", "").strip()
+                elif message_type == "interactive":
+                    # Handle interactive button replies
+                    interactive = message.get("interactive", {})
+                    if interactive.get("type") == "button_reply":
+                        message_text = interactive.get("button_reply", {}).get("title", "").strip()
+                
                 now = datetime.datetime.now().isoformat()
 
-                # Skip non-text messages (images, audio, etc.) with no text body
-                if not message_text:
-                    log_event("webhook_skip", tenant_id=tenant_id, detail="non-text or empty message")
+                # Skip if no content readable for routing
+                if not message_text and message_type not in ["button", "interactive"]:
+                    log_event("webhook_skip", tenant_id=tenant_id, detail="non-text/no-button or empty message")
                     continue
 
                 # --- Deduplication check ---
@@ -165,7 +182,7 @@ async def handle_webhook(body: dict):
                     "contact_phone": sender_phone,
                     "contact_name": sender_name,
                     "message_text": message_text,
-                    "message_type": "text",
+                    "message_type": message_type,
                     "wa_message_id": wa_message_id,
                     "status": "received",
                     "created_at": now,
@@ -175,85 +192,121 @@ async def handle_webhook(body: dict):
                 _db_usage.record(tenant_id, "message_received", "chatbot",
                                  contact_phone=sender_phone, billable=False)
 
-                # Invalidate cached user list so frontend picks up new conversations
+                # Invalidate cached user list
                 cache.invalidate(chat_users_key(tenant_id))
 
-                # ── Debug: show decision context ──────────────────────────
-                print(f"[WEBHOOK] chatbot_enabled={chatbot.get('is_enabled')} "
-                      f"is_configured={settings.get('is_configured')} "
-                      f"phone_number_id={settings.get('phone_number_id')!r} "
-                      f"has_token={bool(settings.get('access_token'))}")
+                # ── Chatbot Decision Logic (Yoga Flow) ──────────────────
+                whatsapp = WhatsAppService(
+                    settings["phone_number_id"],
+                    settings["access_token"],
+                )
+                
+                response_text = ""
+                response_template = ""
+                matched_rule = False
 
-                if chatbot["is_enabled"] and settings["is_configured"]:
-                    response_text = chatbot["fallback_message"]
-                    matched_rule = False
-                    
-                    # Step 1: Check rule-based keyword matches (fast, no API cost)
+                # 1. First Message Handling (Text Only)
+                if message_type == "text" and not users_db.is_user_seen(sender_phone):
+                    users_db.mark_user_seen(sender_phone)
+                    response_template = "first_trigger"
+                    matched_rule = True
+                    print(f"[WEBHOOK] First message from {sender_phone} → first_trigger")
+
+                # 2. Button Handling (Direct matches for yoga plan)
+                clean_text = message_text.strip()
+                if not matched_rule:
+                    if clean_text == "Sessions":
+                        response_template = "session_template"
+                        matched_rule = True
+                    elif clean_text == "Products":
+                        response_template = "products_template"
+                        matched_rule = True
+                    elif clean_text == "6:30 AM":
+                        response_text = "🧘 Our 6:30 AM Yoga plan includes Surya Namaskar, Pranayama, and light meditation to start your day with energy!"
+                        matched_rule = True
+                    elif clean_text == "7:30 Am":
+                        response_text = "🧘 Our 7:30 AM Yoga plan focuses on flexibility and core strength, perfect for mid-morning refreshment."
+                        matched_rule = True
+                    elif clean_text == "10:30 AM":
+                        response_text = "🧘 Our 10:30 AM Yoga plan is a gentle flow designed for stress relief and mindfulness."
+                        matched_rule = True
+
+                # 3. Existing Chatbot Rules (DB-based)
+                if not matched_rule and chatbot["is_enabled"]:
                     rules = _db_chatbot_rules.get_active(tenant_id)
                     message_lower = message_text.lower().strip()
-                    print(f"[WEBHOOK] {len(rules)} active rules, checking: {message_lower!r}")
                     for rule in rules:
-                        # Field is "keyword" (singular) as stored by chatbot rules
                         keyword = rule.get("keyword", "").strip().lower()
                         if keyword and keyword in message_lower:
-                            response_text = rule.get("response", chatbot["fallback_message"])
-                            matched_rule = True
-                            print(f"[WEBHOOK] keyword rule matched: {keyword!r}")
-                            break
-                    
-                    # Step 2: Use AI only if no rule matched and use_ai is enabled
-                    if not matched_rule and chatbot.get("use_ai", True):
-                        api_key = chatbot.get("openai_api_key", "")
-                        system_prompt = chatbot.get("ai_system_prompt", "")
-                        print(f"[WEBHOOK] no rule matched → use_ai={chatbot.get('use_ai')} has_key={bool(api_key)}")
-                        if api_key:
-                            chatgpt = get_chatgpt_service(api_key, system_prompt)
-                            ai_result = await chatgpt.get_response(tenant_id, sender_phone, message_text)
-                            if ai_result["success"]:
-                                response_text = ai_result["response"]
-                                _db_usage.record(tenant_id, "ai_reply", "chatbot",
-                                                 contact_phone=sender_phone)
-                            else:
-                                print(f"[WEBHOOK] AI error: {ai_result['error']}")
-                                log_event("chatgpt_error", tenant_id=tenant_id, phone=sender_phone,
-                                          detail=ai_result['error'], level="WARN")
+                            response_text = rule.get("response", "")
+                            if response_text:
+                                matched_rule = True
+                                break
 
-                    print(f"[WEBHOOK] → sending to {sender_phone}: {response_text!r}")
-                    whatsapp = WhatsAppService(
-                        settings["phone_number_id"],
-                        settings["access_token"],
-                    )
-                    result = await whatsapp.send_text_message(sender_phone, response_text)
-                    print(f"[WEBHOOK] WA API result: {result}")
+                # 4. AI Logic (Fallback)
+                if not matched_rule and chatbot["is_enabled"] and chatbot.get("use_ai", False):
+                    api_key = chatbot.get("openai_api_key", "")
+                    system_prompt = chatbot.get("ai_system_prompt", "")
+                    if api_key:
+                        chatgpt = get_chatgpt_service(api_key, system_prompt)
+                        ai_result = await chatgpt.get_response(tenant_id, sender_phone, message_text)
+                        if ai_result["success"]:
+                            response_text = ai_result["response"]
+                            matched_rule = True
+                            _db_usage.record(tenant_id, "ai_reply", "chatbot", contact_phone=sender_phone)
+
+                # --- Execute Reply ---
+                if matched_rule or response_text or response_template:
+                    result = {"success": False}
+                    final_msg_content = response_text
+                    
+                    if response_template:
+                        components = None
+                        # If first_trigger has a parameter {{1}} for the name
+                        if response_template == "first_trigger":
+                            components = [{
+                                "role": "body",
+                                "type": "body",
+                                "parameters": [
+                                    {"type": "text", "text": sender_name}
+                                ]
+                            }]
+                        
+                        # Use 'en' as the language code since Meta UI says "English"
+                        result = await whatsapp.send_template_message(
+                            sender_phone, 
+                            response_template, 
+                            language="en",
+                            components=components
+                        )
+                        final_msg_content = f"Template: {response_template}"
+                    elif response_text:
+                        result = await whatsapp.send_text_message(sender_phone, response_text)
+
                     log_event("webhook_reply", tenant_id=tenant_id, phone=sender_phone,
                               status="sent" if result["success"] else "failed",
                               detail=result.get("error", ""))
 
                     out_now = datetime.datetime.now().isoformat()
-
-                    # Save outgoing chat message
+                    # Save outgoing logs
                     _db_chat_messages.add(tenant_id, {
                         "contact_phone": sender_phone,
                         "contact_name": sender_name,
-                        "message_text": response_text,
+                        "message_text": final_msg_content,
                         "direction": "outgoing",
                         "created_at": out_now,
                     })
-
-                    # Save to messages (single source of truth)
                     _db_messages.add(tenant_id, {
                         "direction": "outgoing",
                         "product_type": "chatbot",
                         "contact_phone": sender_phone,
-                        "message_type": "text",
+                        "message_type": "template" if response_template else "text",
                         "wa_message_id": result.get("messageId", ""),
                         "status": "sent" if result["success"] else "failed",
                         "error_message": result.get("error", ""),
                         "created_at": out_now,
                     })
-
-                    _db_usage.record(tenant_id, "message_sent", "chatbot",
-                                     contact_phone=sender_phone)
+                    _db_usage.record(tenant_id, "message_sent", "chatbot", contact_phone=sender_phone)
 
                 # Mark webhook event as processed
                 if wa_message_id:
