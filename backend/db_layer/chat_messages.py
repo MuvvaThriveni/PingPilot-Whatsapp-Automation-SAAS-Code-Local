@@ -15,6 +15,7 @@ Optimizations:
 """
 
 import datetime
+from google.cloud.firestore_v1.base_query import FieldFilter
 from firebase_config import get_db
 
 
@@ -58,8 +59,8 @@ class _ChatMessages:
             return []
         try:
             docs = (
-                col.where("tenant_id", "==", tenant_id)
-                .where("contact_phone", "==", contact_phone)
+                col.where(filter=FieldFilter("tenant_id", "==", tenant_id))
+                .where(filter=FieldFilter("contact_phone", "==", contact_phone))
                 .order_by("created_at", direction="DESCENDING")
                 .limit(limit)
                 .stream()
@@ -84,7 +85,7 @@ class _ChatMessages:
             return [], None
         try:
             query = (
-                col.where("tenant_id", "==", tenant_id)
+                col.where(filter=FieldFilter("tenant_id", "==", tenant_id))
                 .order_by("created_at", direction="DESCENDING")
             )
             if cursor:
@@ -111,8 +112,8 @@ class _ChatMessages:
             return [], None
         try:
             query = (
-                col.where("tenant_id", "==", tenant_id)
-                .where("contact_phone", "==", contact_phone)
+                col.where(filter=FieldFilter("tenant_id", "==", tenant_id))
+                .where(filter=FieldFilter("contact_phone", "==", contact_phone))
                 .order_by("created_at", direction="ASCENDING")
             )
             if cursor:

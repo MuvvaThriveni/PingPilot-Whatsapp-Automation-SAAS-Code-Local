@@ -256,7 +256,6 @@ async def handle_webhook(body: dict):
                         # If first_trigger has a parameter {{1}} for the name
                         if response_template == "first_trigger":
                             components = [{
-                                "role": "body",
                                 "type": "body",
                                 "parameters": [
                                     {"type": "text", "text": sender_name}

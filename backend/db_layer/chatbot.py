@@ -11,6 +11,7 @@ Reads are cached via the centralized cache module.
 """
 
 import datetime
+from google.cloud.firestore_v1.base_query import FieldFilter
 from firebase_config import get_db
 from cache import cache, chatbot_config_key, chatbot_rules_key
 
@@ -148,8 +149,8 @@ class _ChatbotRules:
                 return []
             try:
                 docs = (
-                    col.where("tenant_id", "==", tenant_id)
-                    .where("is_active", "==", 1)
+                    col.where(filter=FieldFilter("tenant_id", "==", tenant_id))
+                    .where(filter=FieldFilter("is_active", "==", 1))
                     .order_by("priority", direction="DESCENDING")
                     .stream()
                 )
