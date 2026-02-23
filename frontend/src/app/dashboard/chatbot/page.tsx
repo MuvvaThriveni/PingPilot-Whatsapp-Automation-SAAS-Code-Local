@@ -173,8 +173,8 @@ export default function ChatbotPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold text-gray-900">AI Auto-Reply Chatbot</h1>
-        <p className="text-gray-500 mt-1">Automatically respond to incoming WhatsApp messages using ChatGPT</p>
+        <h1 className="text-2xl font-bold text-gray-900">WhatsApp Chatbot Trigger</h1>
+        <p className="text-gray-500 mt-1">Configure auto-trigger rules and fallback messages</p>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
@@ -211,7 +211,7 @@ export default function ChatbotPage() {
               </span>
             </div>
 
-            {/* OpenAI API Key */}
+            {/* OpenAI API Key (Disabled)
             <div className="space-y-2">
               <Label htmlFor="apiKey">OpenAI API Key</Label>
               <Input
@@ -225,8 +225,9 @@ export default function ChatbotPage() {
                 Get your API key from <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">OpenAI Dashboard</a>
               </p>
             </div>
+            */}
 
-            {/* AI System Prompt */}
+            {/* AI System Prompt (Disabled)
             <div className="space-y-2">
               <Label htmlFor="systemPrompt">AI System Prompt</Label>
               <Textarea
@@ -246,7 +247,9 @@ export default function ChatbotPage() {
                 </p>
               </div>
             </div>
+            */}
 
+            {/* Fallback Message (Disabled - replaced by first_trigger template)
             <div className="space-y-2">
               <Label htmlFor="fallback">Fallback Message</Label>
               <Textarea
@@ -260,6 +263,7 @@ export default function ChatbotPage() {
                 Sent when AI fails or API key is not configured
               </p>
             </div>
+            */}
 
             <Button onClick={handleSaveSettings} disabled={saving} className="w-full">
               {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}

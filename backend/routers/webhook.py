@@ -205,14 +205,7 @@ async def handle_webhook(body: dict):
                 response_template = ""
                 matched_rule = False
 
-                # 1. First Message Handling (Text Only)
-                if message_type == "text" and not users_db.is_user_seen(sender_phone):
-                    users_db.mark_user_seen(sender_phone)
-                    response_template = "first_trigger"
-                    matched_rule = True
-                    print(f"[WEBHOOK] First message from {sender_phone} → first_trigger")
-
-                # 2. Button Handling (Direct matches for yoga plan)
+                # 1. Button Handling (Direct matches for yoga plan)
                 clean_text = message_text.strip()
                 if not matched_rule:
                     if clean_text == "Sessions":
@@ -231,7 +224,7 @@ async def handle_webhook(body: dict):
                         response_text = "🧘 Our 10:30 AM Yoga plan is a gentle flow designed for stress relief and mindfulness."
                         matched_rule = True
 
-                # 3. Existing Chatbot Rules (DB-based)
+                # 2. Existing Chatbot Rules (DB-based)
                 if not matched_rule and chatbot["is_enabled"]:
                     rules = _db_chatbot_rules.get_active(tenant_id)
                     message_lower = message_text.lower().strip()
@@ -243,17 +236,15 @@ async def handle_webhook(body: dict):
                                 matched_rule = True
                                 break
 
-                # 4. AI Logic (Fallback)
-                if not matched_rule and chatbot["is_enabled"] and chatbot.get("use_ai", False):
-                    api_key = chatbot.get("openai_api_key", "")
-                    system_prompt = chatbot.get("ai_system_prompt", "")
-                    if api_key:
-                        chatgpt = get_chatgpt_service(api_key, system_prompt)
-                        ai_result = await chatgpt.get_response(tenant_id, sender_phone, message_text)
-                        if ai_result["success"]:
-                            response_text = ai_result["response"]
-                            matched_rule = True
-                            _db_usage.record(tenant_id, "ai_reply", "chatbot", contact_phone=sender_phone)
+                # 3. Fallback Trigger (First Trigger) - Rate limited to once every 24 hours
+                if not matched_rule:
+                    if users_db.should_send_trigger(sender_phone):
+                        users_db.record_trigger(sender_phone)
+                        response_template = "first_trigger"
+                        matched_rule = True
+                        print(f"[WEBHOOK] Fallback matched for {sender_phone} → sending first_trigger (24h lock)")
+                    else:
+                        print(f"[WEBHOOK] No match for {sender_phone}, but 24h trigger lock active. Skipping response.")
 
                 # --- Execute Reply ---
                 if matched_rule or response_text or response_template:

@@ -32,9 +32,9 @@ _DEFAULT_SETTINGS: Dict = {
 _DEFAULT_CHATBOT: Dict = {
     "is_enabled": False,
     "fallback_message": "Thank you for your message. Our team will get back to you soon.",
-    "use_ai": True,
-    "ai_system_prompt": "You are a helpful customer service assistant. Be friendly, concise, and professional.",
-    "openai_api_key": "",
+    "use_ai": False,  # Changed to False as per transition to rule-based only
+    # "ai_system_prompt": "You are a helpful customer service assistant. Be friendly, concise, and professional.",
+    # "openai_api_key": "",
 }
 
 
@@ -67,9 +67,9 @@ def get_chatbot_settings(tenant_id: str) -> Dict:
             return {
                 "is_enabled": cfg.get("is_enabled", False),
                 "fallback_message": cfg.get("fallback_message", _DEFAULT_CHATBOT["fallback_message"]),
-                "use_ai": cfg.get("use_ai", True),
-                "ai_system_prompt": cfg.get("ai_system_prompt", _DEFAULT_CHATBOT["ai_system_prompt"]),
-                "openai_api_key": _secrets.resolve_openai_key(cfg),
+                "use_ai": False, # cfg.get("use_ai", True),
+                # "ai_system_prompt": cfg.get("ai_system_prompt", _DEFAULT_CHATBOT["ai_system_prompt"]),
+                # "openai_api_key": _secrets.resolve_openai_key(cfg),
             }
         return dict(_DEFAULT_CHATBOT)
 
@@ -121,21 +121,21 @@ def save_settings(tenant_id: str, settings_data: Dict):
 
 
 def save_chatbot_settings(tenant_id: str, chatbot_data: Dict):
-    """Persist chatbot config for a tenant. OpenAI key stored directly in Firestore."""
-    openai_key = chatbot_data.get("openai_api_key", "").strip()
+    """Persist chatbot config for a tenant."""
+    # openai_key = chatbot_data.get("openai_api_key", "").strip()
     upsert_data = {
         "is_enabled": chatbot_data.get("is_enabled", False),
         "fallback_message": chatbot_data.get("fallback_message", ""),
-        "use_ai": chatbot_data.get("use_ai", True),
-        "ai_system_prompt": chatbot_data.get("ai_system_prompt", ""),
+        "use_ai": False, # chatbot_data.get("use_ai", True),
+        # "ai_system_prompt": chatbot_data.get("ai_system_prompt", ""),
     }
     # Store key directly in Firestore so it survives server restarts
-    if openai_key:
-        upsert_data["openai_api_key"] = openai_key
+    # if openai_key:
+    #     upsert_data["openai_api_key"] = openai_key
 
     _db_chatbot_config.upsert(tenant_id, upsert_data)
-    if openai_key:
-        os.environ[f"OPENAI_API_KEY_{tenant_id}"] = openai_key
+    # if openai_key:
+    #     os.environ[f"OPENAI_API_KEY_{tenant_id}"] = openai_key
     # Invalidate cache
     cache.invalidate(chatbot_config_key(tenant_id))
     print(f"[STORE] save_chatbot_settings tenant={tenant_id} → firestore (cache invalidated)")

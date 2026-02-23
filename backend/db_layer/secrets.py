@@ -67,23 +67,23 @@ class _Secrets:
 
         return ""
 
-    @staticmethod
-    def resolve_openai_key(chatbot_doc: dict) -> str:
-        """Resolve the OpenAI API key for a tenant's chatbot config.
-
-        Priority:
-          1. 'openai_api_key' stored directly in Firestore (survives restarts)
-          2. 'openai_key_ref' env-var reference (legacy / env-based deployments)
-        """
-        # Primary: direct field in Firestore document
-        direct = chatbot_doc.get("openai_api_key", "")
-        if direct:
-            return direct
-
-        # Fallback: env-var reference
-        ref = chatbot_doc.get("openai_key_ref", "")
-        resolved = resolve(ref)
-        return resolved if resolved else ""
+    # @staticmethod
+    # def resolve_openai_key(chatbot_doc: dict) -> str:
+    #     """Resolve the OpenAI API key for a tenant's chatbot config.
+    #
+    #     Priority:
+    #       1. 'openai_api_key' stored directly in Firestore (survives restarts)
+    #       2. 'openai_key_ref' env-var reference (legacy / env-based deployments)
+    #     """
+    #     # Primary: direct field in Firestore document
+    #     direct = chatbot_doc.get("openai_api_key", "")
+    #     if direct:
+    #         return direct
+    #
+    #     # Fallback: env-var reference
+    #     ref = chatbot_doc.get("openai_key_ref", "")
+    #     resolved = resolve(ref)
+    #     return resolved if resolved else ""
 
 
 secrets = _Secrets()

@@ -55,12 +55,17 @@ async def update_chatbot_settings(request: Request, data: ChatbotSettingsModel):
     current = _get_chatbot_settings(tenant_id)
     current["is_enabled"] = data.is_enabled
     current["fallback_message"] = data.fallback_message
-    if data.use_ai is not None:
-        current["use_ai"] = data.use_ai
-    if data.ai_system_prompt is not None:
-        current["ai_system_prompt"] = data.ai_system_prompt
-    if data.openai_api_key is not None:
-        current["openai_api_key"] = data.openai_api_key.strip()
+    
+    # AI logic commented out to reflect the transition to a purely rule-based and triggered flow.
+    # if data.use_ai is not None:
+    #     current["use_ai"] = data.use_ai
+    # if data.ai_system_prompt is not None:
+    #     current["ai_system_prompt"] = data.ai_system_prompt
+    # if data.openai_api_key is not None:
+    #     current["openai_api_key"] = data.openai_api_key.strip()
+    
+    current["use_ai"] = False
+    
     _save_chatbot_settings(tenant_id, current)
     return {"success": True, "message": "Settings updated"}
 
