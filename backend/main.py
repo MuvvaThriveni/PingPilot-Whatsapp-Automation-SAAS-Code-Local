@@ -26,6 +26,7 @@ init_firebase()
 from auth_middleware import FirebaseAuthMiddleware
 
 origins = [
+    "https://wappflow-1-h55h.onrender.com",
     "https://wappflow-1.onrender.com",
     "http://localhost:3000",
 ]
