@@ -242,12 +242,35 @@ async def handle_webhook(body: dict):
                             detail=f"button_title={clean_text!r} button_id={interactive_button_id!r}",
                         )
                         print(f"[WEBHOOK] Morning button matched for {sender_phone} → sending aruna_yoga template")
-                    elif clean_text == "Afternoon":
-                        response_text = "🧘 Our 7:30 AM Yoga plan focuses on flexibility and core strength, perfect for mid-morning refreshment."
+                    
+                        # ── Afternoon Session → afternoon_meet template ──────────────────────────────
+                    # Triggered by interactive button_reply title OR button ID fallback.
+                    # The shared template pipeline handles IMAGE header automatically.
+                    elif clean_text == "Afternoon" or interactive_button_id == "afternoon_session":
+                        response_template = "afternoon_meet"
                         matched_rule = True
-                    elif clean_text == "Evening":
-                        response_text = "🧘 Our 10:30 AM Yoga plan is a gentle flow designed for stress relief and mindfulness."
+                        log_event(
+                            "afternoon_session_trigger",
+                            tenant_id=tenant_id,
+                            phone=sender_phone,
+                            status="matched",
+                            detail=f"button_title={clean_text!r} button_id={interactive_button_id!r}",
+                        )
+                        print(f"[WEBHOOK] Afternoon button matched for {sender_phone} → sending afternoon_meet template")
+                    # ── Evening Session → meet3 template ──────────────────────────────
+                    # Triggered by interactive button_reply title OR button ID fallback.
+                    # The shared template pipeline handles IMAGE header automatically.
+                    elif clean_text == "Evening" or interactive_button_id == "evening_session":
+                        response_template = "meet3"
                         matched_rule = True
+                        log_event(
+                            "evening_session_trigger",
+                            tenant_id=tenant_id,
+                            phone=sender_phone,
+                            status="matched",
+                            detail=f"button_title={clean_text!r} button_id={interactive_button_id!r}",
+                        )
+                        print(f"[WEBHOOK] Evening button matched for {sender_phone} → sending meet3 template")
 
                 # 2. Existing Chatbot Rules (DB-based)
                 if not matched_rule and chatbot["is_enabled"]:

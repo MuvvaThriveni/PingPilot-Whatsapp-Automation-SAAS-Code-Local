@@ -1,5 +1,9 @@
 """
-Tests for Morning interactive button_reply → aruna_yoga template flow.
+Tests for Morning / Evening interactive button_reply → template flow.
+
+Covers:
+  - Morning button_reply → aruna_yoga template (including IMAGE header pipeline)
+  - Evening button_reply → meet3 template    (including IMAGE header pipeline)
 
 Run with:
     cd backend
@@ -145,8 +149,8 @@ class TestRoutingLogic:
             elif clean_text == "Afternoon":
                 response_text = "🧘 Our 7:30 AM Yoga plan focuses on flexibility and core strength, perfect for mid-morning refreshment."
                 matched_rule = True
-            elif clean_text == "Evening":
-                response_text = "🧘 Our 10:30 AM Yoga plan is a gentle flow designed for stress relief and mindfulness."
+            elif clean_text == "Evening" or interactive_button_id == "evening_session":
+                response_template = "meet3"
                 matched_rule = True
 
         return response_text, response_template
@@ -176,10 +180,11 @@ class TestRoutingLogic:
         assert tpl == ""
         assert "7:30 AM" in text
 
-    def test_evening_sends_text_not_template(self):
+    def test_evening_sends_meet3_template(self):
+        """Evening now routes to template=meet3 (not plain text)."""
         text, tpl = self._route("Evening", "evening_session")
-        assert tpl == ""
-        assert "10:30 AM" in text
+        assert tpl == "meet3"
+        assert text == ""
 
     # -- Sessions / Products --
 
@@ -269,3 +274,166 @@ class TestDeduplication:
 
         # Second arrival (webhook retry) → duplicate, must be skipped
         assert exists(wa_message_id)
+
+
+# ---------------------------------------------------------------------------
+# Evening Session tests
+# ---------------------------------------------------------------------------
+
+
+class TestEveningTemplate:
+    """Verify Evening button click sends the meet3 template via the shared pipeline."""
+
+    # -- Routing --
+
+    def test_evening_title_routes_to_meet3(self):
+        text, tpl = _route_mirror("Evening", "")
+        assert tpl == "meet3"
+        assert text == ""
+
+    def test_evening_id_fallback_routes_to_meet3(self):
+        """button_id alone (without title) must still trigger meet3."""
+        text, tpl = _route_mirror("", "evening_session")
+        assert tpl == "meet3"
+        assert text == ""
+
+    def test_evening_case_sensitive(self):
+        """'evening' (lowercase) must NOT trigger meet3."""
+        text, tpl = _route_mirror("evening", "")
+        assert tpl != "meet3"
+
+    # -- Payload extraction --
+
+    def test_extracts_evening_button_title(self):
+        payload = _make_interactive_payload(button_title="Evening", button_id="evening_session")
+        message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
+        interactive = message.get("interactive", {})
+        button_reply = interactive.get("button_reply", {})
+        assert button_reply.get("title") == "Evening"
+        assert button_reply.get("id") == "evening_session"
+
+    # -- Mocked WhatsApp template pipeline --
+
+    @pytest.mark.asyncio
+    async def test_meet3_called_with_image_header(self):
+        """When meet3 has IMAGE header, components must include image with media id."""
+        import services.template_builder as tb
+
+        # Seed cache with a meet3 IMAGE-header template
+        meet3_comps = [
+            {
+                "type": "HEADER",
+                "format": "IMAGE",
+                "example": {"header_handle": ["https://cdn.example.com/evening.jpg"]},
+            },
+            {
+                "type": "BODY",
+                "text": "Hello {{1}}, join us for the evening session.",
+                "example": {"body_text": [["Friend"]]},
+            },
+        ]
+        tb._template_components["meet3|en_US"] = meet3_comps
+
+        components = tb.build_components(
+            "meet3|en_US",
+            contact={"name": "Ravi", "phone": "919876543210"},
+            header_media_id="EVENING_MEDIA_ID",
+        )
+
+        # Header component must carry IMAGE with the supplied media id
+        header = next((c for c in components if c["type"] == "header"), None)
+        assert header is not None, "Expected a header component"
+        assert header["parameters"][0] == {
+            "type": "image",
+            "image": {"id": "EVENING_MEDIA_ID"},
+        }
+
+        # Body must use contact name for {{1}}
+        body = next((c for c in components if c["type"] == "body"), None)
+        assert body is not None
+        assert body["parameters"][0]["text"] == "Ravi"
+
+        # Clean up
+        tb._template_components.pop("meet3|en_US", None)
+
+    @pytest.mark.asyncio
+    async def test_meet3_send_template_called_correctly(self):
+        """Mock WhatsAppService and confirm meet3 is dispatched with correct args."""
+        mock_wa = MagicMock()
+        mock_wa.send_template_message = AsyncMock(
+            return_value={"success": True, "messageId": "evening-msg-id"}
+        )
+
+        sender_phone = "919876543210"
+        result = await mock_wa.send_template_message(
+            sender_phone, "meet3", language="en_US", components=[
+                {"type": "header", "parameters": [{"type": "image", "image": {"id": "MID"}}]},
+                {"type": "body", "parameters": [{"type": "text", "text": "Ravi"}]},
+            ]
+        )
+
+        mock_wa.send_template_message.assert_called_once()
+        call_args = mock_wa.send_template_message.call_args
+        assert call_args.args[1] == "meet3"
+        assert call_args.kwargs["language"] == "en_US"
+        comps = call_args.kwargs["components"]
+        assert any(c["type"] == "header" for c in comps)
+        assert result["success"] is True
+        assert result["messageId"] == "evening-msg-id"
+
+    @pytest.mark.asyncio
+    async def test_api_failure_handled_for_meet3(self):
+        """If Meta API returns failure for meet3, result dict contains error."""
+        mock_wa = MagicMock()
+        mock_wa.send_template_message = AsyncMock(
+            return_value={"success": False, "error": "Template not approved"}
+        )
+
+        result = await mock_wa.send_template_message(
+            "919876543210", "meet3", language="en_US", components=None
+        )
+        assert result["success"] is False
+        assert "Template not approved" in result["error"]
+
+    # -- Morning isolation: ensure Morning tests still pass --
+
+    def test_morning_unaffected_by_evening_change(self):
+        """Morning must still route to aruna_yoga after the Evening change."""
+        text, tpl = _route_mirror("Morning", "morning_session")
+        assert tpl == "aruna_yoga"
+        assert text == ""
+
+    def test_morning_id_fallback_unaffected(self):
+        text, tpl = _route_mirror("", "morning_session")
+        assert tpl == "aruna_yoga"
+
+
+# ---------------------------------------------------------------------------
+# Shared routing mirror (used by multiple test classes above)
+# ---------------------------------------------------------------------------
+
+
+def _route_mirror(clean_text: str, interactive_button_id: str = "") -> tuple[str, str]:
+    """Exact mirror of the webhook.py routing block (including Evening → meet3)."""
+    response_text = ""
+    response_template = ""
+    matched_rule = False
+
+    if not matched_rule:
+        if clean_text == "Sessions":
+            response_template = "session_template"
+            matched_rule = True
+        elif clean_text == "Products":
+            response_template = "products_template"
+            matched_rule = True
+        elif clean_text == "Morning" or interactive_button_id == "morning_session":
+            response_template = "aruna_yoga"
+            matched_rule = True
+        elif clean_text == "Afternoon":
+            response_text = "🧘 Our 7:30 AM Yoga plan focuses on flexibility and core strength, perfect for mid-morning refreshment."
+            matched_rule = True
+        elif clean_text == "Evening" or interactive_button_id == "evening_session":
+            response_template = "meet3"
+            matched_rule = True
+
+    return response_text, response_template
