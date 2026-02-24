@@ -1,4 +1,7 @@
-"""Chatbot routes – auto-reply settings, rules, and conversations (Phase-3: multi-tenant)."""
+"""Chatbot routes – auto-reply settings, rules, and conversations (Phase-5: optimized).
+
+Caches expensive user-list endpoint. Reduces read-heavy polling impact.
+"""
 
 import datetime
 from fastapi import APIRouter, Request
@@ -9,6 +12,7 @@ from typing import Optional
 from store import get_chatbot_settings as _get_chatbot_settings, save_chatbot_settings as _save_chatbot_settings, get_chatbot_rules as _get_chatbot_rules
 from db_layer.chatbot import chatbot_rules as _db_rules
 from db_layer.chat_messages import chat_messages as _db_chat_messages
+from cache import cache, chat_users_key
 
 router = APIRouter(prefix="/api/chatbot", tags=["chatbot"])
 
@@ -51,12 +55,17 @@ async def update_chatbot_settings(request: Request, data: ChatbotSettingsModel):
     current = _get_chatbot_settings(tenant_id)
     current["is_enabled"] = data.is_enabled
     current["fallback_message"] = data.fallback_message
-    if data.use_ai is not None:
-        current["use_ai"] = data.use_ai
-    if data.ai_system_prompt is not None:
-        current["ai_system_prompt"] = data.ai_system_prompt
-    if data.openai_api_key is not None:
-        current["openai_api_key"] = data.openai_api_key.strip()
+    
+    # AI logic commented out to reflect the transition to a purely rule-based and triggered flow.
+    # if data.use_ai is not None:
+    #     current["use_ai"] = data.use_ai
+    # if data.ai_system_prompt is not None:
+    #     current["ai_system_prompt"] = data.ai_system_prompt
+    # if data.openai_api_key is not None:
+    #     current["openai_api_key"] = data.openai_api_key.strip()
+    
+    current["use_ai"] = False
+    
     _save_chatbot_settings(tenant_id, current)
     return {"success": True, "message": "Settings updated"}
 
@@ -136,38 +145,42 @@ async def get_conversations(request: Request, limit: int = 50, cursor: str = Non
 
 @router.get("/users")
 async def get_chat_users(request: Request):
-    """Get list of unique users with their latest message."""
+    """Get list of unique users with their latest message. Cached for 15 s."""
     tenant_id = request.state.tenant_id
-    raw, _ = _db_chat_messages.get_conversation_list(tenant_id, limit=500)
-    source = [_remap_chat_msg(m) for m in raw]
 
-    users_map = {}
-    for conv in source:
-        phone = conv.get("sender_phone", "")
-        if not phone:
-            continue
-        if phone not in users_map:
-            users_map[phone] = {
-                "phone": phone,
-                "name": conv.get("sender_name", "Unknown"),
-                "last_message": conv.get("message_text", ""),
-                "last_message_at": conv.get("created_at", ""),
-                "direction": conv.get("direction", "incoming"),
-            }
-        else:
-            if conv.get("created_at", "") > users_map[phone]["last_message_at"]:
-                users_map[phone]["last_message"] = conv.get("message_text", "")
-                users_map[phone]["last_message_at"] = conv.get("created_at", "")
-                users_map[phone]["direction"] = conv.get("direction", "incoming")
-            if conv.get("sender_name") and conv.get("sender_name") != "Unknown":
-                users_map[phone]["name"] = conv.get("sender_name")
-    
-    users_list = sorted(users_map.values(), key=lambda x: x["last_message_at"], reverse=True)
+    def _fetch_users():
+        raw, _ = _db_chat_messages.get_conversation_list(tenant_id, limit=200)
+        source = [_remap_chat_msg(m) for m in raw]
+
+        users_map = {}
+        for conv in source:
+            phone = conv.get("sender_phone", "")
+            if not phone:
+                continue
+            if phone not in users_map:
+                users_map[phone] = {
+                    "phone": phone,
+                    "name": conv.get("sender_name", "Unknown"),
+                    "last_message": conv.get("message_text", ""),
+                    "last_message_at": conv.get("created_at", ""),
+                    "direction": conv.get("direction", "incoming"),
+                }
+            else:
+                if conv.get("created_at", "") > users_map[phone]["last_message_at"]:
+                    users_map[phone]["last_message"] = conv.get("message_text", "")
+                    users_map[phone]["last_message_at"] = conv.get("created_at", "")
+                    users_map[phone]["direction"] = conv.get("direction", "incoming")
+                if conv.get("sender_name") and conv.get("sender_name") != "Unknown":
+                    users_map[phone]["name"] = conv.get("sender_name")
+
+        return sorted(users_map.values(), key=lambda x: x["last_message_at"], reverse=True)
+
+    users_list = cache.get_or_fetch(chat_users_key(tenant_id), _fetch_users, ttl=15.0)
     return {"users": users_list}
 
 
 @router.get("/conversations/{phone}")
-async def get_user_conversations(request: Request, phone: str, limit: int = 100, cursor: str = None):
+async def get_user_conversations(request: Request, phone: str, limit: int = 50, cursor: str = None):
     """Get all conversations for a specific user."""
     tenant_id = request.state.tenant_id
     db_msgs, next_cursor = _db_chat_messages.get_user_messages(tenant_id, phone, limit=limit, cursor=cursor)

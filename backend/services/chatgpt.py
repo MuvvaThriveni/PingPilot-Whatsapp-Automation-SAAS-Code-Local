@@ -23,6 +23,7 @@ class ChatGPTService:
         self.system_prompt = system_prompt or (
             "You are a helpful customer service assistant for a business. "
             "Be friendly, concise, and helpful. Answer questions clearly and professionally. "
+            "Please keep your response strictly under 1500 characters. "
             "If you don't know something, politely say so and offer to connect them with a human agent."
         )
 
@@ -49,11 +50,18 @@ class ChatGPTService:
             }
 
         # Build messages array with system prompt + conversation history
-        # Note: the incoming user message is already persisted to chat_messages
-        # by the webhook handler BEFORE this method is called, so it will be
-        # included in the context returned by build_ai_context.
+        # Note: We explicitly handle the current message to ensure it's present 
+        # (even if DB is slow) and not duplicated (if DB is fast).
+        history = self._get_conversation_history(tenant_id, phone)
+        
+        # Deduplicate: If the last message in history is the current user message, remove it.
+        # We will append it freshly below.
+        if history and history[-1]["role"] == "user" and history[-1]["content"] == message:
+            history.pop()
+            
         messages = [{"role": "system", "content": self.system_prompt}]
-        messages.extend(self._get_conversation_history(tenant_id, phone))
+        messages.extend(history)
+        messages.append({"role": "user", "content": message})
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -64,7 +72,7 @@ class ChatGPTService:
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": "gpt-3.5-turbo",
+                        "model": "gpt-4-turbo",
                         "messages": messages,
                         "max_tokens": 500,
                         "temperature": 0.7,
@@ -92,8 +100,16 @@ _chatgpt_service: ChatGPTService = None
 
 
 def get_chatgpt_service(api_key: str = None, system_prompt: str = None) -> ChatGPTService:
-    """Get or create ChatGPT service instance."""
+    """Get ChatGPT service instance.
+    
+    If api_key or system_prompt are provided, returns a NEW instance with those settings.
+    If no args provided, returns the singleton instance (creating if needed).
+    """
     global _chatgpt_service
-    if _chatgpt_service is None or api_key:
-        _chatgpt_service = ChatGPTService(api_key, system_prompt)
+    
+    if api_key or system_prompt is not None:
+        return ChatGPTService(api_key, system_prompt)
+        
+    if _chatgpt_service is None:
+        _chatgpt_service = ChatGPTService()
     return _chatgpt_service

@@ -40,8 +40,8 @@ export default function ChatbotPage() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
-  const [settings, setSettings] = useState<ChatbotSettings>({ 
-    is_enabled: 0, 
+  const [settings, setSettings] = useState<ChatbotSettings>({
+    is_enabled: 0,
     fallback_message: '',
     use_ai: true,
     ai_system_prompt: '',
@@ -55,13 +55,13 @@ export default function ChatbotPage() {
 
   useEffect(() => {
     fetchData()
-    // Auto-refresh every 5 seconds
+    // Auto-refresh every 30 seconds (reduced from 5s to cut Firestore quota)
     const interval = setInterval(() => {
       fetchUsersQuietly()
       if (selectedUser) {
         fetchUserConversationsQuietly(selectedUser.phone)
       }
-    }, 5000)
+    }, 30000)
     return () => clearInterval(interval)
   }, [selectedUser])
 
@@ -130,8 +130,8 @@ export default function ChatbotPage() {
 
   const handleToggle = async (enabled: boolean) => {
     try {
-      await chatbot.updateSettings({ 
-        is_enabled: enabled, 
+      await chatbot.updateSettings({
+        is_enabled: enabled,
         fallback_message: settings.fallback_message,
         use_ai: settings.use_ai,
         ai_system_prompt: settings.ai_system_prompt,
@@ -173,8 +173,8 @@ export default function ChatbotPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold text-gray-900">AI Auto-Reply Chatbot</h1>
-        <p className="text-gray-500 mt-1">Automatically respond to incoming WhatsApp messages using ChatGPT</p>
+        <h1 className="text-2xl font-bold text-gray-900">WhatsApp Chatbot Trigger</h1>
+        <p className="text-gray-500 mt-1">Configure auto-trigger rules and fallback messages</p>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
@@ -211,7 +211,7 @@ export default function ChatbotPage() {
               </span>
             </div>
 
-            {/* OpenAI API Key */}
+            {/* OpenAI API Key (Disabled)
             <div className="space-y-2">
               <Label htmlFor="apiKey">OpenAI API Key</Label>
               <Input
@@ -225,8 +225,9 @@ export default function ChatbotPage() {
                 Get your API key from <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">OpenAI Dashboard</a>
               </p>
             </div>
+            */}
 
-            {/* AI System Prompt */}
+            {/* AI System Prompt (Disabled)
             <div className="space-y-2">
               <Label htmlFor="systemPrompt">AI System Prompt</Label>
               <Textarea
@@ -235,12 +236,20 @@ export default function ChatbotPage() {
                 value={settings.ai_system_prompt || ''}
                 onChange={(e) => setSettings({ ...settings, ai_system_prompt: e.target.value })}
                 rows={4}
+                maxLength={1500}
               />
-              <p className="text-xs text-gray-500">
-                Instructions for how the AI should behave and respond
-              </p>
+              <div className="flex justify-between">
+                <p className="text-xs text-gray-500">
+                  Instructions for how the AI should behave and respond
+                </p>
+                <p className="text-xs text-gray-500">
+                  {(settings.ai_system_prompt || '').length}/1500
+                </p>
+              </div>
             </div>
+            */}
 
+            {/* Fallback Message (Disabled - replaced by first_trigger template)
             <div className="space-y-2">
               <Label htmlFor="fallback">Fallback Message</Label>
               <Textarea
@@ -254,6 +263,7 @@ export default function ChatbotPage() {
                 Sent when AI fails or API key is not configured
               </p>
             </div>
+            */}
 
             <Button onClick={handleSaveSettings} disabled={saving} className="w-full">
               {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
@@ -279,11 +289,10 @@ export default function ChatbotPage() {
                     <div
                       key={user.phone}
                       onClick={() => handleSelectUser(user)}
-                      className={`p-3 rounded-lg cursor-pointer transition-colors ${
-                        selectedUser?.phone === user.phone
-                          ? 'bg-blue-100 border-blue-300 border'
-                          : 'bg-gray-50 hover:bg-gray-100'
-                      }`}
+                      className={`p-3 rounded-lg cursor-pointer transition-colors ${selectedUser?.phone === user.phone
+                        ? 'bg-blue-100 border-blue-300 border'
+                        : 'bg-gray-50 hover:bg-gray-100'
+                        }`}
                     >
                       <div className="flex items-center gap-2">
                         <User className="h-8 w-8 p-1.5 bg-gray-200 rounded-full text-gray-600" />
@@ -339,11 +348,10 @@ export default function ChatbotPage() {
                         {userConversations.map((conv, index) => (
                           <div
                             key={index}
-                            className={`p-3 rounded-lg max-w-[85%] ${
-                              conv.direction === 'incoming'
-                                ? 'bg-gray-100'
-                                : 'bg-green-100 ml-auto'
-                            }`}
+                            className={`p-3 rounded-lg max-w-[85%] ${conv.direction === 'incoming'
+                              ? 'bg-gray-100'
+                              : 'bg-green-100 ml-auto'
+                              }`}
                           >
                             <p className="text-sm">{conv.message_text}</p>
                             <p className="text-xs text-gray-400 mt-1">

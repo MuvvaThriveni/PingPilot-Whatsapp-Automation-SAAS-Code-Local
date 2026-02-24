@@ -17,13 +17,14 @@ export default function SettingsPage() {
   const [showToken, setShowToken] = useState(false)
   const [connectionStatus, setConnectionStatus] = useState<'unknown' | 'success' | 'error'>('unknown')
   const [connectionInfo, setConnectionInfo] = useState<{ phoneNumber?: string; verifiedName?: string } | null>(null)
-  
+
   const [formData, setFormData] = useState({
     business_account_id: '',
     phone_number_id: '',
     access_token: '',
     webhook_verify_token: ''
   })
+  const [hasExistingToken, setHasExistingToken] = useState(false)
 
   useEffect(() => {
     fetchSettings()
@@ -36,9 +37,11 @@ export default function SettingsPage() {
         setFormData({
           business_account_id: res.data.settings.business_account_id || '',
           phone_number_id: res.data.settings.phone_number_id || '',
-          access_token: '',
+          access_token: '',   // never pre-fill token in UI for security
           webhook_verify_token: res.data.settings.webhook_verify_token || ''
         })
+        // Mark whether a token already exists so we don't require re-entry
+        setHasExistingToken(res.data.settings.is_configured === true)
       }
     } catch (error) {
       console.error('Failed to fetch settings:', error)
@@ -48,16 +51,32 @@ export default function SettingsPage() {
   }
 
   const handleSave = async () => {
-    if (!formData.business_account_id || !formData.phone_number_id || !formData.access_token) {
-      toast({ title: 'Error', description: 'Please fill in all required fields', variant: 'destructive' })
+    // Token required only if there's no existing token saved
+    if (!formData.business_account_id || !formData.phone_number_id) {
+      toast({ title: 'Error', description: 'Please fill in Business Account ID and Phone Number ID', variant: 'destructive' })
+      return
+    }
+    if (!hasExistingToken && !formData.access_token.trim()) {
+      toast({ title: 'Error', description: 'Access token is required for first-time setup', variant: 'destructive' })
       return
     }
 
     setSaving(true)
     try {
-      await settings.saveWhatsApp(formData)
+      // Only send access_token if user typed a new one — otherwise backend keeps existing
+      const payload: any = {
+        business_account_id: formData.business_account_id,
+        phone_number_id: formData.phone_number_id,
+        webhook_verify_token: formData.webhook_verify_token,
+      }
+      if (formData.access_token.trim()) {
+        payload.access_token = formData.access_token.trim()
+      }
+      await settings.saveWhatsApp(payload)
       toast({ title: 'Settings saved', description: 'WhatsApp configuration updated successfully' })
       setConnectionStatus('unknown')
+      setHasExistingToken(true)
+      setFormData(prev => ({ ...prev, access_token: '' }))  // clear field after save
     } catch (error: any) {
       toast({
         title: 'Failed to save',
@@ -127,9 +146,8 @@ export default function SettingsPage() {
         <CardContent className="space-y-6">
           {/* Connection Status */}
           {connectionStatus !== 'unknown' && (
-            <div className={`flex items-center space-x-3 p-4 rounded-lg ${
-              connectionStatus === 'success' ? 'bg-green-50' : 'bg-red-50'
-            }`}>
+            <div className={`flex items-center space-x-3 p-4 rounded-lg ${connectionStatus === 'success' ? 'bg-green-50' : 'bg-red-50'
+              }`}>
               {connectionStatus === 'success' ? (
                 <CheckCircle className="h-5 w-5 text-green-600" />
               ) : (
@@ -178,12 +196,12 @@ export default function SettingsPage() {
 
           {/* Access Token */}
           <div className="space-y-2">
-            <Label htmlFor="access_token">Access Token *</Label>
+            <Label htmlFor="access_token">Access Token {hasExistingToken ? '(leave blank to keep existing)' : '*'}</Label>
             <div className="relative">
               <Input
                 id="access_token"
                 type={showToken ? 'text' : 'password'}
-                placeholder="Enter your permanent access token"
+                placeholder={hasExistingToken ? '(unchanged — enter new token to update)' : 'Enter your permanent access token'}
                 value={formData.access_token}
                 onChange={(e) => setFormData({ ...formData, access_token: e.target.value })}
                 className="pr-10"
@@ -197,7 +215,7 @@ export default function SettingsPage() {
               </button>
             </div>
             <p className="text-xs text-gray-500">
-              Generate a permanent token in Meta Developer Portal
+              {hasExistingToken ? 'A token is already saved. Only enter a new one if you want to update it.' : 'Generate a permanent token in Meta Developer Portal'}
             </p>
           </div>
 

@@ -142,7 +142,7 @@ class _Campaigns:
 
     @staticmethod
     def list_running() -> list[dict]:
-        """Find all campaigns with status 'running' (for resume on restart)."""
+        """Find all campaigns with status 'running'."""
         col = _col()
         if not col:
             return []
@@ -151,6 +151,24 @@ class _Campaigns:
             return [doc.to_dict() for doc in docs]
         except Exception as e:
             print(f"[db_layer.campaigns] list_running failed: {e}")
+            return []
+
+    @staticmethod
+    def get_due_scheduled() -> list[dict]:
+        """Find campaigns with status 'scheduled' whose scheduled_at time has passed."""
+        col = _col()
+        if not col:
+            return []
+        try:
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            docs = (
+                col.where("status", "==", "scheduled")
+                .where("scheduled_at", "<=", now)
+                .stream()
+            )
+            return [doc.to_dict() for doc in docs]
+        except Exception as e:
+            print(f"[db_layer.campaigns] get_due_scheduled failed: {e}")
             return []
 
     @staticmethod

@@ -43,29 +43,47 @@ class _Secrets:
 
     @staticmethod
     def resolve_wa_token(tenant_doc: dict) -> str:
-        """Resolve the WhatsApp access token for a tenant."""
+        """Resolve the WhatsApp access token for a tenant.
+
+        Priority:
+          1. 'access_token' stored directly in Firestore (survives restarts)
+          2. 'token_ref' env-var reference (legacy / env-based deployments)
+        """
+        def _strip_bearer(val: str) -> str:
+            if val and val.lower().startswith("bearer "):
+                return val[7:].strip()
+            return val
+
+        # Primary: direct field in Firestore document
+        direct = tenant_doc.get("access_token", "")
+        if direct:
+            return _strip_bearer(direct)
+
+        # Fallback: env-var reference
         ref = tenant_doc.get("token_ref", "")
         resolved = resolve(ref)
         if resolved:
-            # Strip "Bearer " prefix if present (safety for tokens saved before prefix stripping)
-            if resolved.lower().startswith("bearer "):
-                resolved = resolved[7:].strip()
-            return resolved
-        # Fallback: check legacy field still in memory during migration
-        token = tenant_doc.get("access_token", "")
-        if token.lower().startswith("bearer "):
-            token = token[7:].strip()
-        return token
+            return _strip_bearer(resolved)
 
-    @staticmethod
-    def resolve_openai_key(chatbot_doc: dict) -> str:
-        """Resolve the OpenAI API key for a tenant's chatbot config."""
-        ref = chatbot_doc.get("openai_key_ref", "")
-        resolved = resolve(ref)
-        if resolved:
-            return resolved
-        # Fallback: check legacy field still in memory during migration
-        return chatbot_doc.get("openai_api_key", "")
+        return ""
+
+    # @staticmethod
+    # def resolve_openai_key(chatbot_doc: dict) -> str:
+    #     """Resolve the OpenAI API key for a tenant's chatbot config.
+    #
+    #     Priority:
+    #       1. 'openai_api_key' stored directly in Firestore (survives restarts)
+    #       2. 'openai_key_ref' env-var reference (legacy / env-based deployments)
+    #     """
+    #     # Primary: direct field in Firestore document
+    #     direct = chatbot_doc.get("openai_api_key", "")
+    #     if direct:
+    #         return direct
+    #
+    #     # Fallback: env-var reference
+    #     ref = chatbot_doc.get("openai_key_ref", "")
+    #     resolved = resolve(ref)
+    #     return resolved if resolved else ""
 
 
 secrets = _Secrets()

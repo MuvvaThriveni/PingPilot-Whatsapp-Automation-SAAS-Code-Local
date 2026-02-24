@@ -1,15 +1,20 @@
 from __future__ import annotations
 
-"""Firestore operations for the `webhook_events` collection.
+"""Firestore operations for the `webhook_events` collection (Phase-5: optimized).
 
-Doc ID: deterministic hash for deduplication.
-Stores raw webhook payloads for audit and idempotent processing.
-Write frequency: HIGH.
+Deduplication and auditing for incoming webhooks.
+Doc ID: deterministic hash of event data.
+Write frequency: Medium.
+
+Optimizations:
+- exists() uses get() instead of query (1 read vs N)
+- All queries use .limit()
+- Cached exists check for recent events
 """
 
-import hashlib
 import datetime
 from firebase_config import get_db
+from cache import cache
 
 
 def _col():
@@ -17,92 +22,85 @@ def _col():
     return db.collection("webhook_events") if db else None
 
 
-def _make_doc_id(wa_message_id: str, event_type: str) -> str:
-    """Deterministic doc ID for deduplication."""
-    raw = f"{wa_message_id}:{event_type}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:32]
-
-
 class _WebhookEvents:
 
     @staticmethod
-    def exists(wa_message_id: str, event_type: str = "message") -> bool:
-        """Check if this webhook event was already processed (idempotency)."""
+    def exists(event_id: str) -> bool:
+        """Check if an event has already been processed. Cached for 120 s.
+        
+        Uses direct document get() instead of query — 1 read vs scanning.
+        """
+        cache_key = f"webhook_exists:{event_id}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         col = _col()
         if not col:
             return False
         try:
-            doc_id = _make_doc_id(wa_message_id, event_type)
-            doc = col.document(doc_id).get()
-            if doc.exists:
-                data = doc.to_dict()
-                return data.get("processed", False)
-            return False
+            doc = col.document(event_id).get()
+            result = doc.exists
+            cache.set(cache_key, result, ttl=120.0)
+            return result
         except Exception as e:
-            print(f"[db_layer.webhook_events] exists check failed: {e}")
+            print(f"[db_layer.webhook_events] exists({event_id}) failed: {e}")
             return False
 
     @staticmethod
-    def record(tenant_id: str, wa_message_id: str, event_type: str,
-               sender_phone: str = "", status: str = "",
-               raw_payload: dict = None, processed: bool = False):
-        """Record a webhook event. Uses deterministic ID for dedup."""
+    def record(event_id: str, tenant_id: str, data: dict):
+        """Record a new webhook event for deduplication."""
         col = _col()
         if not col:
             return
         try:
-            doc_id = _make_doc_id(wa_message_id, event_type)
-            data = {
+            # Only store required fields
+            doc = {
                 "tenant_id": tenant_id,
-                "event_type": event_type,
-                "wa_message_id": wa_message_id,
-                "sender_phone": sender_phone,
-                "status": status,
-                "processed": processed,
+                "event_type": data.get("event_type", ""),
+                "status": "received",
                 "created_at": datetime.datetime.utcnow().isoformat(),
             }
-            if raw_payload:
-                # Truncate to avoid exceeding 1MB doc limit
-                import json
-                payload_str = json.dumps(raw_payload)
-                if len(payload_str) > 50000:
-                    data["raw_payload_truncated"] = True
-                    data["raw_payload"] = json.loads(payload_str[:50000])
-                else:
-                    data["raw_payload"] = raw_payload
-            col.document(doc_id).set(data)
+            col.document(event_id).set(doc)
+            # Mark as existing in cache
+            cache.set(f"webhook_exists:{event_id}", True, ttl=120.0)
         except Exception as e:
-            print(f"[db_layer.webhook_events] record failed: {e}")
+            print(f"[db_layer.webhook_events] record({event_id}) failed: {e}")
 
     @staticmethod
-    def mark_processed(wa_message_id: str, event_type: str = "message"):
+    def mark_processed(event_id: str):
         """Mark a webhook event as processed."""
         col = _col()
         if not col:
             return
         try:
-            doc_id = _make_doc_id(wa_message_id, event_type)
-            col.document(doc_id).update({
-                "processed": True,
+            col.document(event_id).update({
+                "status": "processed",
                 "processed_at": datetime.datetime.utcnow().isoformat(),
             })
         except Exception as e:
-            print(f"[db_layer.webhook_events] mark_processed failed: {e}")
+            print(f"[db_layer.webhook_events] mark_processed({event_id}) failed: {e}")
 
     @staticmethod
-    def get_unprocessed(tenant_id: str, limit: int = 100) -> list[dict]:
-        """Get unprocessed events for reprocessing."""
+    def get_unprocessed(limit: int = 50) -> list[dict]:
+        """Get unprocessed events. Hard-capped at 100."""
+        limit = max(1, min(limit, 100))
         col = _col()
         if not col:
             return []
         try:
             docs = (
-                col.where("tenant_id", "==", tenant_id)
-                .where("processed", "==", False)
+                col.where("status", "==", "received")
+                .order_by("created_at", direction="ASCENDING")
                 .limit(limit)
                 .stream()
             )
-            return [doc.to_dict() for doc in docs]
+            results = []
+            for doc in docs:
+                d = doc.to_dict()
+                d["_doc_id"] = doc.id
+                results.append(d)
+            return results
         except Exception as e:
             print(f"[db_layer.webhook_events] get_unprocessed failed: {e}")
             return []
