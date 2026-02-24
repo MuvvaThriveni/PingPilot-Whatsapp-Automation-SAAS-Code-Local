@@ -14,6 +14,12 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from store import get_settings, get_chatbot_settings
 from services.whatsapp import WhatsAppService
 from services.chatgpt import get_chatgpt_service
+from services.template_builder import (
+    ensure_cached as _ensure_template_cached,
+    upload_header_media as _upload_header_media,
+    build_components as _build_template_components,
+    _template_components,
+)
 from db_layer.tenants import tenants as _db_tenants
 from observability import log_event
 from db_layer.webhook_events import webhook_events as _db_webhook
@@ -148,8 +154,17 @@ async def handle_webhook(body: dict):
                     # Handle interactive button replies
                     interactive = message.get("interactive", {})
                     if interactive.get("type") == "button_reply":
-                        message_text = interactive.get("button_reply", {}).get("title", "").strip()
+                        button_reply_data = interactive.get("button_reply", {})
+                        message_text = button_reply_data.get("title", "").strip()
+                        # Capture button ID for fallback matching (e.g. morning_session)
+                        interactive_button_id = button_reply_data.get("id", "").strip()
+                    else:
+                        interactive_button_id = ""
                 
+                # For non-interactive messages there is no button_id
+                if message_type != "interactive":
+                    interactive_button_id = ""
+
                 now = datetime.datetime.now().isoformat()
 
                 # Skip if no content readable for routing
@@ -214,13 +229,23 @@ async def handle_webhook(body: dict):
                     elif clean_text == "Products":
                         response_template = "products_template"
                         matched_rule = True
-                    elif clean_text == "6:30 AM":
-                        response_text = "🧘 Our 6:30 AM Yoga plan includes Surya Namaskar, Pranayama, and light meditation to start your day with energy!"
+                    # ── Morning Session → aruna_yoga template ─────────────────────
+                    # Triggered by interactive button_reply title OR button ID fallback
+                    elif clean_text == "Morning" or interactive_button_id == "morning_session":
+                        response_template = "aruna_yoga"
                         matched_rule = True
-                    elif clean_text == "7:30 Am":
+                        log_event(
+                            "morning_session_trigger",
+                            tenant_id=tenant_id,
+                            phone=sender_phone,
+                            status="matched",
+                            detail=f"button_title={clean_text!r} button_id={interactive_button_id!r}",
+                        )
+                        print(f"[WEBHOOK] Morning button matched for {sender_phone} → sending aruna_yoga template")
+                    elif clean_text == "Afternoon":
                         response_text = "🧘 Our 7:30 AM Yoga plan focuses on flexibility and core strength, perfect for mid-morning refreshment."
                         matched_rule = True
-                    elif clean_text == "10:30 AM":
+                    elif clean_text == "Evening":
                         response_text = "🧘 Our 10:30 AM Yoga plan is a gentle flow designed for stress relief and mindfulness."
                         matched_rule = True
 
@@ -252,22 +277,68 @@ async def handle_webhook(body: dict):
                     final_msg_content = response_text
                     
                     if response_template:
-                        components = None
-                        # If first_trigger has a parameter {{1}} for the name
-                        if response_template == "first_trigger":
+                        # ── Shared template builder (same as bulk campaigns) ──────────────
+                        # Resolve the canonical "name|language" cache key so we can look up
+                        # the template metadata and derive the correct language code.
+                        tpl_name = response_template
+                        tpl_language = "en_US"  # sensible default
+
+                        if "|" in response_template:
+                            # Caller already provided a fully-qualified key
+                            tpl_name, tpl_language = response_template.split("|", 1)
+                        else:
+                            # Try to find the key in the cache (any language suffix)
+                            matching_keys = [
+                                k for k in _template_components
+                                if k == response_template or k.startswith(response_template + "|")
+                            ]
+                            if matching_keys:
+                                tpl_language = matching_keys[0].split("|", 1)[1]
+                            # else: will fetch below; language resolved after cache hit
+
+                        # Build the canonical key used by the builder
+                        canonical_key = f"{tpl_name}|{tpl_language}"
+
+                        # Ensure template metadata is cached (fetch from API if missing)
+                        found = await _ensure_template_cached(canonical_key, whatsapp, settings)
+
+                        # If still not found under the guessed language, try a wildcard
+                        if not found:
+                            matching_keys = [
+                                k for k in _template_components
+                                if k.startswith(tpl_name + "|")
+                            ]
+                            if matching_keys:
+                                canonical_key = matching_keys[0]
+                                tpl_language = canonical_key.split("|", 1)[1]
+                                found = True
+
+                        # Auto-upload header media (IMAGE/VIDEO/DOCUMENT) from example handle
+                        header_media_id = ""
+                        if found:
+                            header_media_id = await _upload_header_media(canonical_key, whatsapp)
+
+                        # Build components (handles IMAGE/VIDEO/DOCUMENT/TEXT headers + BODY params)
+                        # contact dict carries the sender name for {{1}} BODY params
+                        contact_ctx = {"name": sender_name, "phone": sender_phone}
+                        components = _build_template_components(
+                            canonical_key,
+                            contact=contact_ctx,
+                            header_media_id=header_media_id,
+                        ) or None
+
+                        # first_trigger body-only override (no header media needed)
+                        if response_template == "first_trigger" and not components:
                             components = [{
                                 "type": "body",
-                                "parameters": [
-                                    {"type": "text", "text": sender_name}
-                                ]
+                                "parameters": [{"type": "text", "text": sender_name}],
                             }]
-                        
-                        # Use 'en' as the language code since Meta UI says "English"
+
                         result = await whatsapp.send_template_message(
-                            sender_phone, 
-                            response_template, 
-                            language="en",
-                            components=components
+                            sender_phone,
+                            tpl_name,
+                            language=tpl_language,
+                            components=components,
                         )
                         final_msg_content = f"Template: {response_template}"
                     elif response_text:

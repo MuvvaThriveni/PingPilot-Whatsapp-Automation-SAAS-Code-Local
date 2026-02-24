@@ -12,13 +12,19 @@ import re
 import uuid
 import asyncio
 import datetime
-import httpx
 from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import pandas as pd
 
 from store import get_settings, active_campaigns, add_message
 from services.whatsapp import WhatsAppService
+from services.template_builder import (
+    get_components as _get_template_components,
+    build_components as _build_template_components,
+    ensure_cached as _ensure_template_cached,
+    upload_header_media as _upload_header_media,
+    _template_components,
+)
 from observability import log_event
 from db_layer.campaigns import campaigns as _db_campaigns
 from db_layer.campaign_recipients import campaign_recipients as _db_recipients
@@ -26,8 +32,8 @@ from db_layer.campaign_counters import campaign_counters as _db_counters
 
 router = APIRouter(prefix="/api/bulk-message", tags=["bulk-message"])
 
-# Process-local template component cache (rebuilt on miss from WhatsApp API)
-_template_components: dict = {}
+# NOTE: _template_components cache lives in services.template_builder (shared with webhook.py).
+# It is imported above for the legacy cache-key check in _process_campaign.
 
 # Process-local campaign cache for status polling when Firestore is unavailable.
 _recent_campaign_status: dict = {}
@@ -112,119 +118,8 @@ async def get_templates(request: Request):
     return {"templates": approved}
 
 
-def _get_template_components(template_key: str, tenant_id: str = "") -> list:
-    """Get cached template components (process-local cache)."""
-    if template_key in _template_components:
-        return _template_components[template_key]
-    return []
-
-
-def _build_template_components(template_key: str, contact: dict = None, header_media_id: str = "") -> list:
-    """Auto-build the components array for a template based on cached metadata.
-
-    Priority for media headers:
-      1. header_media_id     — pre-uploaded permanent WhatsApp media ID (no URL needed)
-      2. contact imageUrl    — per-contact URL from spreadsheet or headerImageUrl field
-      3. Nothing             — header component is omitted (text-only templates)
-    """
-    cached = _get_template_components(template_key, contact.get("_tenant_id", "") if contact else "")
-    if not cached:
-        return []
-
-    components = []
-    for comp in cached:
-        comp_type = comp.get("type", "")
-        example = comp.get("example", {})
-
-        # HEADER component
-        if comp_type == "HEADER":
-            header_format = comp.get("format", "TEXT")
-            if header_format == "TEXT":
-                text = comp.get("text", "")
-                params = re.findall(r"\{\{\d+\}\}", text)
-                if params:
-                    example_texts = example.get("header_text", [])
-                    parameters = []
-                    for i, _ in enumerate(params):
-                        if i == 0 and contact and contact.get("name"):
-                            parameters.append({"type": "text", "text": contact["name"]})
-                        elif i < len(example_texts):
-                            parameters.append({"type": "text", "text": example_texts[i]})
-                        else:
-                            parameters.append({"type": "text", "text": " "})
-                    components.append({
-                        "type": "header",
-                        "parameters": parameters,
-                    })
-            elif header_format == "IMAGE":
-                if header_media_id:
-                    # Use pre-uploaded permanent media ID (preferred — no URL expiry issues)
-                    components.append({
-                        "type": "header",
-                        "parameters": [{"type": "image", "image": {"id": header_media_id}}],
-                    })
-                else:
-                    image_link = (contact or {}).get("imageUrl", "").strip()
-                    if image_link:
-                        components.append({
-                            "type": "header",
-                            "parameters": [{"type": "image", "image": {"link": image_link}}],
-                        })
-                    else:
-                        print(f"[BULK] WARNING: Template has IMAGE header but no mediaId or imageUrl. Skipping header component.")
-            elif header_format == "VIDEO":
-                if header_media_id:
-                    components.append({
-                        "type": "header",
-                        "parameters": [{"type": "video", "video": {"id": header_media_id}}],
-                    })
-                else:
-                    video_link = (contact or {}).get("videoUrl", "").strip()
-                    if video_link:
-                        components.append({
-                            "type": "header",
-                            "parameters": [{"type": "video", "video": {"link": video_link}}],
-                        })
-                    else:
-                        print(f"[BULK] WARNING: Template has VIDEO header but no mediaId or videoUrl. Skipping header component.")
-            elif header_format == "DOCUMENT":
-                if header_media_id:
-                    components.append({
-                        "type": "header",
-                        "parameters": [{"type": "document", "document": {"id": header_media_id}}],
-                    })
-                else:
-                    doc_link = (contact or {}).get("documentUrl", "").strip()
-                    if doc_link:
-                        components.append({
-                            "type": "header",
-                            "parameters": [{"type": "document", "document": {"link": doc_link}}],
-                        })
-                    else:
-                        print(f"[BULK] WARNING: Template has DOCUMENT header but no mediaId or documentUrl. Skipping header component.")
-
-        # BODY component
-        elif comp_type == "BODY":
-            text = comp.get("text", "")
-            params = re.findall(r"\{\{\d+\}\}", text)
-            if params:
-                example_texts = example.get("body_text", [[]])[0] if example.get("body_text") else []
-                parameters = []
-                for i, _ in enumerate(params):
-                    if i == 0 and contact and contact.get("name"):
-                        parameters.append({"type": "text", "text": contact["name"]})
-                    elif i == 1 and contact and contact.get("phone"):
-                        parameters.append({"type": "text", "text": contact["phone"]})
-                    elif i < len(example_texts):
-                        parameters.append({"type": "text", "text": example_texts[i]})
-                    else:
-                        parameters.append({"type": "text", "text": " "})
-                components.append({
-                    "type": "body",
-                    "parameters": parameters,
-                })
-
-    return components
+# _get_template_components and _build_template_components are now imported from
+# services.template_builder as aliases above.
 
 
 def _find_column(df_columns, keywords):
@@ -449,44 +344,10 @@ async def _process_campaign(campaign_id: str):
         print(f"[BULK] Starting campaign={campaign_id} template='{template_str}' phone_number_id='{settings.get('phone_number_id')}' token_set={bool(settings.get('access_token'))}")
 
         # Ensure template metadata is cached (fetch from WhatsApp API if missing)
-        if template_str not in _template_components:
-            print(f"[BULK] Template '{template_str}' not in cache — fetching from WhatsApp API...")
-            tmpl_result = await whatsapp.get_templates(settings["business_account_id"])
-            if tmpl_result["success"]:
-                for t in tmpl_result["templates"]:
-                    key = f"{t['name']}|{t['language']}"
-                    _template_components[key] = t.get("components", [])
-                print(f"[BULK] Cached {len(tmpl_result['templates'])} templates. Target key '{template_str}' found={template_str in _template_components}")
-            else:
-                print(f"[BULK] WARNING: Could not fetch templates: {tmpl_result.get('error')} — sending without components")
-        else:
-            print(f"[BULK] Template '{template_str}' found in cache.")
+        await _ensure_template_cached(template_str, whatsapp, settings)
 
-        # ── Auto-upload template header media ────────────────────────────────────────
-        header_media_id = ""  # will be populated by auto-upload below if template has example media
-        if template_str in _template_components:
-            for comp in _template_components[template_str]:
-                if comp.get("type") == "HEADER" and comp.get("format") in ("IMAGE", "VIDEO", "DOCUMENT"):
-                    handle_list = (comp.get("example") or {}).get("header_handle") or []
-                    handle_url = handle_list[0] if handle_list else ""
-                    if handle_url:
-                        print(f"[BULK] Auto-uploading template header media from example handle...")
-                        try:
-                            async with httpx.AsyncClient(timeout=30.0) as client:
-                                dl = await client.get(handle_url)
-                            if dl.status_code == 200:
-                                mime = dl.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-                                upload_result = await whatsapp.upload_media(dl.content, mime)
-                                if upload_result["success"]:
-                                    header_media_id = upload_result["mediaId"]
-                                    print(f"[BULK] ✅ Template header media uploaded. mediaId={header_media_id} mime={mime}")
-                                else:
-                                    print(f"[BULK] WARNING: Media upload failed: {upload_result.get('error')} — will try without header")
-                            else:
-                                print(f"[BULK] WARNING: Could not download example media (status={dl.status_code}) — will try without header")
-                        except Exception as exc:
-                            print(f"[BULK] WARNING: Exception auto-uploading header media: {exc} — will try without header")
-                    break  # only process the first HEADER component
+        # ── Auto-upload template header media via shared builder ─────────────────────
+        header_media_id = await _upload_header_media(template_str, whatsapp)
 
         try:
             # Loop over pending recipients in Firestore
