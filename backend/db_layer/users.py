@@ -1,23 +1,16 @@
 import datetime
-from firebase_config import get_db
+from cache import cache
 
 class UsersDB:
-    def __init__(self):
-        self.db = get_db()
-        self.collection_name = "users"
+    """Manages user state in memory (Requirement 7).
+    
+    Resets on server restart, which is acceptable for 'in-memory session state'
+    and results in zero Firestore reads for repeated triggers (Requirement 10).
+    """
 
     def should_send_trigger(self, phone_number: str) -> bool:
-        """Check if we should send a trigger (once every 24 hours)."""
-        if not self.db:
-            return False
-        
-        doc_ref = self.db.collection(self.collection_name).document(phone_number)
-        doc = doc_ref.get()
-        if not doc.exists:
-            return True
-            
-        data = doc.to_dict()
-        last_at = data.get("last_trigger_at")
+        """Check if we should send a trigger (once every 24 hours). Cached in memory."""
+        last_at = cache.get_session(f"user_trigger:{phone_number}")
         if not last_at:
             return True
             
@@ -30,15 +23,8 @@ class UsersDB:
             return True
 
     def record_trigger(self, phone_number: str):
-        """Record the time of the latest trigger."""
-        if not self.db:
-            return
-        
-        doc_ref = self.db.collection(self.collection_name).document(phone_number)
+        """Record the time of the latest trigger in memory."""
         now = datetime.datetime.utcnow().isoformat()
-        doc_ref.set({
-            "last_trigger_at": now,
-            "seen": True
-        }, merge=True)
+        cache.set_session(f"user_trigger:{phone_number}", now)
 
 users_db = UsersDB()
