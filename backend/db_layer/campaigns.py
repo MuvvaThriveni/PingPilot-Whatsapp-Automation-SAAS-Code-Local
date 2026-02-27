@@ -9,6 +9,7 @@ Write frequency: Medium (status updates during send).
 
 import datetime
 from firebase_config import get_db
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 
 def _col():
@@ -101,7 +102,7 @@ class _Campaigns:
                 - datetime.timedelta(seconds=threshold_seconds)
             ).isoformat()
             docs = (
-                col.where("status", "==", "running")
+                col.where(filter=FieldFilter("status", "==", "running"))
                 .stream()
             )
             stale = []
@@ -126,7 +127,7 @@ class _Campaigns:
             return [], None
         try:
             query = (
-                col.where("tenant_id", "==", tenant_id)
+                col.where(filter=FieldFilter("tenant_id", "==", tenant_id))
                 .order_by("created_at", direction="DESCENDING")
             )
             if cursor:
@@ -147,7 +148,7 @@ class _Campaigns:
         if not col:
             return []
         try:
-            docs = col.where("status", "==", "running").stream()
+            docs = col.where(filter=FieldFilter("status", "==", "running")).stream()
             return [doc.to_dict() for doc in docs]
         except Exception as e:
             print(f"[db_layer.campaigns] list_running failed: {e}")
@@ -162,8 +163,8 @@ class _Campaigns:
         try:
             now = datetime.datetime.utcnow().isoformat() + "Z"
             docs = (
-                col.where("status", "==", "scheduled")
-                .where("scheduled_at", "<=", now)
+                col.where(filter=FieldFilter("status", "==", "scheduled"))
+                .where(filter=FieldFilter("scheduled_at", "<=", now))
                 .stream()
             )
             return [doc.to_dict() for doc in docs]

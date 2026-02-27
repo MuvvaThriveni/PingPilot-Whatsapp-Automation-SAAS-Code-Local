@@ -45,9 +45,15 @@ def _resolve_tenant_from_payload(value: dict) -> str | None:
 
 
 # ── Webhook verify token ─────────────────────────────────────────────
-# Set WEBHOOK_VERIFY_TOKEN in your backend .env file.
-# Use the same value in Meta App Dashboard → Webhooks → Verify Token.
-VERIFY_TOKEN: str = os.environ.get("WEBHOOK_VERIFY_TOKEN", "verify123")
+# MUST be set in backend/.env as WEBHOOK_VERIFY_TOKEN=<your_secret>
+# Use this same value in Meta App Dashboard → Webhooks → Verify Token.
+_raw_verify_token: str = os.environ.get("WEBHOOK_VERIFY_TOKEN", "")
+if not _raw_verify_token:
+    raise RuntimeError(
+        "[FATAL] WEBHOOK_VERIFY_TOKEN is not set in .env. "
+        "Generate a strong secret and add it to backend/.env before starting the server."
+    )
+VERIFY_TOKEN: str = _raw_verify_token
 
 
 @router.get("")
@@ -59,7 +65,7 @@ async def verify_webhook(
     """Verify webhook for Meta/WhatsApp.
 
     Accepts the token if:
-      1. It matches the hardcoded VERIFY_TOKEN (verify123), OR
+      1. It matches WEBHOOK_VERIFY_TOKEN from .env, OR
       2. It matches a tenant's webhook_verify_token stored in Firestore.
 
     Returns the hub.challenge as plain text on success — required by Meta.
@@ -71,9 +77,9 @@ async def verify_webhook(
                   detail="Missing hub.mode or hub.verify_token")
         return JSONResponse(status_code=403, content={"error": "Verification failed"})
 
-    # ── Check 1: hardcoded fallback token (always works) ───────────
+    # ── Check 1: env-configured token ───────────────────────────────
     if hub_verify_token == VERIFY_TOKEN:
-        log_event("webhook_verify", status="success", detail="hardcoded token matched")
+        log_event("webhook_verify", status="success", detail="env token matched")
         return PlainTextResponse(content=hub_challenge or "")
 
     # ── Check 2: per-tenant token stored in Firestore ──────────────
@@ -93,6 +99,7 @@ async def verify_webhook(
     log_event("webhook_verify", status="failed", level="WARN",
               detail=f"token did not match any tenant")
     return JSONResponse(status_code=403, content={"error": "Verification failed"})
+
 
 
 @router.get("/")

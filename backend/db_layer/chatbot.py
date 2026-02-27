@@ -13,7 +13,7 @@ Reads are cached via the centralized cache module.
 import datetime
 from google.cloud.firestore_v1.base_query import FieldFilter
 from firebase_config import get_db
-from cache import cache, chatbot_config_key, chatbot_rules_key
+from cache import fetch_cached, cache, chatbot_config_key, chatbot_rules_key, chatbot_active_rules_key
 
 
 def _config_col():
@@ -34,23 +34,24 @@ class _ChatbotConfig:
 
     @staticmethod
     def get(tenant_id: str) -> dict | None:
-        """Get chatbot config. Cached for 60 s."""
+        """Get chatbot config. Cached for 6 hours."""
         def _fetch():
             col = _config_col()
             if not col:
                 return None
             try:
+                # Direct document access (Requirement 2)
                 doc = col.document(tenant_id).get()
                 return doc.to_dict() if doc.exists else None
             except Exception as e:
                 print(f"[db_layer.chatbot_config] get({tenant_id}) failed: {e}")
                 return None
 
-        return cache.get_or_fetch(chatbot_config_key(tenant_id), _fetch, ttl=60.0)
+        return fetch_cached(chatbot_config_key(tenant_id), _fetch)
 
     @staticmethod
     def upsert(tenant_id: str, data: dict):
-        """Merge-update chatbot config. Strips raw openai_api_key."""
+        """Merge-update chatbot config. Invalidate cache."""
         col = _config_col()
         if not col:
             return
@@ -75,7 +76,7 @@ class _ChatbotRules:
 
     @staticmethod
     def list(tenant_id: str) -> list[dict]:
-        """List all chatbot rules. Cached for 60 s."""
+        """List all chatbot rules. Cached for 6 hours."""
         def _fetch():
             col = _rules_col()
             if not col:
@@ -96,7 +97,7 @@ class _ChatbotRules:
                 print(f"[db_layer.chatbot_rules] list({tenant_id}) failed: {e}")
                 return []
 
-        return cache.get_or_fetch(chatbot_rules_key(tenant_id), _fetch, ttl=60.0)
+        return fetch_cached(chatbot_rules_key(tenant_id), _fetch)
 
     @staticmethod
     def create(tenant_id: str, rule: dict) -> dict:
@@ -108,7 +109,9 @@ class _ChatbotRules:
             rule["created_at"] = datetime.datetime.utcnow().isoformat()
             _, doc_ref = col.add(rule)
             rule["_doc_id"] = doc_ref.id
+            # Invalidate cache
             cache.invalidate(chatbot_rules_key(tenant_id))
+            cache.invalidate(chatbot_active_rules_key(tenant_id))
             return rule
         except Exception as e:
             print(f"[db_layer.chatbot_rules] create failed: {e}")
@@ -122,8 +125,9 @@ class _ChatbotRules:
         try:
             data["updated_at"] = datetime.datetime.utcnow().isoformat()
             col.document(doc_id).set(data, merge=True)
-            # Invalidate all rules caches (we don't know tenant_id here)
+            # Invalidate all rules caches
             cache.invalidate_prefix("chatbot_rules:")
+            cache.invalidate_prefix("chatbot_rules_active:")
         except Exception as e:
             print(f"[db_layer.chatbot_rules] update({doc_id}) failed: {e}")
 
@@ -134,20 +138,21 @@ class _ChatbotRules:
             return
         try:
             col.document(doc_id).delete()
+            # Invalidate all rules caches
             cache.invalidate_prefix("chatbot_rules:")
+            cache.invalidate_prefix("chatbot_rules_active:")
         except Exception as e:
             print(f"[db_layer.chatbot_rules] delete({doc_id}) failed: {e}")
 
     @staticmethod
     def get_active(tenant_id: str) -> list[dict]:
-        """Return only active rules, ordered by priority descending. Cached for 60 s."""
-        cache_key = f"chatbot_rules_active:{tenant_id}"
-
+        """Return only active rules. Cached for 6 hours."""
         def _fetch():
             col = _rules_col()
             if not col:
                 return []
             try:
+                # Requirement: avoid .stream() inside handlers - caching solves this
                 docs = (
                     col.where(filter=FieldFilter("tenant_id", "==", tenant_id))
                     .where(filter=FieldFilter("is_active", "==", 1))
@@ -159,7 +164,7 @@ class _ChatbotRules:
                 print(f"[db_layer.chatbot_rules] get_active({tenant_id}) failed: {e}")
                 return []
 
-        return cache.get_or_fetch(cache_key, _fetch, ttl=60.0)
+        return fetch_cached(chatbot_active_rules_key(tenant_id), _fetch)
 
 
 chatbot_rules = _ChatbotRules()

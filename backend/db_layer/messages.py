@@ -17,7 +17,7 @@ Optimizations:
 
 import datetime
 from firebase_config import get_db
-from cache import cache, usage_key
+from cache import cache, usage_key, wa_message_mapping_key, fetch_cached
 
 
 def _col():
@@ -46,13 +46,17 @@ class _Messages:
                 "status": data.get("status", ""),
                 "created_at": data.get("created_at", datetime.datetime.utcnow().isoformat()),
             }
-            # Optional fields — only store if present
             for field in ("contact_name", "template_name", "campaign_id", "error_message"):
                 if data.get(field):
                     doc[field] = data[field]
 
             _, doc_ref = col.add(doc)
-            # Invalidate usage cache on new message
+            
+            # Cache the wa_message_id to doc_id mapping (Requirement 2/10)
+            wa_id = data.get("wa_message_id")
+            if wa_id:
+                cache.set(wa_message_mapping_key(wa_id), doc_ref.id, ttl=3600*24)
+            
             cache.invalidate(usage_key(tenant_id))
             return doc_ref.id
         except Exception as e:
@@ -61,7 +65,7 @@ class _Messages:
 
     @staticmethod
     def add_batch(tenant_id: str, items: list[dict]):
-        """Batch-write multiple message documents (up to 500 per batch)."""
+        """Batch-write multiple message documents. Caches mappings if wa_message_id is present."""
         db = get_db()
         if not db:
             return
@@ -73,9 +77,14 @@ class _Messages:
                 data["tenant_id"] = tenant_id
                 if "created_at" not in data:
                     data["created_at"] = now
-                ref = col.document()  # auto-ID
+                ref = col.document()
                 batch.set(ref, data)
-                # Firestore batch limit is 500
+                
+                # Cache mapping (Requirement 2/10)
+                wa_id = data.get("wa_message_id")
+                if wa_id:
+                    cache.set(wa_message_mapping_key(wa_id), ref.id, ttl=3600*24)
+
                 if (i + 1) % 500 == 0:
                     batch.commit()
                     batch = db.batch()
@@ -86,20 +95,29 @@ class _Messages:
 
     @staticmethod
     def update_status(wa_message_id: str, status: str, tenant_id: str = ""):
-        """Update message status by WhatsApp message ID (webhook status callback)."""
+        """Update message status by WhatsApp message ID (webhook callback). Cached-fallback."""
         col = _col()
         if not col:
             return
         try:
-            query = col.where("wa_message_id", "==", wa_message_id)
-            if tenant_id:
-                query = query.where("tenant_id", "==", tenant_id)
-            query = query.limit(1)
+            # Try to use memory mapping first (Requirement 2: .document() direct access)
+            doc_id = cache.get(wa_message_mapping_key(wa_message_id))
+            if doc_id:
+                col.document(doc_id).update({
+                    "status": status,
+                    "updated_at": datetime.datetime.utcnow().isoformat(),
+                })
+                return
+
+            # Fallback to query
+            query = col.where("wa_message_id", "==", wa_message_id).limit(1)
             for doc in query.stream():
                 doc.reference.update({
                     "status": status,
                     "updated_at": datetime.datetime.utcnow().isoformat(),
                 })
+                # Cache for next status update (e.g. from 'delivered' to 'read')
+                cache.set(wa_message_mapping_key(wa_message_id), doc.id, ttl=3600*24)
                 return
         except Exception as e:
             print(f"[db_layer.messages] update_status({wa_message_id}) failed: {e}")
@@ -158,7 +176,7 @@ class _Messages:
 
     @staticmethod
     def get_stats(tenant_id: str) -> dict:
-        """Compute basic stats. Cached for 120 s to avoid repeated scans."""
+        """Compute basic stats. Cached for 6 hours."""
         cache_key = f"msg_stats:{tenant_id}"
 
         def _fetch():
@@ -169,7 +187,7 @@ class _Messages:
                 docs = (
                     col.where("tenant_id", "==", tenant_id)
                     .order_by("created_at", direction="DESCENDING")
-                    .limit(500)  # Reduced from 1000
+                    .limit(500)
                     .stream()
                 )
                 stats = {}
@@ -182,11 +200,11 @@ class _Messages:
                 print(f"[db_layer.messages] get_stats failed: {e}")
                 return {}
 
-        return cache.get_or_fetch(cache_key, _fetch, ttl=120.0)
+        return fetch_cached(cache_key, _fetch)
 
     @staticmethod
     def get_usage(tenant_id: str) -> dict:
-        """Get usage statistics for dashboard (today + month). Cached for 120 s."""
+        """Get usage statistics for dashboard. Cached for 6 hours."""
         def _fetch():
             col = _col()
             if not col:
@@ -198,7 +216,7 @@ class _Messages:
                 docs = (
                     col.where("tenant_id", "==", tenant_id)
                     .order_by("created_at", direction="DESCENDING")
-                    .limit(500)  # Reduced from 2000
+                    .limit(500)
                     .stream()
                 )
                 today_total = today_ok = today_fail = 0
@@ -228,7 +246,7 @@ class _Messages:
                         "month": {"total": 0, "successful": 0, "failed": 0},
                         "byProduct": []}
 
-        return cache.get_or_fetch(usage_key(tenant_id), _fetch, ttl=120.0)
+        return fetch_cached(usage_key(tenant_id), _fetch)
 
 
 messages = _Messages()

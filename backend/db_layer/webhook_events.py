@@ -26,22 +26,21 @@ class _WebhookEvents:
 
     @staticmethod
     def exists(event_id: str) -> bool:
-        """Check if an event has already been processed. Cached for 120 s.
-        
-        Uses direct document get() instead of query — 1 read vs scanning.
-        """
+        """Check if an event has already been processed. Cached for 1 hour."""
         cache_key = f"webhook_exists:{event_id}"
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
+        # If not in memory, we check Firestore (1 read)
+        # Goal: Reduce reads by 90% + caching results for 1 hour.
         col = _col()
         if not col:
             return False
         try:
             doc = col.document(event_id).get()
             result = doc.exists
-            cache.set(cache_key, result, ttl=120.0)
+            cache.set(cache_key, result, ttl=3600.0)
             return result
         except Exception as e:
             print(f"[db_layer.webhook_events] exists({event_id}) failed: {e}")
@@ -54,7 +53,6 @@ class _WebhookEvents:
         if not col:
             return
         try:
-            # Only store required fields
             doc = {
                 "tenant_id": tenant_id,
                 "event_type": data.get("event_type", ""),
@@ -62,8 +60,8 @@ class _WebhookEvents:
                 "created_at": datetime.datetime.utcnow().isoformat(),
             }
             col.document(event_id).set(doc)
-            # Mark as existing in cache
-            cache.set(f"webhook_exists:{event_id}", True, ttl=120.0)
+            # Mark as existing in memory cache for 1 hour (Requirement 8/10)
+            cache.set(f"webhook_exists:{event_id}", True, ttl=3600.0)
         except Exception as e:
             print(f"[db_layer.webhook_events] record({event_id}) failed: {e}")
 
@@ -78,6 +76,8 @@ class _WebhookEvents:
                 "status": "processed",
                 "processed_at": datetime.datetime.utcnow().isoformat(),
             })
+            # Ensure it stays in cache as 'True'
+            cache.set(f"webhook_exists:{event_id}", True, ttl=3600.0)
         except Exception as e:
             print(f"[db_layer.webhook_events] mark_processed({event_id}) failed: {e}")
 

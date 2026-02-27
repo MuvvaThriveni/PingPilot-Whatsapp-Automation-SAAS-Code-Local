@@ -19,7 +19,8 @@ from db_layer.messages import messages as _db_messages
 from db_layer.secrets import secrets as _secrets
 
 # Cache layer
-from cache import cache, tenant_key, chatbot_config_key, chatbot_rules_key, settings_key
+from cache import cache, fetch_cached, tenant_key, chatbot_config_key, chatbot_rules_key, settings_key
+
 
 _DEFAULT_SETTINGS: Dict = {
     "business_account_id": "",
@@ -32,16 +33,14 @@ _DEFAULT_SETTINGS: Dict = {
 _DEFAULT_CHATBOT: Dict = {
     "is_enabled": False,
     "fallback_message": "Thank you for your message. Our team will get back to you soon.",
-    "use_ai": False,  # Changed to False as per transition to rule-based only
-    # "ai_system_prompt": "You are a helpful customer service assistant. Be friendly, concise, and professional.",
-    # "openai_api_key": "",
+    "use_ai": False,  
 }
 
 
 # ── Accessor functions (cached, Firestore-only, tenant-scoped) ──
 
 def get_settings(tenant_id: str) -> Dict:
-    """Read WhatsApp settings for a specific tenant. Cached for 120 s."""
+    """Read WhatsApp settings for a specific tenant. Cached for 6 hours."""
     def _fetch():
         tenant = _db_tenants.get(tenant_id)
         if tenant:
@@ -56,32 +55,29 @@ def get_settings(tenant_id: str) -> Dict:
             }
         return dict(_DEFAULT_SETTINGS)
 
-    return cache.get_or_fetch(settings_key(tenant_id), _fetch, ttl=120.0)
+    return fetch_cached(settings_key(tenant_id), _fetch)
 
 
 def get_chatbot_settings(tenant_id: str) -> Dict:
-    """Read chatbot config for a specific tenant. Cached for 60 s."""
+    """Read chatbot config for a specific tenant. Cached for 6 hours."""
     def _fetch():
         cfg = _db_chatbot_config.get(tenant_id)
         if cfg:
             return {
                 "is_enabled": cfg.get("is_enabled", False),
                 "fallback_message": cfg.get("fallback_message", _DEFAULT_CHATBOT["fallback_message"]),
-                "use_ai": False, # cfg.get("use_ai", True),
-                # "ai_system_prompt": cfg.get("ai_system_prompt", _DEFAULT_CHATBOT["ai_system_prompt"]),
-                # "openai_api_key": _secrets.resolve_openai_key(cfg),
+                "use_ai": False,
             }
         return dict(_DEFAULT_CHATBOT)
 
-    return cache.get_or_fetch(chatbot_config_key(tenant_id), _fetch, ttl=60.0)
+    return fetch_cached(chatbot_config_key(tenant_id), _fetch)
 
 
 def get_chatbot_rules(tenant_id: str) -> list:
-    """Read chatbot rules for a specific tenant. Cached for 60 s."""
-    return cache.get_or_fetch(
+    """Read chatbot rules for a specific tenant. Cached for 6 hours."""
+    return fetch_cached(
         chatbot_rules_key(tenant_id),
         lambda: _db_chatbot_rules.list(tenant_id),
-        ttl=60.0,
     )
 
 

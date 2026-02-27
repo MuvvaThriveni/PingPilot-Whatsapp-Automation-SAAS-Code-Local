@@ -10,7 +10,7 @@ get_by_phone_number_id() is cached because it's called on EVERY webhook.
 """
 
 from firebase_config import get_db
-from cache import cache, tenant_key, tenant_by_phone_key
+from cache import fetch_cached, cache, tenant_key, tenant_by_phone_key
 
 
 def _col():
@@ -22,28 +22,30 @@ class _Tenants:
 
     @staticmethod
     def get(tenant_id: str) -> dict | None:
-        """Get tenant document. Cached for 120 s."""
+        """Get tenant document. Cached for 6 hours."""
         def _fetch():
             col = _col()
             if not col:
                 return None
             try:
+                # Direct document access (Requirement 2)
                 doc = col.document(tenant_id).get()
                 return doc.to_dict() if doc.exists else None
             except Exception as e:
                 print(f"[db_layer.tenants] get({tenant_id}) failed: {e}")
                 return None
 
-        return cache.get_or_fetch(tenant_key(tenant_id), _fetch, ttl=120.0)
+        return fetch_cached(tenant_key(tenant_id), _fetch)
 
     @staticmethod
     def get_by_phone_number_id(phone_number_id: str) -> dict | None:
-        """Lookup tenant by WhatsApp phone_number_id (webhook routing). Cached for 300 s."""
+        """Lookup tenant by WhatsApp phone_number_id (webhook routing). Cached for 6 hours."""
         def _fetch():
             col = _col()
             if not col:
                 return None
             try:
+                # Still using where for initial lookup, but once cached it won't be called (Requirement 1/8)
                 docs = col.where("phone_number_id", "==", phone_number_id).limit(1).stream()
                 for doc in docs:
                     return doc.to_dict()
@@ -52,23 +54,15 @@ class _Tenants:
                 print(f"[db_layer.tenants] get_by_phone_number_id failed: {e}")
                 return None
 
-        return cache.get_or_fetch(
-            tenant_by_phone_key(phone_number_id), _fetch, ttl=300.0
-        )
+        return fetch_cached(tenant_by_phone_key(phone_number_id), _fetch)
 
     @staticmethod
     def upsert(tenant_id: str, data: dict):
-        """Create or update tenant document.
-
-        Caller must ensure `data` does NOT contain raw secrets.
-        Use `token_ref` / `openai_key_ref` instead.
-        """
+        """Create or update tenant document. Invalidate cache."""
         col = _col()
         if not col:
             return
         try:
-            # Secrets (access_token, openai_api_key) are now allowed to be persisted 
-            # to Firestore so they survive server restarts.
             data["tenant_id"] = tenant_id
             col.document(tenant_id).set(data, merge=True)
             # Invalidate cache
