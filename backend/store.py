@@ -1,14 +1,15 @@
-"""Shared data store for WappFlow – Multi-tenant Firestore-only (Phase-5: cached).
+"""Shared data store for WappFlow – Multi-tenant Firestore-only (Phase-6: hardened).
 
 All reads and writes go exclusively through db_layer + cache.
 Every function requires an explicit `tenant_id` parameter derived from
 the authenticated Firebase Auth UID (set by auth_middleware).
 
-Reads are cached in-memory (30–120 s TTL) to drastically reduce Firestore
-read operations.  Writes invalidate the relevant cache entries immediately.
+Security fixes:
+- REMOVED: Plaintext token logging (was leaking partial tokens to stdout)
+- REMOVED: os.environ pollution with per-tenant access tokens
+- Added structured logging via observability module
 """
 
-import os
 from typing import Dict
 
 # db_layer imports — sole Firestore abstraction
@@ -20,6 +21,7 @@ from db_layer.secrets import secrets as _secrets
 
 # Cache layer
 from cache import cache, fetch_cached, tenant_key, chatbot_config_key, chatbot_rules_key, settings_key
+from observability import log_event
 
 
 _DEFAULT_SETTINGS: Dict = {
@@ -33,7 +35,7 @@ _DEFAULT_SETTINGS: Dict = {
 _DEFAULT_CHATBOT: Dict = {
     "is_enabled": False,
     "fallback_message": "Thank you for your message. Our team will get back to you soon.",
-    "use_ai": False,  
+    "use_ai": False,
 }
 
 
@@ -45,7 +47,10 @@ def get_settings(tenant_id: str) -> Dict:
         tenant = _db_tenants.get(tenant_id)
         if tenant:
             token = _secrets.resolve_wa_token(tenant)
-            print(f"[STORE] Resolved token for {tenant_id}: {token[:5]}... (len={len(token)})")
+            # SECURITY: Never log tokens — not even partially
+            has_token = bool(token)
+            log_event("settings_loaded", tenant_id=tenant_id,
+                      detail=f"has_token={has_token}")
             return {
                 "business_account_id": tenant.get("business_account_id", ""),
                 "phone_number_id": tenant.get("phone_number_id", ""),
@@ -86,9 +91,12 @@ def get_chatbot_rules(tenant_id: str) -> list:
 def save_settings(tenant_id: str, settings_data: Dict):
     """Persist WhatsApp settings for a tenant.
 
-    The access token is stored directly in Firestore so it survives server restarts.
+    The access token is stored in Firestore so it survives server restarts.
     If no new token is provided in settings_data, the existing token in Firestore
     is preserved (not overwritten with empty string).
+
+    SECURITY NOTE: os.environ is no longer polluted with per-tenant tokens.
+    Tokens are resolved at runtime via secrets.resolve_wa_token().
     """
     access_token = settings_data.get("access_token", "").strip()
     # Strip "Bearer " prefix if accidentally included
@@ -104,10 +112,9 @@ def save_settings(tenant_id: str, settings_data: Dict):
     # Only overwrite access_token if a new one was explicitly provided
     if access_token:
         upsert_data["access_token"] = access_token
-        os.environ[f"WHATSAPP_ACCESS_TOKEN_{tenant_id}"] = access_token
-        print(f"[STORE] save_settings tenant={tenant_id} → token updated in Firestore")
+        log_event("settings_saved", tenant_id=tenant_id, detail="token updated")
     else:
-        print(f"[STORE] save_settings tenant={tenant_id} → token NOT updated (kept existing)")
+        log_event("settings_saved", tenant_id=tenant_id, detail="token preserved (no new value)")
 
     _db_tenants.upsert(tenant_id, upsert_data)
     # Invalidate cache so next read picks up new values
@@ -118,23 +125,16 @@ def save_settings(tenant_id: str, settings_data: Dict):
 
 def save_chatbot_settings(tenant_id: str, chatbot_data: Dict):
     """Persist chatbot config for a tenant."""
-    # openai_key = chatbot_data.get("openai_api_key", "").strip()
     upsert_data = {
         "is_enabled": chatbot_data.get("is_enabled", False),
         "fallback_message": chatbot_data.get("fallback_message", ""),
-        "use_ai": False, # chatbot_data.get("use_ai", True),
-        # "ai_system_prompt": chatbot_data.get("ai_system_prompt", ""),
+        "use_ai": False,
     }
-    # Store key directly in Firestore so it survives server restarts
-    # if openai_key:
-    #     upsert_data["openai_api_key"] = openai_key
 
     _db_chatbot_config.upsert(tenant_id, upsert_data)
-    # if openai_key:
-    #     os.environ[f"OPENAI_API_KEY_{tenant_id}"] = openai_key
     # Invalidate cache
     cache.invalidate(chatbot_config_key(tenant_id))
-    print(f"[STORE] save_chatbot_settings tenant={tenant_id} → firestore (cache invalidated)")
+    log_event("chatbot_settings_saved", tenant_id=tenant_id)
 
 
 # ── Ephemeral runtime state (NOT persisted — process-local only) ──
@@ -144,4 +144,3 @@ active_campaigns: Dict = {}
 def add_message(tenant_id: str, message_data: Dict):
     """Convenience wrapper for adding a message to the history."""
     _db_messages.add(tenant_id, message_data)
-

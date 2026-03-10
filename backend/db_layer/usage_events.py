@@ -14,6 +14,8 @@ Optimizations:
 import datetime
 from firebase_config import get_db
 from cache import cache
+from observability import log_event
+from utils.time_utils import get_ist_now
 
 
 def _col():
@@ -32,7 +34,7 @@ class _UsageEvents:
         if not col:
             return
         try:
-            now = datetime.datetime.utcnow()
+            now = get_ist_now()
             doc = {
                 "tenant_id": tenant_id,
                 "event_type": event_type,
@@ -51,7 +53,7 @@ class _UsageEvents:
 
             col.add(doc)
         except Exception as e:
-            print(f"[db_layer.usage_events] record failed: {e}")
+            log_event("db_error", detail=f"usage_events.record failed: {e}", level="ERROR")
 
     @staticmethod
     def get_monthly(tenant_id: str, month_key: str = "", limit: int = 500) -> list[dict]:
@@ -61,7 +63,7 @@ class _UsageEvents:
         if not col:
             return []
         if not month_key:
-            month_key = datetime.datetime.utcnow().strftime("%Y-%m")
+            month_key = get_ist_now().strftime("%Y-%m")
         try:
             docs = (
                 col.where("tenant_id", "==", tenant_id)
@@ -71,14 +73,14 @@ class _UsageEvents:
             )
             return [doc.to_dict() for doc in docs]
         except Exception as e:
-            print(f"[db_layer.usage_events] get_monthly failed: {e}")
+            log_event("db_error", detail=f"usage_events.get_monthly failed: {e}", level="ERROR")
             return []
 
     @staticmethod
     def count_monthly(tenant_id: str, month_key: str = "") -> dict:
         """Count usage events by type for a month. Cached for 300 s."""
         if not month_key:
-            month_key = datetime.datetime.utcnow().strftime("%Y-%m")
+            month_key = get_ist_now().strftime("%Y-%m")
         cache_key = f"usage_count:{tenant_id}:{month_key}"
 
         def _fetch():

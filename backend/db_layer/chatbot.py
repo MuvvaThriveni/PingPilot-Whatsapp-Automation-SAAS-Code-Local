@@ -14,6 +14,8 @@ import datetime
 from google.cloud.firestore_v1.base_query import FieldFilter
 from firebase_config import get_db
 from cache import fetch_cached, cache, chatbot_config_key, chatbot_rules_key, chatbot_active_rules_key
+from observability import log_event
+from utils.time_utils import get_ist_now_iso
 
 
 def _config_col():
@@ -44,7 +46,7 @@ class _ChatbotConfig:
                 doc = col.document(tenant_id).get()
                 return doc.to_dict() if doc.exists else None
             except Exception as e:
-                print(f"[db_layer.chatbot_config] get({tenant_id}) failed: {e}")
+                log_event("db_error", detail=f"chatbot_config.get({tenant_id}) failed: {e}", level="ERROR")
                 return None
 
         return fetch_cached(chatbot_config_key(tenant_id), _fetch)
@@ -57,12 +59,12 @@ class _ChatbotConfig:
             return
         try:
             data["tenant_id"] = tenant_id
-            data["updated_at"] = datetime.datetime.utcnow().isoformat()
+            data["updated_at"] = get_ist_now_iso()
             col.document(tenant_id).set(data, merge=True)
             # Invalidate cache
             cache.invalidate(chatbot_config_key(tenant_id))
         except Exception as e:
-            print(f"[db_layer.chatbot_config] upsert({tenant_id}) failed: {e}")
+            log_event("db_error", detail=f"chatbot_config.upsert({tenant_id}) failed: {e}", level="ERROR")
 
 
 chatbot_config = _ChatbotConfig()
@@ -94,7 +96,7 @@ class _ChatbotRules:
                     results.append(d)
                 return results
             except Exception as e:
-                print(f"[db_layer.chatbot_rules] list({tenant_id}) failed: {e}")
+                log_event("db_error", detail=f"chatbot_rules.list({tenant_id}) failed: {e}", level="ERROR")
                 return []
 
         return fetch_cached(chatbot_rules_key(tenant_id), _fetch)
@@ -106,7 +108,7 @@ class _ChatbotRules:
             return rule
         try:
             rule["tenant_id"] = tenant_id
-            rule["created_at"] = datetime.datetime.utcnow().isoformat()
+            rule["created_at"] = get_ist_now_iso()
             _, doc_ref = col.add(rule)
             rule["_doc_id"] = doc_ref.id
             # Invalidate cache
@@ -114,7 +116,7 @@ class _ChatbotRules:
             cache.invalidate(chatbot_active_rules_key(tenant_id))
             return rule
         except Exception as e:
-            print(f"[db_layer.chatbot_rules] create failed: {e}")
+            log_event("db_error", detail=f"chatbot_rules.create failed: {e}", level="ERROR")
             return rule
 
     @staticmethod
@@ -123,13 +125,13 @@ class _ChatbotRules:
         if not col:
             return
         try:
-            data["updated_at"] = datetime.datetime.utcnow().isoformat()
+            data["updated_at"] = get_ist_now_iso()
             col.document(doc_id).set(data, merge=True)
             # Invalidate all rules caches
             cache.invalidate_prefix("chatbot_rules:")
             cache.invalidate_prefix("chatbot_rules_active:")
         except Exception as e:
-            print(f"[db_layer.chatbot_rules] update({doc_id}) failed: {e}")
+            log_event("db_error", detail=f"chatbot_rules.update({doc_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def delete(doc_id: str):
@@ -142,7 +144,7 @@ class _ChatbotRules:
             cache.invalidate_prefix("chatbot_rules:")
             cache.invalidate_prefix("chatbot_rules_active:")
         except Exception as e:
-            print(f"[db_layer.chatbot_rules] delete({doc_id}) failed: {e}")
+            log_event("db_error", detail=f"chatbot_rules.delete({doc_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def get_active(tenant_id: str) -> list[dict]:
@@ -161,7 +163,7 @@ class _ChatbotRules:
                 )
                 return [doc.to_dict() for doc in docs]
             except Exception as e:
-                print(f"[db_layer.chatbot_rules] get_active({tenant_id}) failed: {e}")
+                log_event("db_error", detail=f"chatbot_rules.get_active({tenant_id}) failed: {e}", level="ERROR")
                 return []
 
         return fetch_cached(chatbot_active_rules_key(tenant_id), _fetch)

@@ -17,6 +17,12 @@ Optimizations:
 import datetime
 from google.cloud.firestore_v1.base_query import FieldFilter
 from firebase_config import get_db
+from observability import log_event
+from utils.time_utils import get_ist_now_iso
+
+
+def _ist_now_iso() -> str:
+    return get_ist_now_iso()
 
 
 def _col():
@@ -40,11 +46,11 @@ class _ChatMessages:
                 "contact_name": data.get("contact_name", ""),
                 "message_text": data.get("message_text", ""),
                 "direction": data.get("direction", ""),
-                "created_at": data.get("created_at", datetime.datetime.utcnow().isoformat()),
+                "created_at": data.get("created_at", _ist_now_iso()),
             }
             col.add(doc)
         except Exception as e:
-            print(f"[db_layer.chat_messages] add failed: {e}")
+            log_event("db_error", detail=f"chat_messages.add failed: {e}", level="ERROR")
 
     @staticmethod
     def get_recent(tenant_id: str, contact_phone: str, limit: int = 6) -> list[dict]:
@@ -69,7 +75,7 @@ class _ChatMessages:
             results.reverse()  # oldest first for AI context
             return results
         except Exception as e:
-            print(f"[db_layer.chat_messages] get_recent failed: {e}")
+            log_event("db_error", detail=f"chat_messages.get_recent failed: {e}", level="ERROR")
             return []
 
     @staticmethod
@@ -96,7 +102,7 @@ class _ChatMessages:
             next_cursor = docs[-1]["created_at"] if has_next and docs else None
             return docs, next_cursor
         except Exception as e:
-            print(f"[db_layer.chat_messages] get_conversation_list failed: {e}")
+            log_event("db_error", detail=f"chat_messages.get_conversation_list failed: {e}", level="ERROR")
             return [], None
 
     @staticmethod
@@ -124,7 +130,7 @@ class _ChatMessages:
             next_cursor = docs[-1]["created_at"] if has_next and docs else None
             return docs, next_cursor
         except Exception as e:
-            print(f"[db_layer.chat_messages] get_user_messages failed: {e}")
+            log_event("db_error", detail=f"chat_messages.get_user_messages failed: {e}", level="ERROR")
             return [], None
 
     @staticmethod

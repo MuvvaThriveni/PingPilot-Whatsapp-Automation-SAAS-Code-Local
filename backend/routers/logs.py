@@ -1,4 +1,7 @@
-"""Logs routes – message log retrieval and export (Phase-3: multi-tenant)."""
+"""Logs routes – message log retrieval and export (Phase-6: hardened).
+
+Security fix: CSV formula injection protection in export.
+"""
 
 import io
 from fastapi import APIRouter, Request
@@ -7,6 +10,19 @@ from fastapi.responses import StreamingResponse
 from db_layer.messages import messages as _db_messages
 
 router = APIRouter(prefix="/api/logs", tags=["logs"])
+
+
+def _sanitize_csv_value(value: str) -> str:
+    """Prevent CSV formula injection (DDE attacks).
+
+    If a cell value starts with =, +, -, @, or tab/CR/LF, prefix it with
+    a single quote to prevent Excel/LibreOffice from interpreting it as a formula.
+    """
+    if not value:
+        return value
+    if value[0] in ('=', '+', '-', '@', '\t', '\r', '\n'):
+        return f"'{value}"
+    return value
 
 
 def _remap_db_log(doc: dict) -> dict:
@@ -63,16 +79,16 @@ async def export_logs(request: Request, product_type: str = None, status: str = 
     rows = [",".join(headers)]
     for log in filtered:
         row = [
-            log.get("product_type", ""),
-            log.get("recipient", ""),
-            log.get("message_id", ""),
-            log.get("template_name", ""),
-            log.get("status", ""),
-            log.get("error_message", ""),
-            log.get("campaign_id", ""),
-            log.get("created_at", ""),
+            _sanitize_csv_value(str(log.get("product_type", ""))),
+            _sanitize_csv_value(str(log.get("recipient", ""))),
+            _sanitize_csv_value(str(log.get("message_id", ""))),
+            _sanitize_csv_value(str(log.get("template_name", ""))),
+            _sanitize_csv_value(str(log.get("status", ""))),
+            _sanitize_csv_value(str(log.get("error_message", ""))),
+            _sanitize_csv_value(str(log.get("campaign_id", ""))),
+            _sanitize_csv_value(str(log.get("created_at", ""))),
         ]
-        rows.append(",".join([f'"{str(v)}"' for v in row]))
+        rows.append(",".join([f'"{v}"' for v in row]))
     csv_content = "\n".join(rows)
 
     return StreamingResponse(

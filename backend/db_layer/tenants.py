@@ -11,6 +11,7 @@ get_by_phone_number_id() is cached because it's called on EVERY webhook.
 
 from firebase_config import get_db
 from cache import fetch_cached, cache, tenant_key, tenant_by_phone_key
+from observability import log_event
 
 
 def _col():
@@ -32,7 +33,7 @@ class _Tenants:
                 doc = col.document(tenant_id).get()
                 return doc.to_dict() if doc.exists else None
             except Exception as e:
-                print(f"[db_layer.tenants] get({tenant_id}) failed: {e}")
+                log_event("db_error", detail=f"tenants.get({tenant_id}) failed: {e}", level="ERROR")
                 return None
 
         return fetch_cached(tenant_key(tenant_id), _fetch)
@@ -51,7 +52,7 @@ class _Tenants:
                     return doc.to_dict()
                 return None
             except Exception as e:
-                print(f"[db_layer.tenants] get_by_phone_number_id failed: {e}")
+                log_event("db_error", detail=f"tenants.get_by_phone_number_id failed: {e}", level="ERROR")
                 return None
 
         return fetch_cached(tenant_by_phone_key(phone_number_id), _fetch)
@@ -69,7 +70,7 @@ class _Tenants:
             cache.invalidate(tenant_key(tenant_id))
             cache.invalidate_prefix("tenant_phone:")
         except Exception as e:
-            print(f"[db_layer.tenants] upsert({tenant_id}) failed: {e}")
+            log_event("db_error", detail=f"tenants.upsert({tenant_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def delete(tenant_id: str):
@@ -81,7 +82,7 @@ class _Tenants:
             cache.invalidate(tenant_key(tenant_id))
             cache.invalidate_prefix("tenant_phone:")
         except Exception as e:
-            print(f"[db_layer.tenants] delete({tenant_id}) failed: {e}")
+            log_event("db_error", detail=f"tenants.delete({tenant_id}) failed: {e}", level="ERROR")
 
 
 tenants = _Tenants()

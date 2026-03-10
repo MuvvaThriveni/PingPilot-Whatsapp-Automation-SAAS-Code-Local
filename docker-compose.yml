@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:6.2-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  api:
+    build:
+      context: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - QUEUE_RATE_LIMIT=80
+      - QUEUE_RETRY_ATTEMPTS=5
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+    command: python worker_main.py
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - QUEUE_RATE_LIMIT=80
+      - QUEUE_RETRY_ATTEMPTS=5
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  redis_data:

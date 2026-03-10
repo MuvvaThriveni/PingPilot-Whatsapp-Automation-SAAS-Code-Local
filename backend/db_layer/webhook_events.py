@@ -15,6 +15,12 @@ Optimizations:
 import datetime
 from firebase_config import get_db
 from cache import cache
+from observability import log_event
+from utils.time_utils import get_ist_now_iso
+
+
+def _ist_now_iso() -> str:
+    return get_ist_now_iso()
 
 
 def _col():
@@ -43,7 +49,7 @@ class _WebhookEvents:
             cache.set(cache_key, result, ttl=3600.0)
             return result
         except Exception as e:
-            print(f"[db_layer.webhook_events] exists({event_id}) failed: {e}")
+            log_event("db_error", detail=f"webhook_events.exists({event_id}) failed: {e}", level="ERROR")
             return False
 
     @staticmethod
@@ -57,13 +63,13 @@ class _WebhookEvents:
                 "tenant_id": tenant_id,
                 "event_type": data.get("event_type", ""),
                 "status": "received",
-                "created_at": datetime.datetime.utcnow().isoformat(),
+                "created_at": _ist_now_iso(),
             }
             col.document(event_id).set(doc)
             # Mark as existing in memory cache for 1 hour (Requirement 8/10)
             cache.set(f"webhook_exists:{event_id}", True, ttl=3600.0)
         except Exception as e:
-            print(f"[db_layer.webhook_events] record({event_id}) failed: {e}")
+            log_event("db_error", detail=f"webhook_events.record({event_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def mark_processed(event_id: str):
@@ -74,12 +80,12 @@ class _WebhookEvents:
         try:
             col.document(event_id).update({
                 "status": "processed",
-                "processed_at": datetime.datetime.utcnow().isoformat(),
+                "processed_at": _ist_now_iso(),
             })
             # Ensure it stays in cache as 'True'
             cache.set(f"webhook_exists:{event_id}", True, ttl=3600.0)
         except Exception as e:
-            print(f"[db_layer.webhook_events] mark_processed({event_id}) failed: {e}")
+            log_event("db_error", detail=f"webhook_events.mark_processed({event_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def get_unprocessed(limit: int = 50) -> list[dict]:
@@ -102,7 +108,7 @@ class _WebhookEvents:
                 results.append(d)
             return results
         except Exception as e:
-            print(f"[db_layer.webhook_events] get_unprocessed failed: {e}")
+            log_event("db_error", detail=f"webhook_events.get_unprocessed failed: {e}", level="ERROR")
             return []
 
 

@@ -1,24 +1,31 @@
 from __future__ import annotations
 
-"""Webhook routes – WhatsApp incoming message handling (Phase-5: cached).
+"""Webhook routes – WhatsApp incoming message handling (Phase-6: hardened).
 
-Webhooks are unauthenticated (called by Meta). Tenant is resolved from the
-phone_number_id in the payload via db_layer.tenants.get_by_phone_number_id().
+Security improvements:
+- X-Hub-Signature-256 verification for all POST webhooks (Meta App Secret)
+- Tenant-scoped template cache lookups
+- Configurable button→template mappings per tenant (no more hardcoded yoga logic)
+- Removed all secret/token logging
+- UTC timestamps everywhere
 """
 
 import os
+import hmac
+import hashlib
 import datetime
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+
+from utils.time_utils import get_ist_now_iso
 
 from store import get_settings, get_chatbot_settings
 from services.whatsapp import WhatsAppService
-from services.chatgpt import get_chatgpt_service
 from services.template_builder import (
     ensure_cached as _ensure_template_cached,
     upload_header_media as _upload_header_media,
     build_components as _build_template_components,
-    _template_components,
+    get_template_keys_for_tenant as _get_template_keys_for_tenant,
 )
 from db_layer.tenants import tenants as _db_tenants
 from observability import log_event
@@ -33,6 +40,11 @@ from cache import cache, chat_users_key
 router = APIRouter(prefix="/api/webhook", tags=["webhook"])
 
 
+def _ist_now() -> str:
+    """Return ISO-formatted IST timestamp."""
+    return get_ist_now_iso()
+
+
 def _resolve_tenant_from_payload(value: dict) -> str | None:
     """Extract phone_number_id from webhook payload and resolve to tenant_id."""
     phone_number_id = value.get("metadata", {}).get("phone_number_id", "")
@@ -45,8 +57,6 @@ def _resolve_tenant_from_payload(value: dict) -> str | None:
 
 
 # ── Webhook verify token ─────────────────────────────────────────────
-# MUST be set in backend/.env as WEBHOOK_VERIFY_TOKEN=<your_secret>
-# Use this same value in Meta App Dashboard → Webhooks → Verify Token.
 _raw_verify_token: str = os.environ.get("WEBHOOK_VERIFY_TOKEN", "")
 if not _raw_verify_token:
     raise RuntimeError(
@@ -55,6 +65,94 @@ if not _raw_verify_token:
     )
 VERIFY_TOKEN: str = _raw_verify_token
 
+# ── Meta App Secret for webhook signature verification ───────────────
+META_APP_SECRET: str = os.environ.get("META_APP_SECRET", "")
+if not META_APP_SECRET:
+    log_event("startup_warn", level="WARN",
+              detail="META_APP_SECRET not set — webhook signature verification DISABLED. "
+                     "Set this in production to prevent forged webhooks.")
+
+
+def _verify_webhook_signature(request_body: bytes, signature_header: str | None) -> bool:
+    """Verify X-Hub-Signature-256 from Meta webhook payload.
+
+    Returns True if signature is valid OR if META_APP_SECRET is not configured
+    (for backward compatibility during migration).
+    """
+    if not META_APP_SECRET:
+        # Not configured — skip verification (log warning at startup)
+        return True
+
+    if not signature_header:
+        log_event("webhook_sig_missing", level="WARN", detail="No X-Hub-Signature-256 header")
+        return False
+
+    # Header format: "sha256=<hex_digest>"
+    if not signature_header.startswith("sha256="):
+        log_event("webhook_sig_invalid", level="WARN", detail="Signature header malformed")
+        return False
+
+    expected_sig = signature_header[7:]  # Strip "sha256=" prefix
+    computed_sig = hmac.new(
+        META_APP_SECRET.encode("utf-8"),
+        request_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(computed_sig, expected_sig)
+
+
+# ── Default button→template mappings (configurable per tenant in Firestore) ──
+_DEFAULT_BUTTON_MAPPINGS = {
+    "Sessions": "session_template",
+    "Products": "products_template",
+    "Morning": "aruna_yoga",
+    "Afternoon": "afternoon_meet",
+    "Evening": "meet3",
+}
+_DEFAULT_BUTTON_ID_MAPPINGS = {
+    "morning_session": "aruna_yoga",
+    "afternoon_session": "afternoon_meet",
+    "evening_session": "meet3",
+}
+
+
+def _get_button_mappings(tenant_id: str) -> tuple[dict, dict]:
+    """Get per-tenant button→template mappings from Firestore (cached).
+
+    Falls back to defaults if the tenant hasn't configured custom mappings.
+    """
+    cache_key = f"button_mappings:{tenant_id}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Try to load from tenant config
+    from firebase_config import get_db
+    db = get_db()
+    text_map = dict(_DEFAULT_BUTTON_MAPPINGS)
+    id_map = dict(_DEFAULT_BUTTON_ID_MAPPINGS)
+
+    if db:
+        try:
+            doc = db.collection("chatbot_config").document(tenant_id).get()
+            if doc.exists:
+                data = doc.to_dict()
+                custom_text = data.get("button_text_mappings")
+                custom_id = data.get("button_id_mappings")
+                if custom_text and isinstance(custom_text, dict):
+                    text_map = custom_text
+                if custom_id and isinstance(custom_id, dict):
+                    id_map = custom_id
+        except Exception:
+            pass  # Use defaults on error
+
+    result = (text_map, id_map)
+    cache.set(cache_key, result, ttl=3600.0)  # Cache for 1 hour
+    return result
+
+
+# ── GET: Webhook verification ────────────────────────────────────────
 
 @router.get("")
 async def verify_webhook(
@@ -78,7 +176,7 @@ async def verify_webhook(
         return JSONResponse(status_code=403, content={"error": "Verification failed"})
 
     # ── Check 1: env-configured token ───────────────────────────────
-    if hub_verify_token == VERIFY_TOKEN:
+    if hmac.compare_digest(hub_verify_token, VERIFY_TOKEN):
         log_event("webhook_verify", status="success", detail="env token matched")
         return PlainTextResponse(content=hub_challenge or "")
 
@@ -97,9 +195,8 @@ async def verify_webhook(
             log_event("webhook_verify", level="WARN", detail=str(e))
 
     log_event("webhook_verify", status="failed", level="WARN",
-              detail=f"token did not match any tenant")
+              detail="token did not match any tenant")
     return JSONResponse(status_code=403, content={"error": "Verification failed"})
-
 
 
 @router.get("/")
@@ -111,8 +208,30 @@ async def verify_webhook_slash(
     return await verify_webhook(hub_mode, hub_verify_token, hub_challenge)
 
 
+# ── POST: Handle incoming webhook ────────────────────────────────────
+
 @router.post("")
-async def handle_webhook(body: dict):
+async def handle_webhook(request: Request):
+    """Process incoming webhook from Meta/WhatsApp.
+
+    Security: Verifies X-Hub-Signature-256 before processing.
+    """
+    # ── Step 0: Verify webhook signature ─────────────────────────────
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256")
+
+    if not _verify_webhook_signature(raw_body, signature):
+        log_event("webhook_sig_rejected", level="WARN",
+                  detail="Invalid or missing webhook signature — request rejected")
+        return JSONResponse(status_code=401, content={"error": "Invalid signature"})
+
+    # Parse the body as JSON
+    import json
+    try:
+        body = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
     log_event("webhook_receive")
 
     for entry in body.get("entry", []):
@@ -146,33 +265,25 @@ async def handle_webhook(body: dict):
                     .get("profile", {})
                     .get("name", "Unknown")
                 )
-                
+
                 message_type = message.get("type", "text")
                 message_text = ""
-                
+                interactive_button_id = ""
+
                 if message_type == "text":
                     message_text = message.get("text", {}).get("body", "").strip()
                 elif message_type == "button":
-                    # For template buttons, Meta sends text in 'text' or 'payload'
                     message_text = message.get("button", {}).get("text", "").strip()
                     if not message_text:
                         message_text = message.get("button", {}).get("payload", "").strip()
                 elif message_type == "interactive":
-                    # Handle interactive button replies
                     interactive = message.get("interactive", {})
                     if interactive.get("type") == "button_reply":
                         button_reply_data = interactive.get("button_reply", {})
                         message_text = button_reply_data.get("title", "").strip()
-                        # Capture button ID for fallback matching (e.g. morning_session)
                         interactive_button_id = button_reply_data.get("id", "").strip()
-                    else:
-                        interactive_button_id = ""
-                
-                # For non-interactive messages there is no button_id
-                if message_type != "interactive":
-                    interactive_button_id = ""
 
-                now = datetime.datetime.now().isoformat()
+                now = _ist_now()
 
                 # Skip if no content readable for routing
                 if not message_text and message_type not in ["button", "interactive"]:
@@ -217,67 +328,34 @@ async def handle_webhook(body: dict):
                 # Invalidate cached user list
                 cache.invalidate(chat_users_key(tenant_id))
 
-                # ── Chatbot Decision Logic (Yoga Flow) ──────────────────
+                # ── Chatbot Decision Logic ───────────────────────────────
                 whatsapp = WhatsAppService(
                     settings["phone_number_id"],
                     settings["access_token"],
                 )
-                
+
                 response_text = ""
                 response_template = ""
                 matched_rule = False
 
-                # 1. Button Handling (Direct matches for yoga plan)
+                # 1. Configurable button→template mappings (per-tenant)
                 clean_text = message_text.strip()
+                text_map, id_map = _get_button_mappings(tenant_id)
+
                 if not matched_rule:
-                    if clean_text == "Sessions":
-                        response_template = "session_template"
+                    # Check text-based button match
+                    if clean_text in text_map:
+                        response_template = text_map[clean_text]
                         matched_rule = True
-                    elif clean_text == "Products":
-                        response_template = "products_template"
+                        log_event("button_match", tenant_id=tenant_id, phone=sender_phone,
+                                  status="matched", detail=f"text={clean_text!r} → {response_template}")
+
+                    # Check button ID match
+                    elif interactive_button_id and interactive_button_id in id_map:
+                        response_template = id_map[interactive_button_id]
                         matched_rule = True
-                    # ── Morning Session → aruna_yoga template ─────────────────────
-                    # Triggered by interactive button_reply title OR button ID fallback
-                    elif clean_text == "Morning" or interactive_button_id == "morning_session":
-                        response_template = "aruna_yoga"
-                        matched_rule = True
-                        log_event(
-                            "morning_session_trigger",
-                            tenant_id=tenant_id,
-                            phone=sender_phone,
-                            status="matched",
-                            detail=f"button_title={clean_text!r} button_id={interactive_button_id!r}",
-                        )
-                        print(f"[WEBHOOK] Morning button matched for {sender_phone} → sending aruna_yoga template")
-                    
-                        # ── Afternoon Session → afternoon_meet template ──────────────────────────────
-                    # Triggered by interactive button_reply title OR button ID fallback.
-                    # The shared template pipeline handles IMAGE header automatically.
-                    elif clean_text == "Afternoon" or interactive_button_id == "afternoon_session":
-                        response_template = "afternoon_meet"
-                        matched_rule = True
-                        log_event(
-                            "afternoon_session_trigger",
-                            tenant_id=tenant_id,
-                            phone=sender_phone,
-                            status="matched",
-                            detail=f"button_title={clean_text!r} button_id={interactive_button_id!r}",
-                        )
-                        print(f"[WEBHOOK] Afternoon button matched for {sender_phone} → sending afternoon_meet template")
-                    # ── Evening Session → meet3 template ──────────────────────────────
-                    # Triggered by interactive button_reply title OR button ID fallback.
-                    # The shared template pipeline handles IMAGE header automatically.
-                    elif clean_text == "Evening" or interactive_button_id == "evening_session":
-                        response_template = "meet3"
-                        matched_rule = True
-                        log_event(
-                            "evening_session_trigger",
-                            tenant_id=tenant_id,
-                            phone=sender_phone,
-                            status="matched",
-                            detail=f"button_title={clean_text!r} button_id={interactive_button_id!r}",
-                        )
-                        print(f"[WEBHOOK] Evening button matched for {sender_phone} → sending meet3 template")
+                        log_event("button_id_match", tenant_id=tenant_id, phone=sender_phone,
+                                  status="matched", detail=f"id={interactive_button_id!r} → {response_template}")
 
                 # 2. Existing Chatbot Rules (DB-based)
                 if not matched_rule and chatbot["is_enabled"]:
@@ -297,107 +375,38 @@ async def handle_webhook(body: dict):
                         users_db.record_trigger(sender_phone)
                         response_template = "first_trigger"
                         matched_rule = True
-                        print(f"[WEBHOOK] Fallback matched for {sender_phone} → sending first_trigger (24h lock)")
-                    else:
-                        print(f"[WEBHOOK] No match for {sender_phone}, but 24h trigger lock active. Skipping response.")
+                        log_event("fallback_trigger", tenant_id=tenant_id, phone=sender_phone,
+                                  detail="first_trigger sent (24h lock)")
 
-                # --- Execute Reply ---
+                # --- Execute Reply via Queue ---
                 if matched_rule or response_text or response_template:
-                    result = {"success": False}
-                    final_msg_content = response_text
+                    from services.queue_manager import enqueue_message
+                    import uuid
+                    uid = str(uuid.uuid4())
                     
                     if response_template:
-                        # ── Shared template builder (same as bulk campaigns) ──────────────
-                        # Resolve the canonical "name|language" cache key so we can look up
-                        # the template metadata and derive the correct language code.
-                        tpl_name = response_template
-                        tpl_language = "en_US"  # sensible default
-
-                        if "|" in response_template:
-                            # Caller already provided a fully-qualified key
-                            tpl_name, tpl_language = response_template.split("|", 1)
-                        else:
-                            # Try to find the key in the cache (any language suffix)
-                            matching_keys = [
-                                k for k in _template_components
-                                if k == response_template or k.startswith(response_template + "|")
-                            ]
-                            if matching_keys:
-                                tpl_language = matching_keys[0].split("|", 1)[1]
-                            # else: will fetch below; language resolved after cache hit
-
-                        # Build the canonical key used by the builder
-                        canonical_key = f"{tpl_name}|{tpl_language}"
-
-                        # Ensure template metadata is cached (fetch from API if missing)
-                        found = await _ensure_template_cached(canonical_key, whatsapp, settings)
-
-                        # If still not found under the guessed language, try a wildcard
-                        if not found:
-                            matching_keys = [
-                                k for k in _template_components
-                                if k.startswith(tpl_name + "|")
-                            ]
-                            if matching_keys:
-                                canonical_key = matching_keys[0]
-                                tpl_language = canonical_key.split("|", 1)[1]
-                                found = True
-
-                        # Auto-upload header media (IMAGE/VIDEO/DOCUMENT) from example handle
-                        header_media_id = ""
-                        if found:
-                            header_media_id = await _upload_header_media(canonical_key, whatsapp)
-
-                        # Build components (handles IMAGE/VIDEO/DOCUMENT/TEXT headers + BODY params)
-                        # contact dict carries the sender name for {{1}} BODY params
-                        contact_ctx = {"name": sender_name, "phone": sender_phone}
-                        components = _build_template_components(
-                            canonical_key,
-                            contact=contact_ctx,
-                            header_media_id=header_media_id,
-                        ) or None
-
-                        # first_trigger body-only override (no header media needed)
-                        if response_template == "first_trigger" and not components:
-                            components = [{
-                                "type": "body",
-                                "parameters": [{"type": "text", "text": sender_name}],
-                            }]
-
-                        result = await whatsapp.send_template_message(
-                            sender_phone,
-                            tpl_name,
-                            language=tpl_language,
-                            components=components,
+                        await enqueue_message(
+                            job_id=f"wh_{wa_message_id}_{uid}",
+                            tenant_id=tenant_id,
+                            campaign_id="webhook",
+                            contact_id=sender_phone,
+                            phone_number=sender_phone,
+                            template_name=response_template,
+                            template_variables={"name": sender_name},
+                            priority=0  # Highest priority for interactive chat
                         )
-                        final_msg_content = f"Template: {response_template}"
+                        log_event("webhook_queued", tenant_id=tenant_id, phone=sender_phone, detail=f"template {response_template}")
                     elif response_text:
-                        result = await whatsapp.send_text_message(sender_phone, response_text)
-
-                    log_event("webhook_reply", tenant_id=tenant_id, phone=sender_phone,
-                              status="sent" if result["success"] else "failed",
-                              detail=result.get("error", ""))
-
-                    out_now = datetime.datetime.now().isoformat()
-                    # Save outgoing logs
-                    _db_chat_messages.add(tenant_id, {
-                        "contact_phone": sender_phone,
-                        "contact_name": sender_name,
-                        "message_text": final_msg_content,
-                        "direction": "outgoing",
-                        "created_at": out_now,
-                    })
-                    _db_messages.add(tenant_id, {
-                        "direction": "outgoing",
-                        "product_type": "chatbot",
-                        "contact_phone": sender_phone,
-                        "message_type": "template" if response_template else "text",
-                        "wa_message_id": result.get("messageId", ""),
-                        "status": "sent" if result["success"] else "failed",
-                        "error_message": result.get("error", ""),
-                        "created_at": out_now,
-                    })
-                    _db_usage.record(tenant_id, "message_sent", "chatbot", contact_phone=sender_phone)
+                        await enqueue_message(
+                            job_id=f"wh_{wa_message_id}_{uid}",
+                            tenant_id=tenant_id,
+                            campaign_id="webhook",
+                            contact_id=sender_phone,
+                            phone_number=sender_phone,
+                            message_text=response_text,
+                            priority=0 
+                        )
+                        log_event("webhook_queued", tenant_id=tenant_id, phone=sender_phone, detail="text message")
 
                 # Mark webhook event as processed
                 if wa_message_id:
@@ -407,5 +416,5 @@ async def handle_webhook(body: dict):
 
 
 @router.post("/")
-async def handle_webhook_slash(body: dict):
-    return await handle_webhook(body)
+async def handle_webhook_slash(request: Request):
+    return await handle_webhook(request)

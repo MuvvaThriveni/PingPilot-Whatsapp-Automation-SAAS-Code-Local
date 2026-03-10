@@ -18,6 +18,12 @@ Optimizations:
 import datetime
 from firebase_config import get_db
 from cache import cache, usage_key, wa_message_mapping_key, fetch_cached
+from observability import log_event
+from utils.time_utils import get_ist_now_iso, get_ist_now
+
+
+def _ist_now_iso() -> str:
+    return get_ist_now_iso()
 
 
 def _col():
@@ -44,7 +50,7 @@ class _Messages:
                 "message_type": data.get("message_type", "text"),
                 "wa_message_id": data.get("wa_message_id", ""),
                 "status": data.get("status", ""),
-                "created_at": data.get("created_at", datetime.datetime.utcnow().isoformat()),
+                "created_at": data.get("created_at", _ist_now_iso()),
             }
             for field in ("contact_name", "template_name", "campaign_id", "error_message"):
                 if data.get(field):
@@ -60,7 +66,7 @@ class _Messages:
             cache.invalidate(usage_key(tenant_id))
             return doc_ref.id
         except Exception as e:
-            print(f"[db_layer.messages] add failed: {e}")
+            log_event("db_error", detail=f"messages.add failed: {e}", level="ERROR")
             return None
 
     @staticmethod
@@ -72,7 +78,7 @@ class _Messages:
         col = db.collection("messages")
         try:
             batch = db.batch()
-            now = datetime.datetime.utcnow().isoformat()
+            now = _ist_now_iso()
             for i, data in enumerate(items):
                 data["tenant_id"] = tenant_id
                 if "created_at" not in data:
@@ -91,7 +97,7 @@ class _Messages:
             batch.commit()
             cache.invalidate(usage_key(tenant_id))
         except Exception as e:
-            print(f"[db_layer.messages] add_batch failed: {e}")
+            log_event("db_error", detail=f"messages.add_batch failed: {e}", level="ERROR")
 
     @staticmethod
     def update_status(wa_message_id: str, status: str, tenant_id: str = ""):
@@ -105,7 +111,7 @@ class _Messages:
             if doc_id:
                 col.document(doc_id).update({
                     "status": status,
-                    "updated_at": datetime.datetime.utcnow().isoformat(),
+                    "updated_at": _ist_now_iso(),
                 })
                 return
 
@@ -114,13 +120,13 @@ class _Messages:
             for doc in query.stream():
                 doc.reference.update({
                     "status": status,
-                    "updated_at": datetime.datetime.utcnow().isoformat(),
+                    "updated_at": _ist_now_iso(),
                 })
                 # Cache for next status update (e.g. from 'delivered' to 'read')
                 cache.set(wa_message_mapping_key(wa_message_id), doc.id, ttl=3600*24)
                 return
         except Exception as e:
-            print(f"[db_layer.messages] update_status({wa_message_id}) failed: {e}")
+            log_event("db_error", detail=f"messages.update_status({wa_message_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def list(tenant_id: str, product_type: str = None, status: str = None,
@@ -151,7 +157,7 @@ class _Messages:
             next_cursor = docs[-1]["created_at"] if has_next and docs else None
             return docs, next_cursor
         except Exception as e:
-            print(f"[db_layer.messages] list failed: {e}")
+            log_event("db_error", detail=f"messages.list failed: {e}", level="ERROR")
             return [], None
 
     @staticmethod
@@ -171,7 +177,7 @@ class _Messages:
             )
             return [doc.to_dict() for doc in docs]
         except Exception as e:
-            print(f"[db_layer.messages] list_by_campaign failed: {e}")
+            log_event("db_error", detail=f"messages.list_by_campaign failed: {e}", level="ERROR")
             return []
 
     @staticmethod
@@ -197,7 +203,7 @@ class _Messages:
                     stats[key] = stats.get(key, 0) + 1
                 return stats
             except Exception as e:
-                print(f"[db_layer.messages] get_stats failed: {e}")
+                log_event("db_error", detail=f"messages.get_stats failed: {e}", level="ERROR")
                 return {}
 
         return fetch_cached(cache_key, _fetch)
@@ -212,7 +218,7 @@ class _Messages:
                         "month": {"total": 0, "successful": 0, "failed": 0},
                         "byProduct": []}
             try:
-                today = datetime.datetime.utcnow().strftime("%Y-%m-%dT")
+                today = get_ist_now().strftime("%Y-%m-%dT")
                 docs = (
                     col.where("tenant_id", "==", tenant_id)
                     .order_by("created_at", direction="DESCENDING")
@@ -241,7 +247,7 @@ class _Messages:
                     "byProduct": [],
                 }
             except Exception as e:
-                print(f"[db_layer.messages] get_usage failed: {e}")
+                log_event("db_error", detail=f"messages.get_usage failed: {e}", level="ERROR")
                 return {"today": {"total": 0, "successful": 0, "failed": 0},
                         "month": {"total": 0, "successful": 0, "failed": 0},
                         "byProduct": []}

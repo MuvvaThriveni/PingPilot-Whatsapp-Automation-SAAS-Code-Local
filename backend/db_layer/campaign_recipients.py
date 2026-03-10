@@ -10,6 +10,12 @@ Write frequency: HIGH.
 import datetime
 from google.cloud.firestore_v1 import Increment
 from firebase_config import get_db
+from observability import log_event
+from utils.time_utils import get_ist_now_iso
+
+
+def _ist_now_iso() -> str:
+    return get_ist_now_iso()
 
 
 def _col():
@@ -35,7 +41,7 @@ class _CampaignRecipients:
         col = db.collection("campaign_recipients")
         try:
             batch = db.batch()
-            now = datetime.datetime.utcnow().isoformat()
+            now = _ist_now_iso()
             for i, contact in enumerate(contacts):
                 phone = contact.get("phone", "")
                 doc_id = _doc_id(campaign_id, phone)
@@ -61,7 +67,7 @@ class _CampaignRecipients:
                     batch = db.batch()
             batch.commit()
         except Exception as e:
-            print(f"[db_layer.campaign_recipients] create_batch failed: {e}")
+            log_event("db_error", detail=f"campaign_recipients.create_batch failed: {e}", level="ERROR")
 
     @staticmethod
     def update_status(campaign_id: str, contact_phone: str, status: str,
@@ -74,8 +80,8 @@ class _CampaignRecipients:
             doc_id = _doc_id(campaign_id, contact_phone)
             update = {
                 "status": status,
-                "updated_at": datetime.datetime.utcnow().isoformat(),
-                "last_attempt_at": datetime.datetime.utcnow().isoformat(),
+                "updated_at": _ist_now_iso(),
+                "last_attempt_at": _ist_now_iso(),
             }
             if wa_message_id:
                 update["wa_message_id"] = wa_message_id
@@ -84,7 +90,7 @@ class _CampaignRecipients:
             update["attempt_count"] = Increment(1)
             col.document(doc_id).update(update)
         except Exception as e:
-            print(f"[db_layer.campaign_recipients] update_status failed: {e}")
+            log_event("db_error", detail=f"campaign_recipients.update_status failed: {e}", level="ERROR")
 
     @staticmethod
     def get_pending(campaign_id: str, limit: int = 10) -> list[dict]:
@@ -102,7 +108,7 @@ class _CampaignRecipients:
             )
             return [doc.to_dict() for doc in docs]
         except Exception as e:
-            print(f"[db_layer.campaign_recipients] get_pending failed: {e}")
+            log_event("db_error", detail=f"campaign_recipients.get_pending failed: {e}", level="ERROR")
             return []
 
     @staticmethod
@@ -119,7 +125,7 @@ class _CampaignRecipients:
             )
             return [doc.to_dict() for doc in docs]
         except Exception as e:
-            print(f"[db_layer.campaign_recipients] get_failed failed: {e}")
+            log_event("db_error", detail=f"campaign_recipients.get_failed failed: {e}", level="ERROR")
             return []
 
     @staticmethod
@@ -137,7 +143,7 @@ class _CampaignRecipients:
             )
             return [doc.to_dict() for doc in docs]
         except Exception as e:
-            print(f"[db_layer.campaign_recipients] list_by_campaign failed: {e}")
+            log_event("db_error", detail=f"campaign_recipients.list_by_campaign failed: {e}", level="ERROR")
             return []
 
     @staticmethod
@@ -160,7 +166,7 @@ class _CampaignRecipients:
             if count % 500 != 0:
                 batch.commit()
         except Exception as e:
-            print(f"[db_layer.campaign_recipients] delete_by_campaign failed: {e}")
+            log_event("db_error", detail=f"campaign_recipients.delete_by_campaign failed: {e}", level="ERROR")
 
 
 campaign_recipients = _CampaignRecipients()

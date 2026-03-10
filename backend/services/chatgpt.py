@@ -35,7 +35,8 @@ class ChatGPTService:
             )
             return context or []
         except Exception as e:
-            print(f"[WARN] Failed to load AI context from Firestore: {e}")
+            from observability import log_event
+            log_event("ai_context_error", detail=str(e), level="WARN")
             return []
 
     async def get_response(self, tenant_id: str, phone: str, message: str) -> Dict:
@@ -107,7 +108,7 @@ def get_chatgpt_service(api_key: str = None, system_prompt: str = None) -> ChatG
     """
     global _chatgpt_service
     
-    if api_key or system_prompt is not None:
+    if api_key is not None or system_prompt is not None:
         return ChatGPTService(api_key, system_prompt)
         
     if _chatgpt_service is None:

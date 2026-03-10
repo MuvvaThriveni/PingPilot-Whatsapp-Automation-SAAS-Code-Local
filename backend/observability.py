@@ -13,6 +13,7 @@ import json
 import functools
 from contextlib import contextmanager
 from typing import Any
+from utils.time_utils import get_ist_now_iso
 
 
 def _safe(value: Any) -> str:
@@ -37,6 +38,7 @@ def log_event(
 ):
     """Emit a single structured log line."""
     entry = {
+        "timestamp": get_ist_now_iso(),
         "level": level,
         "op": operation,
     }

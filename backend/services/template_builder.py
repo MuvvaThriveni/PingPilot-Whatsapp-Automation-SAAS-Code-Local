@@ -1,48 +1,49 @@
-"""Shared WhatsApp template component builder.
+"""Shared WhatsApp template component builder (Phase-6: tenant-isolated).
 
-This module owns the process-local template metadata cache and provides the
-functions needed to construct the ``components`` array accepted by
-``WhatsAppService.send_template_message()``.
+CRITICAL SECURITY FIX: Template component cache is now tenant-scoped.
+Previously, `_template_components` was keyed by "name|language" only,
+causing cross-tenant data leakage when two tenants had templates with
+the same name but different content.
 
-Design goals
-------------
-* Single source of truth for ``_template_components`` cache.
-* Automatic cache population (fetch from WhatsApp API on miss).
-* Automatic header-media upload using the template's own ``example.header_handle``
-  — no hardcoded URLs, no .env image hacks.
-* Works identically for bulk campaigns AND webhook-triggered templates.
-* Multi-tenant safe (each WhatsAppService instance carries its own credentials).
+Now keyed by "{tenant_id}:{name}|{language}".
+
+Also caches uploaded media IDs to avoid re-uploading on every webhook trigger.
 
 Public API
 ----------
-``ensure_cached(template_key, whatsapp, settings) -> bool``
-    Guarantee that the template metadata for *template_key* is in the cache.
-    Fetches from the WhatsApp API when missing.  Returns True on success.
-
-``get_components(template_key) -> list``
-    Return the raw cached component metadata for a template key.
-
-``build_components(template_key, contact, header_media_id) -> list``
-    Build the runtime ``components`` payload from cached metadata.
-
-``upload_header_media(template_key, whatsapp) -> str``
-    Download the example handle URL embedded in a template's IMAGE/VIDEO/DOCUMENT
-    HEADER component and upload it to the WhatsApp media endpoint.
-    Returns the resulting ``media_id`` string (or empty string on failure).
+``ensure_cached(template_key, whatsapp, settings, tenant_id) -> bool``
+``get_components(template_key, tenant_id) -> list``
+``build_components(template_key, contact, header_media_id, tenant_id) -> list``
+``upload_header_media(template_key, whatsapp, tenant_id) -> str``
+``get_template_keys_for_tenant(tenant_id, template_name) -> list[str]``
 """
 
 from __future__ import annotations
 
 import re
 import httpx
+from observability import log_event
 
 # ---------------------------------------------------------------------------
-# Process-local template metadata cache
+# Tenant-scoped template metadata cache
 #
-# Key format:  "{template_name}|{language_code}"   e.g. "aruna_yoga|en_US"
+# Key format:  "{tenant_id}:{template_name}|{language_code}"
 # Value:       raw ``components`` list from the WhatsApp API response
 # ---------------------------------------------------------------------------
 _template_components: dict[str, list] = {}
+
+# ---------------------------------------------------------------------------
+# Cached uploaded media IDs (avoids re-uploading on every webhook trigger)
+#
+# Key format:  "{tenant_id}:{template_name}|{language_code}"
+# Value:       WhatsApp media_id string
+# ---------------------------------------------------------------------------
+_uploaded_media_ids: dict[str, str] = {}
+
+
+def _tenant_key(tenant_id: str, template_key: str) -> str:
+    """Build tenant-scoped cache key."""
+    return f"{tenant_id}:{template_key}"
 
 
 # ---------------------------------------------------------------------------
@@ -50,70 +51,83 @@ _template_components: dict[str, list] = {}
 # ---------------------------------------------------------------------------
 
 
-def get_components(template_key: str) -> list:
+def get_components(template_key: str, tenant_id: str = "") -> list:
     """Return the raw cached component list for *template_key* (or empty list)."""
+    if tenant_id:
+        return _template_components.get(_tenant_key(tenant_id, template_key), [])
+    # Backward compat: check without tenant prefix
     return _template_components.get(template_key, [])
 
 
-async def ensure_cached(template_key: str, whatsapp, settings: dict) -> bool:
-    """Ensure *template_key* is present in the in-process cache.
+def get_template_keys_for_tenant(tenant_id: str, template_name: str) -> list[str]:
+    """Find all cached template keys for a tenant matching the given template name.
+
+    Returns keys in "name|language" format (without tenant prefix).
+    """
+    prefix = f"{tenant_id}:{template_name}|"
+    exact = f"{tenant_id}:{template_name}"
+    result = []
+    for k in _template_components:
+        if k == exact or k.startswith(prefix):
+            # Strip tenant prefix for caller
+            result.append(k.split(":", 1)[1] if ":" in k else k)
+    return result
+
+
+async def ensure_cached(template_key: str, whatsapp, settings: dict,
+                        tenant_id: str = "") -> bool:
+    """Ensure *template_key* is present in the tenant-scoped cache.
 
     If the key is already cached, returns True immediately (no network call).
     Otherwise fetches all templates from the WhatsApp Business API, populates
     the cache, and returns True if the key was found.
-
-    Parameters
-    ----------
-    template_key:
-        ``"name|language"`` string, e.g. ``"aruna_yoga|en_US"``.
-    whatsapp:
-        An initialised ``WhatsAppService`` instance for the correct tenant.
-    settings:
-        The tenant settings dict (must contain ``business_account_id``).
-
-    Returns
-    -------
-    bool
-        True  — template is now in cache (either was already, or just fetched).
-        False — fetch failed or template not found in the API response.
     """
-    if template_key in _template_components:
+    full_key = _tenant_key(tenant_id, template_key) if tenant_id else template_key
+
+    if full_key in _template_components:
         return True
 
-    print(f"[TEMPLATE_BUILDER] '{template_key}' not in cache — fetching from WhatsApp API…")
+    log_event("template_cache_miss", tenant_id=tenant_id, detail=f"key={template_key}")
     baid = settings.get("business_account_id", "")
     if not baid:
-        print("[TEMPLATE_BUILDER] ERROR: business_account_id missing from settings — cannot fetch templates.")
+        log_event("template_cache_error", tenant_id=tenant_id, level="ERROR",
+                  detail="business_account_id missing from settings")
         return False
 
     result = await whatsapp.get_templates(baid)
     if not result["success"]:
-        print(f"[TEMPLATE_BUILDER] WARNING: Could not fetch templates: {result.get('error')}")
+        log_event("template_fetch_failed", tenant_id=tenant_id, level="WARN",
+                  detail=result.get("error", ""))
         return False
 
     for t in result["templates"]:
         key = f"{t['name']}|{t['language']}"
-        _template_components[key] = t.get("components", [])
+        cache_key = _tenant_key(tenant_id, key) if tenant_id else key
+        _template_components[cache_key] = t.get("components", [])
 
-    found = template_key in _template_components
-    print(
-        f"[TEMPLATE_BUILDER] Cached {len(result['templates'])} templates. "
-        f"'{template_key}' found={found}"
-    )
+    found = full_key in _template_components
+    log_event("template_cache_populated", tenant_id=tenant_id,
+              detail=f"cached={len(result['templates'])} found={found} key={template_key}")
     return found
 
 
-async def upload_header_media(template_key: str, whatsapp) -> str:
+async def upload_header_media(template_key: str, whatsapp,
+                              tenant_id: str = "") -> str:
     """Upload the example header media embedded in the template definition.
 
-    Reads the ``example.header_handle`` URL from the first HEADER component
-    that has format IMAGE | VIDEO | DOCUMENT, downloads the bytes, then uploads
-    them via ``whatsapp.upload_media()``.
+    Caches the resulting media_id to avoid re-uploading on subsequent calls
+    (e.g., every webhook trigger for the same template).
 
-    Returns the WhatsApp ``media_id`` string on success, or empty string on any
-    failure.  All errors are non-fatal (logged via ``print`` only).
+    Returns the WhatsApp media_id string on success, or empty string on failure.
     """
-    cached = _template_components.get(template_key, [])
+    full_key = _tenant_key(tenant_id, template_key) if tenant_id else template_key
+
+    # Check media ID cache first
+    cached_media_id = _uploaded_media_ids.get(full_key)
+    if cached_media_id:
+        return cached_media_id
+
+    cached = _template_components.get(full_key, [])
     for comp in cached:
         if comp.get("type") != "HEADER":
             continue
@@ -123,42 +137,35 @@ async def upload_header_media(template_key: str, whatsapp) -> str:
         handle_list = (comp.get("example") or {}).get("header_handle") or []
         handle_url = handle_list[0] if handle_list else ""
         if not handle_url:
-            print(
-                f"[TEMPLATE_BUILDER] Template '{template_key}' has media header but no "
-                f"example.header_handle — cannot auto-upload."
-            )
-            break  # only one HEADER per template
+            log_event("template_media_missing", tenant_id=tenant_id, level="WARN",
+                      detail=f"'{template_key}' has media header but no example.header_handle")
+            break
 
-        print(f"[TEMPLATE_BUILDER] Auto-uploading header media from example handle for '{template_key}'…")
+        log_event("template_media_upload", tenant_id=tenant_id,
+                  detail=f"Uploading header media for '{template_key}'")
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 dl = await client.get(handle_url)
             if dl.status_code != 200:
-                print(
-                    f"[TEMPLATE_BUILDER] WARNING: Could not download example media "
-                    f"(status={dl.status_code}) — will try sending without header."
-                )
+                log_event("template_media_download_failed", tenant_id=tenant_id, level="WARN",
+                          detail=f"status={dl.status_code}")
                 break
 
             mime = dl.headers.get("content-type", "image/jpeg").split(";")[0].strip()
             upload_result = await whatsapp.upload_media(dl.content, mime)
             if upload_result["success"]:
                 media_id: str = upload_result["mediaId"]
-                print(
-                    f"[TEMPLATE_BUILDER] ✅ Header media uploaded. "
-                    f"mediaId={media_id} mime={mime}"
-                )
+                # Cache the media ID for reuse
+                _uploaded_media_ids[full_key] = media_id
+                log_event("template_media_uploaded", tenant_id=tenant_id,
+                          detail=f"mediaId cached for '{template_key}'")
                 return media_id
             else:
-                print(
-                    f"[TEMPLATE_BUILDER] WARNING: Media upload failed: "
-                    f"{upload_result.get('error')} — will try sending without header."
-                )
+                log_event("template_media_upload_failed", tenant_id=tenant_id, level="WARN",
+                          detail=upload_result.get("error", ""))
         except Exception as exc:
-            print(
-                f"[TEMPLATE_BUILDER] WARNING: Exception auto-uploading header media: "
-                f"{exc} — will try without header."
-            )
+            log_event("template_media_error", tenant_id=tenant_id, level="WARN",
+                      detail=str(exc)[:120])
         break  # only one HEADER component matters
 
     return ""
@@ -168,37 +175,14 @@ def build_components(
     template_key: str,
     contact: dict | None = None,
     header_media_id: str = "",
+    tenant_id: str = "",
 ) -> list:
     """Build the runtime *components* payload for ``send_template_message()``.
 
-    Uses cached template metadata to generate the correct ``components`` array,
-    handling all header types (IMAGE, VIDEO, DOCUMENT, TEXT) as well as
-    parameterised BODY components.
-
-    Priority for media headers
-    --------------------------
-    1. *header_media_id* — pre-uploaded permanent WhatsApp media ID (preferred).
-    2. ``contact["imageUrl"]`` / ``contact["videoUrl"]`` / ``contact["documentUrl"]``
-       — per-contact URL from a spreadsheet column.
-    3. Nothing — header component is silently omitted (text-only templates still work).
-
-    Parameters
-    ----------
-    template_key:
-        ``"name|language"`` string, e.g. ``"aruna_yoga|en_US"``.
-    contact:
-        Optional contact dict with keys: ``name``, ``phone``, ``imageUrl``, etc.
-        Pass ``None`` (or ``{}``) for webhook-triggered sends where no spreadsheet
-        row is available.
-    header_media_id:
-        Pre-uploaded WhatsApp media ID returned by ``upload_header_media()``.
-
-    Returns
-    -------
-    list
-        Ready-to-use components array, or ``[]`` if the template is not cached.
+    Uses tenant-scoped cached template metadata.
     """
-    cached = _template_components.get(template_key, [])
+    full_key = _tenant_key(tenant_id, template_key) if tenant_id else template_key
+    cached = _template_components.get(full_key, [])
     if not cached:
         return []
 
@@ -241,11 +225,6 @@ def build_components(
                             "type": "header",
                             "parameters": [{"type": "image", "image": {"link": image_link}}],
                         })
-                    else:
-                        print(
-                            f"[TEMPLATE_BUILDER] WARNING: '{template_key}' has IMAGE header "
-                            f"but no media_id or imageUrl — skipping header component."
-                        )
 
             elif header_format == "VIDEO":
                 if header_media_id:
@@ -260,11 +239,6 @@ def build_components(
                             "type": "header",
                             "parameters": [{"type": "video", "video": {"link": video_link}}],
                         })
-                    else:
-                        print(
-                            f"[TEMPLATE_BUILDER] WARNING: '{template_key}' has VIDEO header "
-                            f"but no media_id or videoUrl — skipping header component."
-                        )
 
             elif header_format == "DOCUMENT":
                 if header_media_id:
@@ -279,11 +253,6 @@ def build_components(
                             "type": "header",
                             "parameters": [{"type": "document", "document": {"link": doc_link}}],
                         })
-                    else:
-                        print(
-                            f"[TEMPLATE_BUILDER] WARNING: '{template_key}' has DOCUMENT header "
-                            f"but no media_id or documentUrl — skipping header component."
-                        )
 
         # ── BODY ───────────────────────────────────────────────────────────
         elif comp_type == "BODY":

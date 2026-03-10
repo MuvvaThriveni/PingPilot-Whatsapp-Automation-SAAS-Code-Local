@@ -9,6 +9,7 @@ Writers pick a random shard to avoid write contention on a single document.
 import random
 from google.cloud.firestore_v1 import Increment
 from firebase_config import get_db
+from observability import log_event
 
 NUM_SHARDS = 10
 
@@ -36,7 +37,7 @@ class _CampaignCounters:
                 batch.set(ref, {"sent": 0, "failed": 0})
             batch.commit()
         except Exception as e:
-            print(f"[db_layer.campaign_counters] init_shards({campaign_id}) failed: {e}")
+            log_event("db_error", detail=f"campaign_counters.init_shards({campaign_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def increment_sent(campaign_id: str, count: int = 1):
@@ -50,7 +51,7 @@ class _CampaignCounters:
                 "sent": Increment(count)
             })
         except Exception as e:
-            print(f"[db_layer.campaign_counters] increment_sent({campaign_id}) failed: {e}")
+            log_event("db_error", detail=f"campaign_counters.increment_sent({campaign_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def increment_failed(campaign_id: str, count: int = 1):
@@ -64,7 +65,7 @@ class _CampaignCounters:
                 "failed": Increment(count)
             })
         except Exception as e:
-            print(f"[db_layer.campaign_counters] increment_failed({campaign_id}) failed: {e}")
+            log_event("db_error", detail=f"campaign_counters.increment_failed({campaign_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def get_totals(campaign_id: str) -> dict:
@@ -81,7 +82,7 @@ class _CampaignCounters:
                 total_failed += d.get("failed", 0)
             return {"sent": total_sent, "failed": total_failed}
         except Exception as e:
-            print(f"[db_layer.campaign_counters] get_totals({campaign_id}) failed: {e}")
+            log_event("db_error", detail=f"campaign_counters.get_totals({campaign_id}) failed: {e}", level="ERROR")
             return {"sent": 0, "failed": 0}
 
     @staticmethod
@@ -99,7 +100,7 @@ class _CampaignCounters:
             # Delete the parent document
             db.collection("campaign_counters").document(campaign_id).delete()
         except Exception as e:
-            print(f"[db_layer.campaign_counters] delete({campaign_id}) failed: {e}")
+            log_event("db_error", detail=f"campaign_counters.delete({campaign_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def get(campaign_id: str) -> dict:

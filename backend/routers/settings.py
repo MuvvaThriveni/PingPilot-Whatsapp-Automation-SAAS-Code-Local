@@ -1,13 +1,19 @@
-"""Settings routes – WhatsApp Business API configuration (Phase-3: multi-tenant)."""
+"""Settings routes – WhatsApp Business API configuration (Phase-6: hardened).
+
+Security fix: Never return access_token in GET responses.
+Input validation via Pydantic.
+"""
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional
+import re
 
 from store import get_settings, save_settings
 from services.whatsapp import WhatsAppService
 from db_layer.messages import messages as _db_messages
+from observability import log_event
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -18,17 +24,27 @@ class WhatsAppSettings(BaseModel):
     access_token: Optional[str] = ""   # optional — omit to keep existing token
     webhook_verify_token: Optional[str] = ""
 
+    @field_validator("business_account_id", "phone_number_id")
+    @classmethod
+    def must_be_alphanumeric(cls, v: str) -> str:
+        v = v.strip()
+        if v and not re.match(r'^[a-zA-Z0-9_]+$', v):
+            raise ValueError("Must contain only alphanumeric characters and underscores")
+        return v
+
 
 @router.get("/whatsapp")
 async def get_whatsapp_settings(request: Request):
     tenant_id = request.state.tenant_id
     settings = get_settings(tenant_id)
+    # SECURITY: Never return the access token to the frontend
     return {
         "settings": {
             "business_account_id": settings["business_account_id"],
             "phone_number_id": settings["phone_number_id"],
             "webhook_verify_token": settings["webhook_verify_token"],
             "is_configured": settings["is_configured"],
+            "has_access_token": bool(settings.get("access_token")),
         }
     }
 
@@ -48,6 +64,7 @@ async def save_whatsapp_settings(request: Request, data: WhatsAppSettings):
         "is_configured": True,
     }
     save_settings(tenant_id, settings_data)
+    log_event("settings_updated", tenant_id=tenant_id)
     return {"message": "Settings saved successfully"}
 
 

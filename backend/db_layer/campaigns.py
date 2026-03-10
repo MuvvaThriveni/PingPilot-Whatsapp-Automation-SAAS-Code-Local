@@ -10,6 +10,12 @@ Write frequency: Medium (status updates during send).
 import datetime
 from firebase_config import get_db
 from google.cloud.firestore_v1.base_query import FieldFilter
+from observability import log_event
+from utils.time_utils import get_ist_now_iso, get_ist_now
+
+
+def _ist_now_iso() -> str:
+    return get_ist_now_iso()
 
 
 def _col():
@@ -28,11 +34,11 @@ class _Campaigns:
         try:
             data["campaign_id"] = campaign_id
             data["tenant_id"] = tenant_id
-            data["created_at"] = datetime.datetime.utcnow().isoformat()
+            data["created_at"] = _ist_now_iso()
             data["updated_at"] = data["created_at"]
             col.document(campaign_id).set(data)
         except Exception as e:
-            print(f"[db_layer.campaigns] create({campaign_id}) failed: {e}")
+            log_event("db_error", detail=f"campaigns.create({campaign_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def get(campaign_id: str) -> dict | None:
@@ -43,7 +49,7 @@ class _Campaigns:
             doc = col.document(campaign_id).get()
             return doc.to_dict() if doc.exists else None
         except Exception as e:
-            print(f"[db_layer.campaigns] get({campaign_id}) failed: {e}")
+            log_event("db_error", detail=f"campaigns.get({campaign_id}) failed: {e}", level="ERROR")
             return None
 
     @staticmethod
@@ -53,11 +59,11 @@ class _Campaigns:
         if not col:
             return
         try:
-            update = {"status": status, "updated_at": datetime.datetime.utcnow().isoformat()}
+            update = {"status": status, "updated_at": _ist_now_iso()}
             update.update(extra)
             col.document(campaign_id).update(update)
         except Exception as e:
-            print(f"[db_layer.campaigns] update_status({campaign_id}) failed: {e}")
+            log_event("db_error", detail=f"campaigns.update_status({campaign_id}) failed: {e}", level="ERROR")
 
     @staticmethod
     def update_last_processed(campaign_id: str, index: int):
@@ -68,10 +74,10 @@ class _Campaigns:
         try:
             col.document(campaign_id).update({
                 "last_processed_index": index,
-                "updated_at": datetime.datetime.utcnow().isoformat(),
+                "updated_at": _ist_now_iso(),
             })
         except Exception as e:
-            print(f"[db_layer.campaigns] update_last_processed failed: {e}")
+            log_event("db_error", detail=f"campaigns.update_last_processed failed: {e}", level="ERROR")
 
     @staticmethod
     def update_heartbeat(campaign_id: str):
@@ -81,10 +87,10 @@ class _Campaigns:
             return
         try:
             col.document(campaign_id).update({
-                "worker_heartbeat": datetime.datetime.utcnow().isoformat(),
+                "worker_heartbeat": _ist_now_iso(),
             })
         except Exception as e:
-            print(f"[db_layer.campaigns] update_heartbeat({campaign_id}) failed: {e}")
+            log_event("db_error", detail=f"campaigns.update_heartbeat({campaign_id}) failed: {e}", level="ERROR")
 
     HEARTBEAT_STALE_SECONDS = 120  # campaign considered stuck if no heartbeat for 2 min
 
@@ -98,7 +104,7 @@ class _Campaigns:
             return []
         try:
             cutoff = (
-                datetime.datetime.utcnow()
+                get_ist_now()
                 - datetime.timedelta(seconds=threshold_seconds)
             ).isoformat()
             docs = (
@@ -115,7 +121,7 @@ class _Campaigns:
                     stale.append(d)
             return stale
         except Exception as e:
-            print(f"[db_layer.campaigns] get_stale_running failed: {e}")
+            log_event("db_error", detail=f"campaigns.get_stale_running failed: {e}", level="ERROR")
             return []
 
     @staticmethod
@@ -138,7 +144,7 @@ class _Campaigns:
             next_cursor = docs[-1]["created_at"] if has_next and docs else None
             return docs, next_cursor
         except Exception as e:
-            print(f"[db_layer.campaigns] list({tenant_id}) failed: {e}")
+            log_event("db_error", detail=f"campaigns.list({tenant_id}) failed: {e}", level="ERROR")
             return [], None
 
     @staticmethod
@@ -151,7 +157,7 @@ class _Campaigns:
             docs = col.where(filter=FieldFilter("status", "==", "running")).stream()
             return [doc.to_dict() for doc in docs]
         except Exception as e:
-            print(f"[db_layer.campaigns] list_running failed: {e}")
+            log_event("db_error", detail=f"campaigns.list_running failed: {e}", level="ERROR")
             return []
 
     @staticmethod
@@ -161,7 +167,7 @@ class _Campaigns:
         if not col:
             return []
         try:
-            now = datetime.datetime.utcnow().isoformat() + "Z"
+            now = get_ist_now_iso()
             docs = (
                 col.where(filter=FieldFilter("status", "==", "scheduled"))
                 .where(filter=FieldFilter("scheduled_at", "<=", now))
@@ -169,7 +175,7 @@ class _Campaigns:
             )
             return [doc.to_dict() for doc in docs]
         except Exception as e:
-            print(f"[db_layer.campaigns] get_due_scheduled failed: {e}")
+            log_event("db_error", detail=f"campaigns.get_due_scheduled failed: {e}", level="ERROR")
             return []
 
     @staticmethod
@@ -180,7 +186,7 @@ class _Campaigns:
         try:
             col.document(campaign_id).delete()
         except Exception as e:
-            print(f"[db_layer.campaigns] delete({campaign_id}) failed: {e}")
+            log_event("db_error", detail=f"campaigns.delete({campaign_id}) failed: {e}", level="ERROR")
 
 
 campaigns = _Campaigns()

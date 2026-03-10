@@ -6,6 +6,7 @@ Caches expensive user-list endpoint. Reduces read-heavy polling impact.
 import datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from utils.time_utils import get_ist_now_iso
 from pydantic import BaseModel
 from typing import Optional
 
@@ -88,7 +89,7 @@ async def create_chatbot_rule(request: Request, rule: ChatbotRuleModel):
         "response": rule.response,
         "priority": rule.priority,
         "is_active": 1,
-        "created_at": datetime.datetime.now().isoformat(),
+        "created_at": get_ist_now_iso(),
     }
     result = _db_rules.create(tenant_id, new_rule)
     return {"rule": result}

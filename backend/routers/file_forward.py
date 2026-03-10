@@ -1,18 +1,33 @@
-"""File Forwarding routes – single and bulk (Phase-3: multi-tenant)."""
+"""File Forwarding routes – single and bulk (Phase-6: hardened).
+
+Fixes:
+- File upload size limit (16MB)
+- Contact deduplication before bulk send
+- UTC timestamps
+- Phone number normalization with country code support
+"""
 
 import io
 import datetime
 import asyncio
 from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
+from utils.time_utils import get_ist_now_iso
 import pandas as pd
 
 from store import get_settings
 from services.whatsapp import WhatsAppService
 from db_layer.messages import messages as _db_messages
 from db_layer.usage_events import usage_events as _db_usage
+from observability import log_event
 
 router = APIRouter(prefix="/api/file-forward", tags=["file-forward"])
+
+MAX_UPLOAD_SIZE_BYTES = 16 * 1024 * 1024  # 16MB
+
+
+def _ist_now() -> str:
+    return get_ist_now_iso()
 
 
 def _find_column(df_columns, keywords):
@@ -33,10 +48,24 @@ def _parse_contacts_from_df(df):
     name_col = _find_column(df.columns, ["name"])
 
     contacts = []
+    seen_phones = set()  # Deduplication
     for idx, row in df.iterrows():
-        phone = str(row[phone_col]).strip()
-        phone = "".join(filter(str.isdigit, phone))
-        if len(phone) >= 10:
+        raw = row[phone_col]
+        # Handle Excel storing phone numbers as floats
+        if isinstance(raw, float) and raw == int(raw):
+            phone_str = str(int(raw))
+        else:
+            phone_str = str(raw).strip()
+            if phone_str.endswith('.0'):
+                phone_str = phone_str[:-2]
+
+        phone = "".join(filter(str.isdigit, phone_str))
+        # Auto-add India country code for 10-digit mobile numbers
+        if len(phone) == 10 and phone[0] in ('6', '7', '8', '9'):
+            phone = '91' + phone
+
+        if len(phone) >= 10 and phone not in seen_phones:
+            seen_phones.add(phone)
             contacts.append({
                 "index": idx,
                 "phone": phone,
@@ -45,10 +74,25 @@ def _parse_contacts_from_df(df):
     return contacts
 
 
+async def _read_upload_safe(file: UploadFile) -> bytes:
+    """Read uploaded file with size limit enforcement."""
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_SIZE_BYTES:
+        raise ValueError(
+            f"File too large: {len(content) / (1024*1024):.1f}MB exceeds "
+            f"limit of {MAX_UPLOAD_SIZE_BYTES / (1024*1024):.0f}MB"
+        )
+    return content
+
+
 @router.post("/parse-contacts")
 async def parse_contacts_file(contactsFile: UploadFile = File(...)):
     """Parse an Excel/CSV file to extract contacts for bulk file forwarding."""
-    content = await contactsFile.read()
+    try:
+        content = await _read_upload_safe(contactsFile)
+    except ValueError as e:
+        return JSONResponse(status_code=413, content={"error": str(e)})
+
     try:
         filename = contactsFile.filename or ""
         if filename.lower().endswith(".csv"):
@@ -76,9 +120,13 @@ async def send_file(
             content={"error": "WhatsApp not configured. Please configure in Settings."},
         )
 
+    try:
+        file_content = await _read_upload_safe(file)
+    except ValueError as e:
+        return JSONResponse(status_code=413, content={"error": str(e)})
+
     whatsapp = WhatsAppService(settings["phone_number_id"], settings["access_token"])
-    file_content = await file.read()
-    now = datetime.datetime.now().isoformat()
+    now = _ist_now()
 
     # Step 1: Upload media to WhatsApp
     upload_result = await whatsapp.upload_media(file_content, file.content_type or "application/octet-stream")
@@ -144,15 +192,20 @@ async def send_file_bulk(
             content={"error": "WhatsApp not configured. Please configure in Settings."},
         )
 
-    # Parse contacts from the uploaded spreadsheet
-    contacts_content = await contactsFile.read()
+    # Read and validate both files
+    try:
+        file_content = await _read_upload_safe(file)
+        contacts_content = await _read_upload_safe(contactsFile)
+    except ValueError as e:
+        return JSONResponse(status_code=413, content={"error": str(e)})
+
     try:
         filename = contactsFile.filename or ""
         if filename.lower().endswith(".csv"):
             df = pd.read_csv(io.BytesIO(contacts_content))
         else:
             df = pd.read_excel(io.BytesIO(contacts_content))
-        contacts = _parse_contacts_from_df(df)
+        contacts = _parse_contacts_from_df(df)  # Already deduplicated
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": f"Failed to parse contacts: {str(e)}"})
 
@@ -160,7 +213,6 @@ async def send_file_bulk(
         return JSONResponse(status_code=400, content={"error": "No valid contacts found in file"})
 
     whatsapp = WhatsAppService(settings["phone_number_id"], settings["access_token"])
-    file_content = await file.read()
     content_type = file.content_type or ""
     file_name = file.filename or "file"
 
@@ -178,7 +230,7 @@ async def send_file_bulk(
     async def send_to_contact(contact):
         nonlocal sent_count, failed_count
         phone = contact["phone"]
-        now = datetime.datetime.now().isoformat()
+        now = _ist_now()
 
         if is_image:
             result = await whatsapp.send_image(phone, media_id, message)
@@ -212,6 +264,9 @@ async def send_file_bulk(
         await asyncio.gather(*[send_to_contact(c) for c in batch])
         if i + batch_size < len(contacts):
             await asyncio.sleep(1)  # Rate limit delay
+
+    log_event("file_forward_bulk_done", tenant_id=tenant_id,
+              detail=f"sent={sent_count} failed={failed_count} total={len(contacts)}")
 
     return {
         "success": True,

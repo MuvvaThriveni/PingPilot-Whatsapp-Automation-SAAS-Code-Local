@@ -9,6 +9,12 @@ Write frequency: Low.
 
 import datetime
 from firebase_config import get_db
+from observability import log_event
+from utils.time_utils import get_ist_now_iso
+
+
+def _ist_now_iso() -> str:
+    return get_ist_now_iso()
 
 
 def _col():
@@ -38,10 +44,10 @@ class _TemplateCache:
                 "status": status,
                 "components": components,
                 "param_count": param_count,
-                "fetched_at": datetime.datetime.utcnow().isoformat(),
+                "fetched_at": _ist_now_iso(),
             })
         except Exception as e:
-            print(f"[db_layer.template_cache] upsert failed: {e}")
+            log_event("db_error", detail=f"template_cache.upsert failed: {e}", level="ERROR")
 
     @staticmethod
     def upsert_batch(tenant_id: str, templates: list[dict]):
@@ -52,7 +58,7 @@ class _TemplateCache:
         col = db.collection("template_cache")
         try:
             batch = db.batch()
-            now = datetime.datetime.utcnow().isoformat()
+            now = _ist_now_iso()
             for i, t in enumerate(templates):
                 name = t.get("template_name", t.get("name", ""))
                 lang = t.get("language", "en_US")
@@ -72,7 +78,7 @@ class _TemplateCache:
                     batch = db.batch()
             batch.commit()
         except Exception as e:
-            print(f"[db_layer.template_cache] upsert_batch failed: {e}")
+            log_event("db_error", detail=f"template_cache.upsert_batch failed: {e}", level="ERROR")
 
     @staticmethod
     def get(tenant_id: str, template_name: str, language: str) -> dict | None:
@@ -85,7 +91,7 @@ class _TemplateCache:
             doc = col.document(doc_id).get()
             return doc.to_dict() if doc.exists else None
         except Exception as e:
-            print(f"[db_layer.template_cache] get failed: {e}")
+            log_event("db_error", detail=f"template_cache.get failed: {e}", level="ERROR")
             return None
 
     @staticmethod
@@ -115,7 +121,7 @@ class _TemplateCache:
             )
             return [doc.to_dict() for doc in docs]
         except Exception as e:
-            print(f"[db_layer.template_cache] list_approved failed: {e}")
+            log_event("db_error", detail=f"template_cache.list_approved failed: {e}", level="ERROR")
             return []
 
     @staticmethod
@@ -136,7 +142,7 @@ class _TemplateCache:
                 result[key] = d.get("components", [])
             return result
         except Exception as e:
-            print(f"[db_layer.template_cache] load_all_as_dict failed: {e}")
+            log_event("db_error", detail=f"template_cache.load_all_as_dict failed: {e}", level="ERROR")
             return {}
 
 
