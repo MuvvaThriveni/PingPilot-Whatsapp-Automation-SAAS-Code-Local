@@ -87,6 +87,19 @@ async def ensure_cached(template_key: str, whatsapp, settings: dict,
     if full_key in _template_components:
         return True
 
+    # Try Postgres-backed persistent cache first (tenant-scoped only)
+    if tenant_id and "|" in template_key:
+        try:
+            from db_layer.template_cache import template_cache_db
+
+            name, lang = template_key.split("|", 1)
+            cached = await template_cache_db.get(tenant_id, name.strip(), lang.strip())
+            if cached and cached.get("components"):
+                _template_components[full_key] = cached.get("components")
+                return True
+        except Exception:
+            pass
+
     log_event("template_cache_miss", tenant_id=tenant_id, detail=f"key={template_key}")
     baid = settings.get("business_account_id", "")
     if not baid:
@@ -104,6 +117,15 @@ async def ensure_cached(template_key: str, whatsapp, settings: dict,
         key = f"{t['name']}|{t['language']}"
         cache_key = _tenant_key(tenant_id, key) if tenant_id else key
         _template_components[cache_key] = t.get("components", [])
+
+    # Best-effort persist to Postgres so templates survive restarts
+    if tenant_id:
+        try:
+            from db_layer.template_cache import template_cache_db
+
+            await template_cache_db.upsert_batch(tenant_id, result.get("templates", []))
+        except Exception:
+            pass
 
     found = full_key in _template_components
     log_event("template_cache_populated", tenant_id=tenant_id,

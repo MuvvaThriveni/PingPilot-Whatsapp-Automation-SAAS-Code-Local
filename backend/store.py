@@ -1,4 +1,4 @@
-"""Shared data store for WappFlow – Multi-tenant Firestore-only (Phase-6: hardened).
+"""Shared data store for WappFlow – Multi-tenant Postgres-backed (Phase-6: hardened).
 
 All reads and writes go exclusively through db_layer + cache.
 Every function requires an explicit `tenant_id` parameter derived from
@@ -12,7 +12,7 @@ Security fixes:
 
 from typing import Dict
 
-# db_layer imports — sole Firestore abstraction
+# db_layer imports — sole DB abstraction
 from db_layer.tenants import tenants as _db_tenants
 from db_layer.chatbot import chatbot_config as _db_chatbot_config, chatbot_rules as _db_chatbot_rules
 from db_layer.chat_messages import chat_messages as _db_chat_messages
@@ -20,7 +20,7 @@ from db_layer.messages import messages as _db_messages
 from db_layer.secrets import secrets as _secrets
 
 # Cache layer
-from cache import cache, fetch_cached, tenant_key, chatbot_config_key, chatbot_rules_key, settings_key
+from cache import cache, fetch_cached_async, tenant_key, chatbot_config_key, chatbot_rules_key, settings_key
 from observability import log_event
 
 
@@ -39,12 +39,12 @@ _DEFAULT_CHATBOT: Dict = {
 }
 
 
-# ── Accessor functions (cached, Firestore-only, tenant-scoped) ──
+# ── Accessor functions (cached, tenant-scoped) ──
 
-def get_settings(tenant_id: str) -> Dict:
+async def get_settings(tenant_id: str) -> Dict:
     """Read WhatsApp settings for a specific tenant. Cached for 6 hours."""
-    def _fetch():
-        tenant = _db_tenants.get(tenant_id)
+    async def _fetch():
+        tenant = await _db_tenants.get(tenant_id)
         if tenant:
             token = _secrets.resolve_wa_token(tenant)
             # SECURITY: Never log tokens — not even partially
@@ -60,13 +60,13 @@ def get_settings(tenant_id: str) -> Dict:
             }
         return dict(_DEFAULT_SETTINGS)
 
-    return fetch_cached(settings_key(tenant_id), _fetch)
+    return await fetch_cached_async(settings_key(tenant_id), _fetch)
 
 
-def get_chatbot_settings(tenant_id: str) -> Dict:
+async def get_chatbot_settings(tenant_id: str) -> Dict:
     """Read chatbot config for a specific tenant. Cached for 6 hours."""
-    def _fetch():
-        cfg = _db_chatbot_config.get(tenant_id)
+    async def _fetch():
+        cfg = await _db_chatbot_config.get(tenant_id)
         if cfg:
             return {
                 "is_enabled": cfg.get("is_enabled", False),
@@ -75,24 +75,24 @@ def get_chatbot_settings(tenant_id: str) -> Dict:
             }
         return dict(_DEFAULT_CHATBOT)
 
-    return fetch_cached(chatbot_config_key(tenant_id), _fetch)
+    return await fetch_cached_async(chatbot_config_key(tenant_id), _fetch)
 
 
-def get_chatbot_rules(tenant_id: str) -> list:
+async def get_chatbot_rules(tenant_id: str) -> list:
     """Read chatbot rules for a specific tenant. Cached for 6 hours."""
-    return fetch_cached(
+    return await fetch_cached_async(
         chatbot_rules_key(tenant_id),
         lambda: _db_chatbot_rules.list(tenant_id),
     )
 
 
-# ── Write functions (Firestore-only via db_layer, invalidate cache) ──
+# ── Write functions (DB via db_layer, invalidate cache) ──
 
-def save_settings(tenant_id: str, settings_data: Dict):
+async def save_settings(tenant_id: str, settings_data: Dict):
     """Persist WhatsApp settings for a tenant.
 
-    The access token is stored in Firestore so it survives server restarts.
-    If no new token is provided in settings_data, the existing token in Firestore
+    The access token is stored in the database so it survives server restarts.
+    If no new token is provided in settings_data, the existing token in the database
     is preserved (not overwritten with empty string).
 
     SECURITY NOTE: os.environ is no longer polluted with per-tenant tokens.
@@ -116,14 +116,14 @@ def save_settings(tenant_id: str, settings_data: Dict):
     else:
         log_event("settings_saved", tenant_id=tenant_id, detail="token preserved (no new value)")
 
-    _db_tenants.upsert(tenant_id, upsert_data)
+    await _db_tenants.upsert(tenant_id, upsert_data)
     # Invalidate cache so next read picks up new values
     cache.invalidate(settings_key(tenant_id))
     cache.invalidate(tenant_key(tenant_id))
 
 
 
-def save_chatbot_settings(tenant_id: str, chatbot_data: Dict):
+async def save_chatbot_settings(tenant_id: str, chatbot_data: Dict):
     """Persist chatbot config for a tenant."""
     upsert_data = {
         "is_enabled": chatbot_data.get("is_enabled", False),
@@ -131,7 +131,7 @@ def save_chatbot_settings(tenant_id: str, chatbot_data: Dict):
         "use_ai": False,
     }
 
-    _db_chatbot_config.upsert(tenant_id, upsert_data)
+    await _db_chatbot_config.upsert(tenant_id, upsert_data)
     # Invalidate cache
     cache.invalidate(chatbot_config_key(tenant_id))
     log_event("chatbot_settings_saved", tenant_id=tenant_id)
@@ -141,6 +141,10 @@ def save_chatbot_settings(tenant_id: str, chatbot_data: Dict):
 active_campaigns: Dict = {}
 
 
-def add_message(tenant_id: str, message_data: Dict):
+async def add_message(tenant_id: str, message_data: Dict):
     """Convenience wrapper for adding a message to the history."""
-    _db_messages.add(tenant_id, message_data)
+    await _db_messages.add(tenant_id, message_data)
+
+
+async def add_message_conn(tenant_id: str, message_data: Dict, conn):
+    await _db_messages.add(tenant_id, message_data, conn=conn)

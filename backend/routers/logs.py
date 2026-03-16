@@ -48,8 +48,13 @@ async def get_logs(
     cursor: str = None,
 ):
     tenant_id = request.state.tenant_id
-    db_docs, next_cursor = _db_messages.list(tenant_id, product_type=product_type,
-                                              status=status, limit=limit, cursor=cursor)
+    db_docs, next_cursor = await _db_messages.list(
+        tenant_id,
+        product_type=product_type,
+        status=status,
+        limit=limit,
+        cursor=cursor,
+    )
     return {
         "logs": [_remap_db_log(d) for d in db_docs],
         "total": len(db_docs),
@@ -65,8 +70,13 @@ async def export_logs(request: Request, product_type: str = None, status: str = 
     all_docs: list[dict] = []
     cur = None
     while len(all_docs) < 5000:
-        batch, cur = _db_messages.list(tenant_id, product_type=product_type,
-                                       status=status, limit=100, cursor=cur)
+        batch, cur = await _db_messages.list(
+            tenant_id,
+            product_type=product_type,
+            status=status,
+            limit=100,
+            cursor=cur,
+        )
         all_docs.extend(batch)
         if not cur:
             break
@@ -101,5 +111,5 @@ async def export_logs(request: Request, product_type: str = None, status: str = 
 @router.get("/stats")
 async def get_log_stats(request: Request):
     tenant_id = request.state.tenant_id
-    db_stats = _db_messages.get_stats(tenant_id)
+    db_stats = await _db_messages.get_stats(tenant_id)
     return {"stats": db_stats, "dailyStats": []}

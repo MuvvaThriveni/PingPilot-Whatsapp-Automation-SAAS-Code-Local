@@ -36,7 +36,7 @@ class WhatsAppSettings(BaseModel):
 @router.get("/whatsapp")
 async def get_whatsapp_settings(request: Request):
     tenant_id = request.state.tenant_id
-    settings = get_settings(tenant_id)
+    settings = await get_settings(tenant_id)
     # SECURITY: Never return the access token to the frontend
     return {
         "settings": {
@@ -63,7 +63,7 @@ async def save_whatsapp_settings(request: Request, data: WhatsAppSettings):
         "webhook_verify_token": (data.webhook_verify_token or "").strip(),
         "is_configured": True,
     }
-    save_settings(tenant_id, settings_data)
+    await save_settings(tenant_id, settings_data)
     log_event("settings_updated", tenant_id=tenant_id)
     return {"message": "Settings saved successfully"}
 
@@ -71,7 +71,7 @@ async def save_whatsapp_settings(request: Request, data: WhatsAppSettings):
 @router.post("/whatsapp/test")
 async def test_whatsapp_connection(request: Request):
     tenant_id = request.state.tenant_id
-    settings = get_settings(tenant_id)
+    settings = await get_settings(tenant_id)
     if not settings["is_configured"]:
         return JSONResponse(status_code=400, content={"error": "WhatsApp settings not configured"})
 
@@ -92,4 +92,4 @@ async def test_whatsapp_connection(request: Request):
 @router.get("/usage")
 async def get_usage_stats(request: Request):
     tenant_id = request.state.tenant_id
-    return _db_messages.get_usage(tenant_id)
+    return await _db_messages.get_usage(tenant_id)

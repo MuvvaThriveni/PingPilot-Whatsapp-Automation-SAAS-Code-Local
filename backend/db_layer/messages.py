@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-"""Firestore operations for the `messages` collection (Phase-5: optimized).
+"""Postgres operations for the `messages` table (Phase-5: optimized).
 
 Single source of truth for ALL message history (chatbot, bulk, file-forward).
 No secondary summary documents — query this collection directly.
 
-Doc ID: auto-generated.
+Primary key: (tenant_id, id).
 Write frequency: HIGH.
 
 Optimizations:
@@ -16,8 +16,8 @@ Optimizations:
 """
 
 import datetime
-from firebase_config import get_db
-from cache import cache, usage_key, wa_message_mapping_key, fetch_cached
+from database import fetchrow, fetch, execute, fetchrow_conn
+from cache import cache, usage_key, wa_message_mapping_key, fetch_cached_async
 from observability import log_event
 from utils.time_utils import get_ist_now_iso, get_ist_now
 
@@ -26,179 +26,365 @@ def _ist_now_iso() -> str:
     return get_ist_now_iso()
 
 
-def _col():
-    db = get_db()
-    return db.collection("messages") if db else None
-
-
 class _Messages:
 
     @staticmethod
-    def add(tenant_id: str, data: dict) -> str | None:
-        """Insert a single message document. Returns the auto-generated doc ID."""
-        col = _col()
-        if not col:
-            return None
+    async def add(tenant_id: str, data: dict, conn=None) -> str | None:
+        """Insert a single message row. Returns the inserted row ID as string."""
         try:
-            # Store only required fields
-            doc = {
-                "tenant_id": tenant_id,
-                "direction": data.get("direction", ""),
-                "product_type": data.get("product_type", ""),
-                "contact_phone": data.get("contact_phone", ""),
-                "message_text": data.get("message_text", ""),
-                "message_type": data.get("message_type", "text"),
-                "wa_message_id": data.get("wa_message_id", ""),
-                "status": data.get("status", ""),
-                "created_at": data.get("created_at", _ist_now_iso()),
-            }
-            for field in ("contact_name", "template_name", "campaign_id", "error_message"):
-                if data.get(field):
-                    doc[field] = data[field]
+            created_at = data.get("created_at")
+            q = """
+                INSERT INTO messages (
+                    tenant_id,
+                    direction,
+                    product_type,
+                    contact_phone,
+                    contact_name,
+                    message_text,
+                    message_type,
+                    wa_message_id,
+                    status,
+                    template_name,
+                    campaign_id,
+                    media_id,
+                    error_message,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    COALESCE(%s::timestamptz, now()),
+                    now()
+                )
+                RETURNING id
+                """
+            args = (
+                tenant_id,
+                data.get("direction", ""),
+                data.get("product_type", ""),
+                data.get("contact_phone", ""),
+                data.get("contact_name", ""),
+                data.get("message_text", ""),
+                data.get("message_type", "text"),
+                data.get("wa_message_id", ""),
+                data.get("status", ""),
+                data.get("template_name", ""),
+                data.get("campaign_id") or None,
+                data.get("media_id", ""),
+                data.get("error_message", ""),
+                created_at if created_at else None,
+            )
+            if conn is not None:
+                row = await fetchrow_conn(conn, q, *args)
+            else:
+                row = await fetchrow(q, *args)
 
-            _, doc_ref = col.add(doc)
-            
-            # Cache the wa_message_id to doc_id mapping (Requirement 2/10)
+            inserted_id = str(row["id"]) if row and row.get("id") is not None else None
+
             wa_id = data.get("wa_message_id")
-            if wa_id:
-                cache.set(wa_message_mapping_key(wa_id), doc_ref.id, ttl=3600*24)
-            
+            if wa_id and inserted_id:
+                cache.set(wa_message_mapping_key(wa_id, tenant_id), inserted_id, ttl=3600 * 24)
+
             cache.invalidate(usage_key(tenant_id))
-            return doc_ref.id
+            return inserted_id
         except Exception as e:
             log_event("db_error", detail=f"messages.add failed: {e}", level="ERROR")
             return None
 
     @staticmethod
-    def add_batch(tenant_id: str, items: list[dict]):
-        """Batch-write multiple message documents. Caches mappings if wa_message_id is present."""
-        db = get_db()
-        if not db:
-            return
-        col = db.collection("messages")
+    async def get_latest_outgoing_for_campaign_recipient(
+        tenant_id: str,
+        campaign_id: str,
+        contact_phone: str,
+        conn=None,
+    ) -> dict | None:
         try:
-            batch = db.batch()
-            now = _ist_now_iso()
-            for i, data in enumerate(items):
-                data["tenant_id"] = tenant_id
-                if "created_at" not in data:
-                    data["created_at"] = now
-                ref = col.document()
-                batch.set(ref, data)
-                
-                # Cache mapping (Requirement 2/10)
-                wa_id = data.get("wa_message_id")
-                if wa_id:
-                    cache.set(wa_message_mapping_key(wa_id), ref.id, ttl=3600*24)
+            q = """
+                SELECT id, wa_message_id, status, created_at
+                FROM messages
+                WHERE tenant_id = %s
+                  AND campaign_id = %s::uuid
+                  AND contact_phone = %s
+                  AND direction = 'outgoing'
+                  AND status IN ('submitted', 'sent', 'delivered', 'read')
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """
+            args = (tenant_id, campaign_id, contact_phone)
+            if conn is not None:
+                row = await fetchrow_conn(conn, q, *args)
+            else:
+                row = await fetchrow(q, *args)
+            return dict(row) if row else None
+        except Exception as e:
+            log_event("db_error", detail=f"messages.get_latest_outgoing_for_campaign_recipient failed: {e}", level="ERROR")
+            return None
 
-                if (i + 1) % 500 == 0:
-                    batch.commit()
-                    batch = db.batch()
-            batch.commit()
+    @staticmethod
+    async def add_idempotent(tenant_id: str, data: dict, conn=None) -> str | None:
+        """Insert a message row but ignore any unique conflicts.
+
+        Intended for worker finalization where retries must not create duplicate rows.
+        """
+        try:
+            created_at = data.get("created_at")
+            q = """
+                INSERT INTO messages (
+                    tenant_id,
+                    direction,
+                    product_type,
+                    contact_phone,
+                    contact_name,
+                    message_text,
+                    message_type,
+                    wa_message_id,
+                    status,
+                    template_name,
+                    campaign_id,
+                    media_id,
+                    error_message,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    COALESCE(%s::timestamptz, now()),
+                    now()
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING id
+                """
+            args = (
+                tenant_id,
+                data.get("direction", ""),
+                data.get("product_type", ""),
+                data.get("contact_phone", ""),
+                data.get("contact_name", ""),
+                data.get("message_text", ""),
+                data.get("message_type", "text"),
+                data.get("wa_message_id", ""),
+                data.get("status", ""),
+                data.get("template_name", ""),
+                data.get("campaign_id") or None,
+                data.get("media_id", ""),
+                data.get("error_message", ""),
+                created_at if created_at else None,
+            )
+            if conn is not None:
+                row = await fetchrow_conn(conn, q, *args)
+            else:
+                row = await fetchrow(q, *args)
+
+            inserted_id = str(row["id"]) if row and row.get("id") is not None else None
+
+            wa_id = data.get("wa_message_id")
+            if wa_id and inserted_id:
+                cache.set(wa_message_mapping_key(wa_id, tenant_id), inserted_id, ttl=3600 * 24)
+
+            cache.invalidate(usage_key(tenant_id))
+            return inserted_id
+        except Exception as e:
+            log_event("db_error", detail=f"messages.add_idempotent failed: {e}", level="ERROR")
+            return None
+
+    @staticmethod
+    async def get_sent_for_campaign_recipient(tenant_id: str, campaign_id: str, contact_phone: str, conn=None) -> dict | None:
+        """Fetch an existing sent outgoing message for a campaign+recipient if present."""
+        try:
+            q = """
+                SELECT id, wa_message_id, created_at
+                FROM messages
+                WHERE tenant_id = %s
+                  AND campaign_id = %s::uuid
+                  AND contact_phone = %s
+                  AND direction = 'outgoing'
+                  AND status IN ('submitted', 'sent', 'delivered', 'read')
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """
+            if conn is not None:
+                row = await fetchrow_conn(conn, q, tenant_id, campaign_id, contact_phone)
+            else:
+                row = await fetchrow(q, tenant_id, campaign_id, contact_phone)
+            return dict(row) if row else None
+        except Exception as e:
+            log_event("db_error", detail=f"messages.get_sent_for_campaign_recipient failed: {e}", level="ERROR")
+            return None
+
+    @staticmethod
+    async def get_outgoing_by_wa_message_id(tenant_id: str, wa_message_id: str, conn=None) -> dict | None:
+        """Fetch outgoing message row by WhatsApp message ID."""
+        try:
+            q = """
+                SELECT id, tenant_id, campaign_id, contact_phone, status, template_name, created_at
+                FROM messages
+                WHERE tenant_id = %s
+                  AND wa_message_id = %s
+                  AND direction = 'outgoing'
+                LIMIT 1
+                """
+            args = (tenant_id, wa_message_id)
+            if conn is not None:
+                row = await fetchrow_conn(conn, q, *args)
+            else:
+                row = await fetchrow(q, *args)
+            return dict(row) if row else None
+        except Exception as e:
+            log_event("db_error", detail=f"messages.get_outgoing_by_wa_message_id failed: {e}", level="ERROR")
+            return None
+
+    @staticmethod
+    async def add_batch(tenant_id: str, items: list[dict]):
+        """Insert multiple message rows."""
+        try:
+            for data in items:
+                await _Messages.add(tenant_id, data)
             cache.invalidate(usage_key(tenant_id))
         except Exception as e:
             log_event("db_error", detail=f"messages.add_batch failed: {e}", level="ERROR")
 
     @staticmethod
-    def update_status(wa_message_id: str, status: str, tenant_id: str = ""):
+    async def update_status(wa_message_id: str, status: str, tenant_id: str = ""):
         """Update message status by WhatsApp message ID (webhook callback). Cached-fallback."""
-        col = _col()
-        if not col:
-            return
         try:
-            # Try to use memory mapping first (Requirement 2: .document() direct access)
-            doc_id = cache.get(wa_message_mapping_key(wa_message_id))
-            if doc_id:
-                col.document(doc_id).update({
-                    "status": status,
-                    "updated_at": _ist_now_iso(),
-                })
+            if not tenant_id:
                 return
 
-            # Fallback to query
-            query = col.where("wa_message_id", "==", wa_message_id).limit(1)
-            for doc in query.stream():
-                doc.reference.update({
-                    "status": status,
-                    "updated_at": _ist_now_iso(),
-                })
-                # Cache for next status update (e.g. from 'delivered' to 'read')
-                cache.set(wa_message_mapping_key(wa_message_id), doc.id, ttl=3600*24)
+            # Try to use memory mapping first (Requirement 2: .document() direct access)
+            doc_id = None
+            doc_id = cache.get(wa_message_mapping_key(wa_message_id, tenant_id))
+            if not doc_id:
+                # Backward compat (pre-tenant-scoped cache keys)
+                doc_id = cache.get(wa_message_mapping_key(wa_message_id))
+            if doc_id:
+                await execute(
+                    """
+                    UPDATE messages
+                    SET status = %s, updated_at = now()
+                    WHERE tenant_id = %s AND id = %s
+                    """,
+                    status,
+                    tenant_id,
+                    int(doc_id),
+                )
                 return
+
+            row = await fetchrow(
+                """
+                UPDATE messages
+                SET status = %s, updated_at = now()
+                WHERE tenant_id = %s AND wa_message_id = %s
+                RETURNING id
+                """,
+                status,
+                tenant_id,
+                wa_message_id,
+            )
+            if row and row.get("id") is not None:
+                cache.set(wa_message_mapping_key(wa_message_id, tenant_id), str(row["id"]), ttl=3600 * 24)
         except Exception as e:
             log_event("db_error", detail=f"messages.update_status({wa_message_id}) failed: {e}", level="ERROR")
 
     @staticmethod
-    def list(tenant_id: str, product_type: str = None, status: str = None,
-             limit: int = 25, cursor: str = None) -> tuple[list[dict], str | None]:
+    async def list(tenant_id: str, product_type: str = None, status: str = None,
+                   limit: int = 25, cursor: str = None) -> tuple[list[dict], str | None]:
         """Query messages with optional filters and cursor-based pagination.
 
         Returns (docs, next_cursor).  next_cursor is None when no more pages.
         limit is clamped to [1, 100].
         """
         limit = max(1, min(limit, 100))
-        col = _col()
-        if not col:
-            return [], None
         try:
-            query = col.where("tenant_id", "==", tenant_id)
+            where = ["tenant_id = %s"]
+            args: list = [tenant_id]
             if product_type:
-                query = query.where("product_type", "==", product_type)
+                args.append(product_type)
+                where.append("product_type = %s")
             if status:
-                query = query.where("status", "==", status)
-            query = query.order_by("created_at", direction="DESCENDING")
+                args.append(status)
+                where.append("status = %s")
 
-            if cursor:
-                query = query.start_after({"created_at": cursor})
+            cursor_created_at: str | None = None
+            cursor_id: int | None = None
+            if cursor and "::" in cursor:
+                parts = cursor.split("::", 1)
+                cursor_created_at = parts[0]
+                try:
+                    cursor_id = int(parts[1])
+                except ValueError:
+                    cursor_id = None
+            elif cursor:
+                cursor_created_at = cursor
 
-            raw = list(query.limit(limit + 1).stream())
+            if cursor_created_at and cursor_id is not None:
+                args.append(cursor_created_at)
+                args.append(cursor_id)
+                where.append("(created_at, id) < (%s::timestamptz, %s)")
+            elif cursor_created_at:
+                args.append(cursor_created_at)
+                where.append("created_at < %s::timestamptz")
+
+            q = (
+                "SELECT * FROM messages WHERE "
+                + " AND ".join(where)
+                + " ORDER BY created_at DESC, id DESC LIMIT "
+                + str(limit + 1)
+            )
+            raw = await fetch(q, *args)
             has_next = len(raw) > limit
-            docs = [doc.to_dict() for doc in raw[:limit]]
-            next_cursor = docs[-1]["created_at"] if has_next and docs else None
+            page = raw[:limit]
+            docs = [dict(r) for r in page]
+            next_cursor = None
+            if has_next and page:
+                last = page[-1]
+                next_cursor = f"{last['created_at'].isoformat()}::{last['id']}"
             return docs, next_cursor
         except Exception as e:
             log_event("db_error", detail=f"messages.list failed: {e}", level="ERROR")
             return [], None
 
     @staticmethod
-    def list_by_campaign(tenant_id: str, campaign_id: str, limit: int = 500) -> list[dict]:
+    async def list_by_campaign(tenant_id: str, campaign_id: str, limit: int = 500) -> list[dict]:
         """Get all messages for a specific campaign."""
         limit = max(1, min(limit, 500))
-        col = _col()
-        if not col:
-            return []
         try:
-            docs = (
-                col.where("tenant_id", "==", tenant_id)
-                .where("campaign_id", "==", campaign_id)
-                .order_by("created_at", direction="ASCENDING")
-                .limit(limit)
-                .stream()
+            rows = await fetch(
+                """
+                SELECT *
+                FROM messages
+                WHERE tenant_id = %s AND campaign_id = %s
+                ORDER BY created_at ASC, id ASC
+                LIMIT %s
+                """,
+                tenant_id,
+                campaign_id,
+                limit,
             )
-            return [doc.to_dict() for doc in docs]
+            return [dict(r) for r in rows]
         except Exception as e:
             log_event("db_error", detail=f"messages.list_by_campaign failed: {e}", level="ERROR")
             return []
 
     @staticmethod
-    def get_stats(tenant_id: str) -> dict:
+    async def get_stats(tenant_id: str) -> dict:
         """Compute basic stats. Cached for 6 hours."""
         cache_key = f"msg_stats:{tenant_id}"
 
-        def _fetch():
-            col = _col()
-            if not col:
-                return {}
+        async def _fetch():
             try:
-                docs = (
-                    col.where("tenant_id", "==", tenant_id)
-                    .order_by("created_at", direction="DESCENDING")
-                    .limit(500)
-                    .stream()
+                rows = await fetch(
+                    """
+                    SELECT product_type, status
+                    FROM messages
+                    WHERE tenant_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 500
+                    """,
+                    tenant_id,
                 )
                 stats = {}
-                for doc in docs:
-                    d = doc.to_dict()
+                for r in rows:
+                    d = dict(r)
                     key = f"{d.get('product_type', 'unknown')}_{d.get('status', 'unknown')}"
                     stats[key] = stats.get(key, 0) + 1
                 return stats
@@ -206,44 +392,52 @@ class _Messages:
                 log_event("db_error", detail=f"messages.get_stats failed: {e}", level="ERROR")
                 return {}
 
-        return fetch_cached(cache_key, _fetch)
+        return await fetch_cached_async(cache_key, _fetch)
 
     @staticmethod
-    def get_usage(tenant_id: str) -> dict:
+    async def get_usage(tenant_id: str) -> dict:
         """Get usage statistics for dashboard. Cached for 6 hours."""
-        def _fetch():
-            col = _col()
-            if not col:
-                return {"today": {"total": 0, "successful": 0, "failed": 0},
-                        "month": {"total": 0, "successful": 0, "failed": 0},
-                        "byProduct": []}
+        async def _fetch():
             try:
-                today = get_ist_now().strftime("%Y-%m-%dT")
-                docs = (
-                    col.where("tenant_id", "==", tenant_id)
-                    .order_by("created_at", direction="DESCENDING")
-                    .limit(500)
-                    .stream()
+                now_ist = get_ist_now()
+                today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+                month_start_ist = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+                today_row = await fetchrow(
+                    """
+                    SELECT
+                      COUNT(*) AS total,
+                      COUNT(*) FILTER (WHERE status IN ('sent','delivered','read')) AS successful,
+                      COUNT(*) FILTER (WHERE status = 'failed') AS failed
+                    FROM messages
+                    WHERE tenant_id = %s AND created_at >= %s::timestamptz
+                    """,
+                    tenant_id,
+                    today_start_ist.astimezone(datetime.timezone.utc).isoformat(),
                 )
-                today_total = today_ok = today_fail = 0
-                month_total = month_ok = month_fail = 0
-                for doc in docs:
-                    d = doc.to_dict()
-                    month_total += 1
-                    s = d.get("status", "")
-                    if s in ("sent", "delivered", "read"):
-                        month_ok += 1
-                    elif s == "failed":
-                        month_fail += 1
-                    if d.get("created_at", "").startswith(today):
-                        today_total += 1
-                        if s in ("sent", "delivered", "read"):
-                            today_ok += 1
-                        elif s == "failed":
-                            today_fail += 1
+                month_row = await fetchrow(
+                    """
+                    SELECT
+                      COUNT(*) AS total,
+                      COUNT(*) FILTER (WHERE status IN ('sent','delivered','read')) AS successful,
+                      COUNT(*) FILTER (WHERE status = 'failed') AS failed
+                    FROM messages
+                    WHERE tenant_id = %s AND created_at >= %s::timestamptz
+                    """,
+                    tenant_id,
+                    month_start_ist.astimezone(datetime.timezone.utc).isoformat(),
+                )
                 return {
-                    "today": {"total": today_total, "successful": today_ok, "failed": today_fail},
-                    "month": {"total": month_total, "successful": month_ok, "failed": month_fail},
+                    "today": {
+                        "total": int((today_row or {}).get("total") or 0),
+                        "successful": int((today_row or {}).get("successful") or 0),
+                        "failed": int((today_row or {}).get("failed") or 0),
+                    },
+                    "month": {
+                        "total": int((month_row or {}).get("total") or 0),
+                        "successful": int((month_row or {}).get("successful") or 0),
+                        "failed": int((month_row or {}).get("failed") or 0),
+                    },
                     "byProduct": [],
                 }
             except Exception as e:
@@ -252,7 +446,7 @@ class _Messages:
                         "month": {"total": 0, "successful": 0, "failed": 0},
                         "byProduct": []}
 
-        return fetch_cached(usage_key(tenant_id), _fetch)
+        return await fetch_cached_async(usage_key(tenant_id), _fetch)
 
 
 messages = _Messages()

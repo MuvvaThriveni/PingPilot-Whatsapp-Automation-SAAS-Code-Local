@@ -1,8 +1,7 @@
-"""Firestore data access layer for WappFlow (Phase-5: cached).
+"""Postgres data access layer for WappFlow.
 
-All Firestore reads/writes go through this module.
-Uses the existing firebase_config.get_db() client — does NOT reinitialize Firebase.
-Reads are cached via the centralized cache module to reduce quota usage.
+All tenant-scoped reads/writes go through these modules.
+Backed by Neon Postgres via `psycopg` (see `database.py`) and optionally cached via `cache.py`.
 """
 
 from db_layer.tenants import tenants

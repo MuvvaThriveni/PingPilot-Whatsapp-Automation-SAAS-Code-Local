@@ -1,8 +1,7 @@
 """ChatGPT service for AI-powered auto-replies (Phase-3: multi-tenant).
 
-Conversation context is always loaded from the Firestore `chat_messages`
-collection via db_layer.  No in-memory persistence — fully stateless,
-safe for multi-worker deployments.
+Conversation context is always loaded from Postgres `chat_messages`
+via db_layer. No in-memory persistence — fully stateless, safe for multi-worker deployments.
 """
 
 import os
@@ -27,10 +26,10 @@ class ChatGPTService:
             "If you don't know something, politely say so and offer to connect them with a human agent."
         )
 
-    def _get_conversation_history(self, tenant_id: str, phone: str) -> List[Dict]:
-        """Load conversation history from Firestore chat_messages."""
+    async def _get_conversation_history(self, tenant_id: str, phone: str) -> List[Dict]:
+        """Load conversation history from Postgres chat_messages."""
         try:
-            context = _db_chat_messages.build_ai_context(
+            context = await _db_chat_messages.build_ai_context(
                 tenant_id, phone, limit=MAX_MEMORY_MESSAGES
             )
             return context or []
@@ -42,7 +41,7 @@ class ChatGPTService:
     async def get_response(self, tenant_id: str, phone: str, message: str) -> Dict:
         """
         Get an AI response for the given message.
-        Conversation context is loaded from Firestore on every call.
+        Conversation context is loaded from the database on every call.
         """
         if not self.api_key:
             return {
@@ -53,7 +52,7 @@ class ChatGPTService:
         # Build messages array with system prompt + conversation history
         # Note: We explicitly handle the current message to ensure it's present 
         # (even if DB is slow) and not duplicated (if DB is fast).
-        history = self._get_conversation_history(tenant_id, phone)
+        history = await self._get_conversation_history(tenant_id, phone)
         
         # Deduplicate: If the last message in history is the current user message, remove it.
         # We will append it freshly below.

@@ -1,14 +1,17 @@
 import os
 import asyncio
 import logging
+import uuid
+import datetime
 from bullmq import Worker, Job
 from dotenv import load_dotenv
 
+if os.name == "nt":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 load_dotenv()
 
-# We perform the same startup checks and firebase initialization
-from firebase_config import init_firebase, get_db
-init_firebase()
+from database import init_db_pool, close_db_pool, transaction
 
 from store import get_settings
 from utils.time_utils import get_ist_now_iso
@@ -18,7 +21,9 @@ from services.template_builder import (
     ensure_cached as _ensure_template_cached,
     upload_header_media as _upload_header_media,
     build_components as _build_template_components,
+    get_template_keys_for_tenant as _get_template_keys_for_tenant,
 )
+from observability import log_event
 from db_layer.campaigns import campaigns as _db_campaigns
 from db_layer.campaign_recipients import campaign_recipients as _db_recipients
 from db_layer.campaign_counters import campaign_counters as _db_counters
@@ -27,6 +32,70 @@ from db_layer.messages import messages as _db_messages
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("worker")
 
+
+DELIVERY_CONFIRM_TIMEOUT_SECONDS = int(os.environ.get("DELIVERY_CONFIRM_TIMEOUT_SECONDS", "900"))
+
+
+def _is_uuid(s: str) -> bool:
+    try:
+        uuid.UUID(str(s))
+        return True
+    except Exception:
+        return False
+
+
+async def _maybe_finalize_campaign(tenant_id: str, campaign_id: str, max_attempts: int = 5):
+    if not campaign_id or campaign_id == "webhook":
+        return
+    if not _is_uuid(campaign_id):
+        return
+
+    campaign = await _db_campaigns.get(tenant_id, campaign_id)
+    if not campaign:
+        return
+
+    status = (campaign.get("status") or "").strip().lower()
+    if status not in ("running", "queued", "scheduled"):
+        return
+
+    total = int(campaign.get("total_contacts") or 0)
+    if total <= 0:
+        await _db_campaigns.update_status(tenant_id, campaign_id, "completed")
+        return
+
+    # Use authoritative recipient table count — counters can drift.
+    done = await _db_recipients.count_done(tenant_id, campaign_id, max_attempts=max_attempts)
+    if done >= total:
+        await _db_campaigns.update_status(tenant_id, campaign_id, "completed")
+
+
+def _choose_template_key(keys: list[str]) -> str:
+    if not keys:
+        return ""
+    for k in keys:
+        if k.endswith("|en_US"):
+            return k
+    return keys[0]
+
+
+async def _resolve_template_key(template_name: str, whatsapp: WhatsAppService, settings: dict, tenant_id: str) -> tuple[str, bool]:
+    if not template_name:
+        return "", False
+    if "|" in template_name:
+        ok = await _ensure_template_cached(template_name, whatsapp, settings, tenant_id=tenant_id)
+        return template_name, bool(ok)
+
+    preferred = f"{template_name}|en_US"
+    ok = await _ensure_template_cached(preferred, whatsapp, settings, tenant_id=tenant_id)
+    if ok:
+        return preferred, True
+
+    keys = _get_template_keys_for_tenant(tenant_id, template_name)
+    chosen = _choose_template_key(keys)
+    if chosen:
+        return chosen, True
+    return template_name, False
+
 async def process_campaign_job(job: Job, token: str):
     """Worker logic for campaign_queue: fetch all pending recipients and distribute to message_queue."""
     campaign_id = job.data.get("campaign_id")
@@ -34,7 +103,7 @@ async def process_campaign_job(job: Job, token: str):
     
     logger.info(f"Processing campaign setup: {campaign_id}")
     
-    campaign = _db_campaigns.get(campaign_id)
+    campaign = await _db_campaigns.get(tenant_id, campaign_id)
     if not campaign:
         logger.warning(f"Campaign {campaign_id} not found in DB.")
         return
@@ -46,13 +115,13 @@ async def process_campaign_job(job: Job, token: str):
     template_name = campaign.get("template_name")
     header_image_url = campaign.get("header_image_url", "")
     
-    _db_campaigns.update_status(campaign_id, "running")
+    await _db_campaigns.update_status(tenant_id, campaign_id, "running")
     
     # Process recipients in large batches
     total_enqueued = 0
     limit = 1000
     while True:
-        pending = _db_recipients.get_pending(campaign_id, limit=limit)
+        pending = await _db_recipients.get_pending(tenant_id, campaign_id, limit=limit)
         if not pending:
             break
             
@@ -70,19 +139,29 @@ async def process_campaign_job(job: Job, token: str):
             }
             
             # Enqueue to individual message job
-            await enqueue_message(
-                job_id=job_id,
-                tenant_id=tenant_id,
-                campaign_id=campaign_id,
-                contact_id=phone,
-                phone_number=phone,
-                template_name=template_name,
-                template_variables=template_variables
-            )
-            
-            # Status update
-            _db_recipients.update_status(campaign_id, phone, "queued")
-            total_enqueued += 1
+            enqueued_ok = False
+            try:
+                await enqueue_message(
+                    job_id=job_id,
+                    tenant_id=tenant_id,
+                    campaign_id=campaign_id,
+                    contact_id=phone,
+                    phone_number=phone,
+                    template_name=template_name,
+                    template_variables=template_variables,
+                )
+                enqueued_ok = True
+            except Exception as e:
+                # Most common failure: jobId already exists (restart / duplicate campaign job).
+                # Do not abort the whole campaign — transition to queued so it won't be stuck in pending.
+                msg = str(e)
+                logger.warning(f"Failed to enqueue message job campaign={campaign_id} phone={phone} err={msg}")
+                if "already exists" in msg.lower() or "job" in msg.lower() and "exists" in msg.lower():
+                    enqueued_ok = True
+
+            if enqueued_ok:
+                await _db_recipients.transition_pending_to_queued(tenant_id, campaign_id, phone)
+                total_enqueued += 1
             
     logger.info(f"Campaign {campaign_id}: enqueued {total_enqueued} distinct messages.")
     
@@ -100,29 +179,162 @@ async def process_message_job(job: Job, token: str):
     message_text = data.get("message_text", "")
     extra_vars = data.get("template_variables", {})
     idempotency_key = data.get("idempotency_key")
+    job_opts = getattr(job, "opts", None) or {}
+    try:
+        max_attempts = int(job_opts.get("attempts", 5))
+    except Exception:
+        max_attempts = 5
+
+    logger.info(f"Picked job={job.id} tenant={tenant_id} campaign={campaign_id} phone={phone}")
+
+    # Old/stale jobs may carry non-UUID campaign IDs (e.g. "camp1").
+    # Avoid DB errors from UUID casts by treating such values as "no campaign".
+    if campaign_id and campaign_id != "webhook" and not _is_uuid(campaign_id):
+        campaign_id = ""
     
-    # Check if the campaign was stopped dynamically (only if it belongs to a campaign)
     if campaign_id and campaign_id != "webhook":
-        campaign = _db_campaigns.get(campaign_id)
-        if campaign and campaign.get("status") in ("stopped", "deleted"):
-            _db_recipients.update_status(campaign_id, phone, "failed", error_message="Campaign was stopped")
-            _db_counters.increment(campaign_id, "failed")
+        campaign = await _db_campaigns.get(tenant_id, campaign_id)
+        if not campaign:
+            logger.warning(f"Campaign not found: {campaign_id}")
+            return "skipped"
+        if campaign.get("status") in ("stopped", "deleted"):
+            logger.info(f"Skip send; campaign status={campaign.get('status')} campaign={campaign_id}")
             return "skipped"
 
-    settings = get_settings(tenant_id)
+        existing = await _db_messages.get_sent_for_campaign_recipient(tenant_id, campaign_id, phone)
+        if existing:
+            logger.info(f"Skip send; already in messages sent campaign={campaign_id} phone={phone}")
+            await _db_recipients.mark_sent(
+                tenant_id,
+                campaign_id,
+                phone,
+                existing.get("wa_message_id") or "",
+            )
+            await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+            return "already_sent"
+
+        r = await _db_recipients.get_one(tenant_id, campaign_id, phone)
+        if not r:
+            logger.warning(f"Recipient row not found campaign={campaign_id} phone={phone}")
+            return "skipped"
+        if r.get("status") == "sent":
+            logger.info(f"Skip send; recipient already sent campaign={campaign_id} phone={phone}")
+            await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+            return "already_sent"
+
+        if r.get("status") == "submitted":
+            logger.info(f"Skip send; recipient already submitted campaign={campaign_id} phone={phone}")
+            latest = await _db_messages.get_latest_outgoing_for_campaign_recipient(tenant_id, campaign_id, phone)
+            if not latest:
+                await _db_recipients.transition_submitted_to_queued(
+                    tenant_id,
+                    campaign_id,
+                    phone,
+                    "Submitted row had no matching outgoing message; re-queued",
+                )
+                await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+                return "requeued"
+
+            # If delivery confirmation never arrives, re-queue after a timeout.
+            try:
+                last_attempt = r.get("last_attempt_at")
+                if last_attempt and isinstance(last_attempt, datetime.datetime):
+                    age = datetime.datetime.now(datetime.timezone.utc) - last_attempt
+                    if age.total_seconds() > DELIVERY_CONFIRM_TIMEOUT_SECONDS:
+                        await _db_recipients.transition_submitted_to_queued(
+                            tenant_id,
+                            campaign_id,
+                            phone,
+                            f"No delivery confirmation after {DELIVERY_CONFIRM_TIMEOUT_SECONDS}s; re-queued",
+                        )
+                        return "requeued"
+            except Exception:
+                pass
+
+            await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+            return "skipped"
+        if r.get("status") == "processing":
+            logger.info(f"Skip send; recipient already processing campaign={campaign_id} phone={phone}")
+            # Do not resend: if a sent message exists, finalize; else let it remain processing.
+            existing2 = await _db_messages.get_sent_for_campaign_recipient(tenant_id, campaign_id, phone)
+            if existing2:
+                await _db_recipients.mark_sent(
+                    tenant_id,
+                    campaign_id,
+                    phone,
+                    existing2.get("wa_message_id") or "",
+                )
+                await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+                return "already_sent"
+            try:
+                last_attempt = r.get("last_attempt_at")
+                if last_attempt and isinstance(last_attempt, datetime.datetime):
+                    age = datetime.datetime.now(datetime.timezone.utc) - last_attempt
+                    if age.total_seconds() > 300:
+                        await _db_recipients.transition_processing_to_queued(
+                            tenant_id,
+                            campaign_id,
+                            phone,
+                            "Stale processing (>300s); re-queued",
+                        )
+                        return "requeued"
+            except Exception:
+                pass
+            return "skipped"
+        if r.get("status") not in ("queued", "failed"):
+            logger.info(f"Skip send; recipient status={r.get('status')} campaign={campaign_id} phone={phone}")
+            await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+            return "skipped"
+
+        if r.get("status") == "failed" and int(r.get("attempt_count") or 0) >= max_attempts:
+            logger.info(f"Skip send; max attempts reached attempts={r.get('attempt_count')} max={max_attempts} campaign={campaign_id} phone={phone}")
+            await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+            return "skipped"
+
+        ok = await _db_recipients.transition_to_processing(tenant_id, campaign_id, phone)
+        if not ok:
+            r2 = await _db_recipients.get_one(tenant_id, campaign_id, phone)
+            logger.info(f"Skip send; could not transition to processing status={r2.get('status') if r2 else None} campaign={campaign_id} phone={phone}")
+            await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+            return "skipped"
+
+    settings = await get_settings(tenant_id)
     if not settings.get("phone_number_id") or not settings.get("access_token"):
         raise ValueError("WhatsApp not configured")
         
     whatsapp = WhatsAppService(settings["phone_number_id"], settings["access_token"])
     
     if campaign_id and campaign_id != "webhook":
-        _db_recipients.update_status(campaign_id, phone, "processing")
+        log_event("worker_send_prepare", tenant_id=tenant_id, campaign_id=campaign_id, phone=phone)
     
     try:
         if template_name:
-            # Cache template on tenant
-            await _ensure_template_cached(template_name, whatsapp, settings, tenant_id=tenant_id)
-            
+            resolved_template_key, found_tpl = await _resolve_template_key(template_name, whatsapp, settings, tenant_id)
+            if not found_tpl:
+                log_event(
+                    "template_not_found",
+                    tenant_id=tenant_id,
+                    campaign_id=campaign_id,
+                    phone=phone,
+                    detail=f"template={template_name}",
+                    level="WARN",
+                )
+                if campaign_id and campaign_id != "webhook":
+                    async with transaction() as conn:
+                        failed_ok = await _db_recipients.transition_processing_to_failed(
+                            tenant_id,
+                            campaign_id,
+                            phone,
+                            f"Template not found: {template_name}",
+                            conn=conn,
+                        )
+                        if failed_ok:
+                            await _db_counters.increment(tenant_id, campaign_id, "failed", conn=conn)
+                    await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+                return "template_missing"
+
+            template_name = resolved_template_key
+
             # Determine media overrides
             header_media_id = await _upload_header_media(template_name, whatsapp, tenant_id=tenant_id)
             
@@ -150,47 +362,178 @@ async def process_message_job(job: Job, token: str):
         now = get_ist_now_iso()
         if result["success"]:
             wa_message_id = result["messageId"]
+            logger.info(f"Send success campaign={campaign_id} phone={phone} wa_id={wa_message_id}")
             
             if campaign_id and campaign_id != "webhook":
-                _db_recipients.update_status(campaign_id, phone, "sent", wa_message_id=wa_message_id)
-                _db_counters.increment(campaign_id, "sent")
+                try:
+                    async with transaction() as conn:
+                        submitted_ok = await _db_recipients.transition_processing_to_submitted(
+                            tenant_id,
+                            campaign_id,
+                            phone,
+                            wa_message_id,
+                            conn=conn,
+                        )
+                        if submitted_ok:
+                            await _db_counters.increment(tenant_id, campaign_id, "sent", conn=conn)
+                        await _db_messages.add_idempotent(
+                            tenant_id,
+                            {
+                                "direction": "outgoing",
+                                "product_type": "bulk_message" if campaign_id != "webhook" else "chatbot",
+                                "contact_phone": phone,
+                                "message_type": "template" if template_name else "text",
+                                "wa_message_id": wa_message_id,
+                                "campaign_id": campaign_id,
+                                "status": "submitted",
+                                "template_name": template_name,
+                                "created_at": now,
+                            },
+                            conn=conn,
+                        )
+                    log_event(
+                        "worker_finalize_sent",
+                        tenant_id=tenant_id,
+                        campaign_id=campaign_id,
+                        phone=phone,
+                        detail=f"wa_id={wa_message_id}",
+                    )
+                except Exception as finalize_exc:
+                    # Critical: do NOT raise after a successful WhatsApp send.
+                    # If we raise, BullMQ will retry and we may resend the same message.
+                    log_event(
+                        "worker_finalize_error",
+                        tenant_id=tenant_id,
+                        campaign_id=campaign_id,
+                        phone=phone,
+                        detail=f"wa_id={wa_message_id} err={finalize_exc}",
+                        level="ERROR",
+                    )
+
+                    # Best-effort fallback: attempt to persist state without a transaction.
+                    # Still do not raise.
+                    try:
+                        await _db_recipients.mark_submitted(tenant_id, campaign_id, phone, wa_message_id)
+                    except Exception as e:
+                        log_event(
+                            "worker_finalize_error",
+                            tenant_id=tenant_id,
+                            campaign_id=campaign_id,
+                            phone=phone,
+                            detail=f"fallback mark_sent failed: {e}",
+                            level="ERROR",
+                        )
+                    try:
+                        await _db_counters.increment(tenant_id, campaign_id, "sent")
+                    except Exception:
+                        pass
+                    try:
+                        await _db_messages.add_idempotent(
+                            tenant_id,
+                            {
+                                "direction": "outgoing",
+                                "product_type": "bulk_message",
+                                "contact_phone": phone,
+                                "message_type": "template" if template_name else "text",
+                                "wa_message_id": wa_message_id,
+                                "campaign_id": campaign_id,
+                                "status": "submitted",
+                                "template_name": template_name,
+                                "created_at": now,
+                            },
+                        )
+                    except Exception as e:
+                        log_event(
+                            "worker_finalize_error",
+                            tenant_id=tenant_id,
+                            campaign_id=campaign_id,
+                            phone=phone,
+                            detail=f"fallback add_message failed: {e}",
+                            level="ERROR",
+                        )
+            else:
+                await _db_messages.add(tenant_id, {
+                    "direction": "outgoing",
+                    "product_type": "bulk_message" if campaign_id != "webhook" else "chatbot",
+                    "contact_phone": phone,
+                    "message_type": "template" if template_name else "text",
+                    "wa_message_id": wa_message_id,
+                    "campaign_id": campaign_id if campaign_id != "webhook" else "",
+                    "status": "sent",
+                    "template_name": template_name,
+                    "created_at": now,
+                })
             
-            _db_messages.add(tenant_id, {
-                "direction": "outgoing",
-                "product_type": "bulk_message" if campaign_id != "webhook" else "chatbot",
-                "contact_phone": phone,
-                "message_type": "template" if template_name else "text",
-                "wa_message_id": wa_message_id,
-                "campaign_id": campaign_id if campaign_id != "webhook" else "",
-                "status": "sent",
-                "template_name": template_name,
-                "created_at": now,
-            })
-            
+            if campaign_id and campaign_id != "webhook":
+                await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+
             if campaign_id == "webhook":
                 from db_layer.chat_messages import chat_messages as _db_chat_messages
                 from db_layer.usage_events import usage_events as _db_usage
                 final_msg_content = f"Template: {template_name}" if template_name else message_text
-                _db_chat_messages.add(tenant_id, {
+                await _db_chat_messages.add(tenant_id, {
                     "contact_phone": phone,
                     "contact_name": extra_vars.get("name", "Unknown"),
                     "message_text": final_msg_content,
                     "direction": "outgoing",
-                    "created_at": now,
                 })
-                _db_usage.record(tenant_id, "message_sent", "chatbot", contact_phone=phone)
+                await _db_usage.record(tenant_id, "message_sent", "chatbot", contact_phone=phone)
             
+            logger.info(f"Job complete job={job.id} campaign={campaign_id} phone={phone}")
             return wa_message_id
             
         else:
             err = result.get("error", "Unknown error")
+            logger.warning(f"Send failed campaign={campaign_id} phone={phone} err={err}")
+
+            # Non-retryable error: template missing / translation missing.
+            non_retryable = "132001" in err or "Template name does not exist" in err
+
             if campaign_id and campaign_id != "webhook":
-                _db_recipients.update_status(campaign_id, phone, "failed", error_message=err)
+                async with transaction() as conn:
+                    await _db_recipients.transition_processing_to_queued(
+                        tenant_id,
+                        campaign_id,
+                        phone,
+                        err,
+                        conn=conn,
+                    )
+
+            if non_retryable:
+                log_event(
+                    "wa_non_retryable",
+                    tenant_id=tenant_id,
+                    campaign_id=campaign_id,
+                    phone=phone,
+                    detail=err,
+                    level="WARN",
+                )
+                if campaign_id and campaign_id != "webhook":
+                    async with transaction() as conn:
+                        failed_ok = await _db_recipients.mark_failed(
+                            tenant_id,
+                            campaign_id,
+                            phone,
+                            err,
+                            conn=conn,
+                        )
+                        if failed_ok:
+                            await _db_counters.increment(tenant_id, campaign_id, "failed", conn=conn)
+                    await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+                return "non_retryable"
+
             raise RuntimeError(f"WhatsApp API Error: {err}")
             
     except Exception as e:
         if campaign_id and campaign_id != "webhook":
-            _db_recipients.update_status(campaign_id, phone, "retrying", error_message=str(e))
+            async with transaction() as conn:
+                await _db_recipients.transition_processing_to_queued(
+                    tenant_id,
+                    campaign_id,
+                    phone,
+                    str(e),
+                    conn=conn,
+                )
         raise e  # Throw to BullMQ to handle retry/backoff
 
 
@@ -210,13 +553,25 @@ async def on_failed_message(job: Job, error: Exception):
         # Final failure
         logger.error(f"Job {job.id} reached max retries. Moving to Dead Letter Queue.")
         if campaign_id and campaign_id != "webhook":
-            _db_recipients.update_status(campaign_id, phone, "failed", error_message=f"Exhausted retries: {str(error)}")
-            _db_counters.increment(campaign_id, "failed")
+            tenant_id = job.data.get("tenant_id")
+            async with transaction() as conn:
+                failed_ok = await _db_recipients.mark_failed(
+                    tenant_id,
+                    campaign_id,
+                    phone,
+                    f"Exhausted retries: {str(error)}",
+                    conn=conn,
+                )
+                if failed_ok:
+                    await _db_counters.increment(tenant_id, campaign_id, "failed", conn=conn)
+            await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=int(job.opts.get("attempts", 3)))
         await enqueue_dead_letter(job.data, reason=str(error))
 
 
 async def main():
     logger.info("Starting BullMQ Workers...")
+
+    await init_db_pool()
     
     # Limiter setup: max 80 requests per second (1000ms)
     rate_limit = int(os.environ.get("QUEUE_RATE_LIMIT", "80"))
@@ -236,7 +591,10 @@ async def main():
     message_worker = Worker("message_queue", process_message_job, worker_options)
     
     # The current python bullmq API might attach event listeners slightly differently, but natively you can use the built-in events.
-    message_worker.on("failed", on_failed_message)
+    def _on_failed(job: Job, error: Exception):
+        asyncio.create_task(on_failed_message(job, error))
+
+    message_worker.on("failed", _on_failed)
     
     logger.info("Workers are listening to Redis queues. Press Ctrl+C to exit.")
     
@@ -249,6 +607,7 @@ async def main():
     finally:
         await campaign_worker.close()
         await message_worker.close()
+        await close_db_pool()
 
 
 if __name__ == "__main__":

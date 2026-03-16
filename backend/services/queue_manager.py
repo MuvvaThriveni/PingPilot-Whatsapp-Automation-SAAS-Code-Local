@@ -43,11 +43,13 @@ async def enqueue_message(
     """Enqueue individual message job."""
     opts = {
         "jobId": job_id, 
-        "attempts": int(os.environ.get("QUEUE_RETRY_ATTEMPTS", "5")),
+        "attempts": int(os.environ.get("QUEUE_RETRY_ATTEMPTS", "3")),
         "backoff": {
             "type": "exponential",
             "delay": 5000  # Will start at 5s, then 10s, 20s, 40s, 80s
         },
+        "removeOnComplete": True,
+        "removeOnFail": True,
         "priority": priority
     }
     

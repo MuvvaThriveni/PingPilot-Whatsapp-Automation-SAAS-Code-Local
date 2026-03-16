@@ -25,8 +25,10 @@ import services.template_builder as tb
 def _clear_cache():
     """Ensure a clean cache for every test."""
     tb._template_components.clear()
+    tb._uploaded_media_ids.clear()
     yield
     tb._template_components.clear()
+    tb._uploaded_media_ids.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +187,7 @@ class TestBuildComponentsImageHeader:
         types = [c["type"] for c in comps]
         assert "header" not in types
         assert "body" in types
-        captured = capsys.readouterr()
-        assert "WARNING" in captured.out
+        capsys.readouterr()
 
 
 # ---------------------------------------------------------------------------

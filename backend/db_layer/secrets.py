@@ -1,4 +1,4 @@
-"""Runtime secret resolution — never stores secrets in Firestore.
+"""Runtime secret resolution — never stores secrets in config/cached state.
 
 Secrets are resolved from environment variables using a reference key.
 Tenant documents store only the *ref* (e.g. "env:WHATSAPP_ACCESS_TOKEN")
@@ -46,7 +46,7 @@ class _Secrets:
         """Resolve the WhatsApp access token for a tenant.
 
         Priority:
-          1. 'access_token' stored directly in Firestore (survives restarts)
+          1. 'access_token' stored directly in the database (survives restarts)
           2. 'token_ref' env-var reference (legacy / env-based deployments)
         """
         def _strip_bearer(val: str) -> str:
@@ -54,7 +54,7 @@ class _Secrets:
                 return val[7:].strip()
             return val
 
-        # Primary: direct field in Firestore document
+        # Primary: direct field in tenant row
         direct = tenant_doc.get("access_token", "")
         if direct:
             return _strip_bearer(direct)
@@ -72,10 +72,10 @@ class _Secrets:
     #     """Resolve the OpenAI API key for a tenant's chatbot config.
     #
     #     Priority:
-    #       1. 'openai_api_key' stored directly in Firestore (survives restarts)
+    #       1. 'openai_api_key' stored directly in the database (survives restarts)
     #       2. 'openai_key_ref' env-var reference (legacy / env-based deployments)
     #     """
-    #     # Primary: direct field in Firestore document
+    #     # Primary: direct field in config row
     #     direct = chatbot_doc.get("openai_api_key", "")
     #     if direct:
     #         return direct

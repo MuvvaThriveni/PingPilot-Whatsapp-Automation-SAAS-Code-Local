@@ -1,31 +1,19 @@
 from __future__ import annotations
 
-"""Firestore operations for `chatbot_config` and `chatbot_rules` (Phase-5: cached).
+"""Postgres operations for `chatbot_config` and `chatbot_rules` (Phase-5: cached).
 
-chatbot_config — Doc ID: {tenant_id} (deterministic, 1:1 with tenant).
-chatbot_rules  — Doc ID: auto-generated, linked by tenant_id field.
+chatbot_config — Primary key: tenant_id (1:1 with tenant).
+chatbot_rules  — Primary key: (tenant_id, id).
 
 Secrets (openai_api_key) are NEVER stored. Only `openai_key_ref` is persisted.
 
 Reads are cached via the centralized cache module.
 """
 
-import datetime
-from google.cloud.firestore_v1.base_query import FieldFilter
-from firebase_config import get_db
-from cache import fetch_cached, cache, chatbot_config_key, chatbot_rules_key, chatbot_active_rules_key
+from database import fetchrow, fetch, execute
+from cache import fetch_cached_async, cache, chatbot_config_key, chatbot_rules_key, chatbot_active_rules_key
 from observability import log_event
 from utils.time_utils import get_ist_now_iso
-
-
-def _config_col():
-    db = get_db()
-    return db.collection("chatbot_config") if db else None
-
-
-def _rules_col():
-    db = get_db()
-    return db.collection("chatbot_rules") if db else None
 
 
 # ---------------------------------------------------------------------------
@@ -35,32 +23,67 @@ def _rules_col():
 class _ChatbotConfig:
 
     @staticmethod
-    def get(tenant_id: str) -> dict | None:
+    async def get(tenant_id: str) -> dict | None:
         """Get chatbot config. Cached for 6 hours."""
-        def _fetch():
-            col = _config_col()
-            if not col:
-                return None
+        async def _fetch():
             try:
-                # Direct document access (Requirement 2)
-                doc = col.document(tenant_id).get()
-                return doc.to_dict() if doc.exists else None
+                row = await fetchrow(
+                    "SELECT * FROM chatbot_config WHERE tenant_id = %s",
+                    tenant_id,
+                )
+                return dict(row) if row else None
             except Exception as e:
                 log_event("db_error", detail=f"chatbot_config.get({tenant_id}) failed: {e}", level="ERROR")
                 return None
 
-        return fetch_cached(chatbot_config_key(tenant_id), _fetch)
+        return await fetch_cached_async(chatbot_config_key(tenant_id), _fetch)
 
     @staticmethod
-    def upsert(tenant_id: str, data: dict):
+    async def upsert(tenant_id: str, data: dict):
         """Merge-update chatbot config. Invalidate cache."""
-        col = _config_col()
-        if not col:
-            return
         try:
-            data["tenant_id"] = tenant_id
-            data["updated_at"] = get_ist_now_iso()
-            col.document(tenant_id).set(data, merge=True)
+            await execute(
+                """
+                INSERT INTO chatbot_config (
+                    tenant_id,
+                    is_enabled,
+                    fallback_message,
+                    use_ai,
+                    button_text_mappings,
+                    button_id_mappings,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s,
+                    COALESCE(%s, FALSE),
+                    COALESCE(%s, ''),
+                    COALESCE(%s, FALSE),
+                    %s,
+                    %s,
+                    now(),
+                    now()
+                )
+                ON CONFLICT (tenant_id) DO UPDATE SET
+                    is_enabled = COALESCE(%s, chatbot_config.is_enabled),
+                    fallback_message = COALESCE(%s, chatbot_config.fallback_message),
+                    use_ai = COALESCE(%s, chatbot_config.use_ai),
+                    button_text_mappings = COALESCE(%s, chatbot_config.button_text_mappings),
+                    button_id_mappings = COALESCE(%s, chatbot_config.button_id_mappings),
+                    updated_at = now()
+                """,
+                tenant_id,
+                data.get("is_enabled"),
+                data.get("fallback_message"),
+                data.get("use_ai"),
+                data.get("button_text_mappings"),
+                data.get("button_id_mappings"),
+                data.get("is_enabled"),
+                data.get("fallback_message"),
+                data.get("use_ai"),
+                data.get("button_text_mappings"),
+                data.get("button_id_mappings"),
+            )
             # Invalidate cache
             cache.invalidate(chatbot_config_key(tenant_id))
         except Exception as e:
@@ -77,40 +100,51 @@ chatbot_config = _ChatbotConfig()
 class _ChatbotRules:
 
     @staticmethod
-    def list(tenant_id: str) -> list[dict]:
+    async def list(tenant_id: str) -> list[dict]:
         """List all chatbot rules. Cached for 6 hours."""
-        def _fetch():
-            col = _rules_col()
-            if not col:
-                return []
+        async def _fetch():
             try:
-                docs = (
-                    col.where("tenant_id", "==", tenant_id)
-                    .order_by("priority", direction="DESCENDING")
-                    .stream()
+                rows = await fetch(
+                    """
+                    SELECT id, tenant_id, keyword, response, priority, is_active, created_at, updated_at
+                    FROM chatbot_rules
+                    WHERE tenant_id = %s
+                    ORDER BY priority DESC, id DESC
+                    """,
+                    tenant_id,
                 )
-                results = []
-                for doc in docs:
-                    d = doc.to_dict()
-                    d["_doc_id"] = doc.id
+                results: list[dict] = []
+                for r in rows:
+                    d = dict(r)
+                    d["_doc_id"] = str(d.get("id"))
                     results.append(d)
                 return results
             except Exception as e:
                 log_event("db_error", detail=f"chatbot_rules.list({tenant_id}) failed: {e}", level="ERROR")
                 return []
 
-        return fetch_cached(chatbot_rules_key(tenant_id), _fetch)
+        return await fetch_cached_async(chatbot_rules_key(tenant_id), _fetch)
 
     @staticmethod
-    def create(tenant_id: str, rule: dict) -> dict:
-        col = _rules_col()
-        if not col:
-            return rule
+    async def create(tenant_id: str, rule: dict) -> dict:
         try:
-            rule["tenant_id"] = tenant_id
-            rule["created_at"] = get_ist_now_iso()
-            _, doc_ref = col.add(rule)
-            rule["_doc_id"] = doc_ref.id
+            row = await fetchrow(
+                """
+                INSERT INTO chatbot_rules (
+                    tenant_id, keyword, response, priority, is_active, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, COALESCE(%s, TRUE), now(), NULL)
+                RETURNING id
+                """,
+                tenant_id,
+                (rule.get("keyword") or "").strip(),
+                (rule.get("response") or ""),
+                int(rule.get("priority") or 0),
+                (rule.get("is_active") if rule.get("is_active") is not None else True),
+            )
+            if row and row.get("id") is not None:
+                rule["id"] = int(row["id"])
+                rule["_doc_id"] = str(row["id"])
             # Invalidate cache
             cache.invalidate(chatbot_rules_key(tenant_id))
             cache.invalidate(chatbot_active_rules_key(tenant_id))
@@ -120,13 +154,26 @@ class _ChatbotRules:
             return rule
 
     @staticmethod
-    def update(doc_id: str, data: dict):
-        col = _rules_col()
-        if not col:
-            return
+    async def update(tenant_id: str, doc_id: str, data: dict):
         try:
-            data["updated_at"] = get_ist_now_iso()
-            col.document(doc_id).set(data, merge=True)
+            await execute(
+                """
+                UPDATE chatbot_rules
+                SET
+                    keyword = COALESCE(%s, keyword),
+                    response = COALESCE(%s, response),
+                    priority = COALESCE(%s, priority),
+                    is_active = COALESCE(%s, is_active),
+                    updated_at = now()
+                WHERE tenant_id = %s AND id = %s
+                """,
+                data.get("keyword"),
+                data.get("response"),
+                data.get("priority"),
+                (True if data.get("is_active") in (True, 1, "1") else False) if data.get("is_active") is not None else None,
+                tenant_id,
+                int(doc_id),
+            )
             # Invalidate all rules caches
             cache.invalidate_prefix("chatbot_rules:")
             cache.invalidate_prefix("chatbot_rules_active:")
@@ -134,12 +181,13 @@ class _ChatbotRules:
             log_event("db_error", detail=f"chatbot_rules.update({doc_id}) failed: {e}", level="ERROR")
 
     @staticmethod
-    def delete(doc_id: str):
-        col = _rules_col()
-        if not col:
-            return
+    async def delete(tenant_id: str, doc_id: str):
         try:
-            col.document(doc_id).delete()
+            await execute(
+                "DELETE FROM chatbot_rules WHERE tenant_id = %s AND id = %s",
+                tenant_id,
+                int(doc_id),
+            )
             # Invalidate all rules caches
             cache.invalidate_prefix("chatbot_rules:")
             cache.invalidate_prefix("chatbot_rules_active:")
@@ -147,26 +195,25 @@ class _ChatbotRules:
             log_event("db_error", detail=f"chatbot_rules.delete({doc_id}) failed: {e}", level="ERROR")
 
     @staticmethod
-    def get_active(tenant_id: str) -> list[dict]:
+    async def get_active(tenant_id: str) -> list[dict]:
         """Return only active rules. Cached for 6 hours."""
-        def _fetch():
-            col = _rules_col()
-            if not col:
-                return []
+        async def _fetch():
             try:
-                # Requirement: avoid .stream() inside handlers - caching solves this
-                docs = (
-                    col.where(filter=FieldFilter("tenant_id", "==", tenant_id))
-                    .where(filter=FieldFilter("is_active", "==", 1))
-                    .order_by("priority", direction="DESCENDING")
-                    .stream()
+                rows = await fetch(
+                    """
+                    SELECT keyword, response, priority, is_active
+                    FROM chatbot_rules
+                    WHERE tenant_id = %s AND is_active = TRUE
+                    ORDER BY priority DESC, id DESC
+                    """,
+                    tenant_id,
                 )
-                return [doc.to_dict() for doc in docs]
+                return [dict(r) for r in rows]
             except Exception as e:
                 log_event("db_error", detail=f"chatbot_rules.get_active({tenant_id}) failed: {e}", level="ERROR")
                 return []
 
-        return fetch_cached(chatbot_active_rules_key(tenant_id), _fetch)
+        return await fetch_cached_async(chatbot_active_rules_key(tenant_id), _fetch)
 
 
 chatbot_rules = _ChatbotRules()

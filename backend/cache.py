@@ -1,12 +1,11 @@
-"""Centralized in-memory cache to prevent repeated Firestore reads.
+"""Centralized in-memory cache to prevent repeated DB reads.
 
-Required for reducing Firestore quota usage.
-Default TTL is now 6 hours (21600s).
+Default TTL is 6 hours (21600s).
 """
 
 import time
 import logging
-from typing import Any, Optional, Callable
+from typing import Any, Optional, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +56,7 @@ class InMemoryCache:
     def get_or_fetch(self, key: str, fetcher: Callable, ttl: float = 21600.0) -> Any:
         """Return cached value or call fetcher() to populate cache.
         
-        Primary method for reducing Firestore reads. Default 6h TTL.
+        Primary method for reducing repeated origin reads. Default 6h TTL.
         """
         val = self.get(key)
         if val is not None:
@@ -93,6 +92,17 @@ def fetch_cached(key: str, fetcher: Callable, ttl: float = 21600.0) -> Any:
     return cache.get_or_fetch(key, fetcher, ttl)
 
 
+async def fetch_cached_async(key: str, fetcher: Callable[[], Awaitable[Any]], ttl: float = 21600.0) -> Any:
+    val = cache.get(key)
+    if val is not None:
+        return val
+    logger.info(f"[CACHE] Miss for key: {key}. Fetching from origin...")
+    val = await fetcher()
+    if val is not None:
+        cache.set(key, val, ttl)
+    return val
+
+
 # ── Cache key builders ──────────────────────────────────────────────
 
 def tenant_key(tenant_id: str) -> str:
@@ -119,5 +129,7 @@ def usage_key(tenant_id: str) -> str:
 def settings_key(tenant_id: str) -> str:
     return f"settings:{tenant_id}"
 
-def wa_message_mapping_key(wa_message_id: str) -> str:
+def wa_message_mapping_key(wa_message_id: str, tenant_id: str = "") -> str:
+    if tenant_id:
+        return f"wa_map:{tenant_id}:{wa_message_id}"
     return f"wa_map:{wa_message_id}"

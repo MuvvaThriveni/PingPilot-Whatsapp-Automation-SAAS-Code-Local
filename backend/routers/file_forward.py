@@ -51,10 +51,11 @@ def _parse_contacts_from_df(df):
     seen_phones = set()  # Deduplication
     for idx, row in df.iterrows():
         raw = row[phone_col]
-        # Handle Excel storing phone numbers as floats
-        if isinstance(raw, float) and raw == int(raw):
-            phone_str = str(int(raw))
-        else:
+        # Handle numeric values (int, float, or scientific-notation strings like "9.1995E+11")
+        try:
+            numeric = float(raw)
+            phone_str = f"{numeric:.0f}"
+        except (ValueError, TypeError):
             phone_str = str(raw).strip()
             if phone_str.endswith('.0'):
                 phone_str = phone_str[:-2]
@@ -96,9 +97,9 @@ async def parse_contacts_file(contactsFile: UploadFile = File(...)):
     try:
         filename = contactsFile.filename or ""
         if filename.lower().endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(content))
+            df = pd.read_csv(io.BytesIO(content), dtype=str)
         else:
-            df = pd.read_excel(io.BytesIO(content))
+            df = pd.read_excel(io.BytesIO(content), dtype=str)
         contacts = _parse_contacts_from_df(df)
         return {"contacts": contacts, "total": len(contacts)}
     except Exception as e:
@@ -113,7 +114,7 @@ async def send_file(
     message: str = Form(""),
 ):
     tenant_id = request.state.tenant_id
-    settings = get_settings(tenant_id)
+    settings = await get_settings(tenant_id)
     if not settings["is_configured"]:
         return JSONResponse(
             status_code=400,
@@ -131,7 +132,7 @@ async def send_file(
     # Step 1: Upload media to WhatsApp
     upload_result = await whatsapp.upload_media(file_content, file.content_type or "application/octet-stream")
     if not upload_result["success"]:
-        _db_messages.add(tenant_id, {
+        await _db_messages.add(tenant_id, {
             "direction": "outgoing", "product_type": "file_forward",
             "contact_phone": recipient, "message_type": "document",
             "status": "failed", "error_message": upload_result["error"],
@@ -151,22 +152,22 @@ async def send_file(
     msg_type = "image" if content_type.startswith("image/") else "document"
 
     if send_result["success"]:
-        _db_messages.add(tenant_id, {
+        await _db_messages.add(tenant_id, {
             "direction": "outgoing", "product_type": "file_forward",
             "contact_phone": recipient, "message_type": msg_type,
             "wa_message_id": send_result["messageId"],
             "media_id": upload_result["mediaId"],
             "status": "sent", "created_at": now,
         })
-        _db_usage.record(tenant_id, "message_sent", "file_forward",
-                         contact_phone=recipient)
+        await _db_usage.record(tenant_id, "message_sent", "file_forward",
+                               contact_phone=recipient)
         return {
             "success": True,
             "message": "File sent successfully",
             "messageId": send_result["messageId"],
         }
 
-    _db_messages.add(tenant_id, {
+    await _db_messages.add(tenant_id, {
         "direction": "outgoing", "product_type": "file_forward",
         "contact_phone": recipient, "message_type": msg_type,
         "media_id": upload_result["mediaId"],
@@ -185,7 +186,7 @@ async def send_file_bulk(
 ):
     """Send a file to multiple recipients from an Excel/CSV contact list."""
     tenant_id = request.state.tenant_id
-    settings = get_settings(tenant_id)
+    settings = await get_settings(tenant_id)
     if not settings["is_configured"]:
         return JSONResponse(
             status_code=400,
@@ -240,17 +241,17 @@ async def send_file_bulk(
         msg_type = "image" if is_image else "document"
         if result["success"]:
             sent_count += 1
-            _db_messages.add(tenant_id, {
+            await _db_messages.add(tenant_id, {
                 "direction": "outgoing", "product_type": "file_forward_bulk",
                 "contact_phone": phone, "message_type": msg_type,
                 "wa_message_id": result["messageId"],
                 "media_id": media_id, "status": "sent", "created_at": now,
             })
-            _db_usage.record(tenant_id, "message_sent", "file_forward_bulk",
-                             contact_phone=phone)
+            await _db_usage.record(tenant_id, "message_sent", "file_forward_bulk",
+                                   contact_phone=phone)
         else:
             failed_count += 1
-            _db_messages.add(tenant_id, {
+            await _db_messages.add(tenant_id, {
                 "direction": "outgoing", "product_type": "file_forward_bulk",
                 "contact_phone": phone, "message_type": msg_type,
                 "media_id": media_id, "status": "failed",

@@ -3,7 +3,7 @@
 Security fixes:
 - Tenant ownership validation on stop/status/delete endpoints
 - File upload size limit (16MB)
-- Firestore-based stop signals (works across multiple workers)
+- DB-backed stop signals (works across multiple workers)
 - UTC timestamps everywhere
 - Removed all print() logging → structured log_event()
 - Tenant-scoped template cache lookups
@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 import pandas as pd
 from utils.time_utils import get_ist_now_iso, get_ist_now
 
-from store import get_settings, active_campaigns, add_message
+from store import get_settings, active_campaigns, add_message, add_message_conn
 from services.whatsapp import WhatsAppService
 from services.template_builder import (
     get_components as _get_template_components,
@@ -32,6 +32,7 @@ from observability import log_event
 from db_layer.campaigns import campaigns as _db_campaigns
 from db_layer.campaign_recipients import campaign_recipients as _db_recipients
 from db_layer.campaign_counters import campaign_counters as _db_counters
+from database import transaction
 
 router = APIRouter(prefix="/api/bulk-message", tags=["bulk-message"])
 
@@ -83,11 +84,14 @@ def _parse_contacts(df):
     image_col = _find_column(df.columns, ["image", "url"])
 
     contacts = []
+    seen_phones = set()
     for idx, row in df.iterrows():
         raw = row[phone_col]
-        if isinstance(raw, float) and raw == int(raw):
-            phone_str = str(int(raw))
-        else:
+        # Handle numeric values (int, float, or scientific-notation strings like "9.1995E+11")
+        try:
+            numeric = float(raw)
+            phone_str = f"{numeric:.0f}"
+        except (ValueError, TypeError):
             phone_str = str(raw).strip()
             if phone_str.endswith('.0'):
                 phone_str = phone_str[:-2]
@@ -97,7 +101,8 @@ def _parse_contacts(df):
         if len(phone) == 10 and phone[0] in ('6', '7', '8', '9'):
             phone = '91' + phone
 
-        if len(phone) >= 10:
+        if len(phone) >= 10 and phone not in seen_phones:
+            seen_phones.add(phone)
             contacts.append({
                 "index": idx,
                 "phone": phone,
@@ -108,10 +113,14 @@ def _parse_contacts(df):
 
 
 def _read_spreadsheet(content: bytes, filename: str):
-    """Read an Excel or CSV file into a DataFrame."""
+    """Read an Excel or CSV file into a DataFrame.
+
+    Uses dtype=str to prevent pandas from converting phone numbers to floats
+    (which can cause precision loss or scientific-notation artifacts).
+    """
     if filename and filename.lower().endswith(".csv"):
-        return pd.read_csv(io.BytesIO(content))
-    return pd.read_excel(io.BytesIO(content))
+        return pd.read_csv(io.BytesIO(content), dtype=str)
+    return pd.read_excel(io.BytesIO(content), dtype=str)
 
 
 async def _read_upload_safe(file: UploadFile) -> bytes:
@@ -131,7 +140,7 @@ async def _read_upload_safe(file: UploadFile) -> bytes:
 async def get_templates(request: Request):
     """Fetch available WhatsApp message templates from the Business Account."""
     tenant_id = request.state.tenant_id
-    settings = get_settings(tenant_id)
+    settings = await get_settings(tenant_id)
     if not settings["is_configured"]:
         return JSONResponse(status_code=400, content={"error": "WhatsApp not configured"})
 
@@ -219,7 +228,7 @@ async def start_bulk_campaign(
     scheduledAt: str = Form(None),
 ):
     tenant_id = request.state.tenant_id
-    settings = get_settings(tenant_id)
+    settings = await get_settings(tenant_id)
     if not settings["is_configured"]:
         return JSONResponse(status_code=400, content={"error": "WhatsApp not configured. Please configure in Settings."})
 
@@ -256,9 +265,10 @@ async def start_bulk_campaign(
     if scheduledAt:
         campaign_data["scheduled_at"] = scheduledAt
 
-    _db_campaigns.create(campaign_id, tenant_id, campaign_data)
-    _db_recipients.create_batch(campaign_id, tenant_id, contacts)
-    _db_counters.init_shards(campaign_id)
+    async with transaction() as conn:
+        await _db_campaigns.create(campaign_id, tenant_id, campaign_data, conn=conn)
+        await _db_recipients.create_batch(campaign_id, tenant_id, contacts, conn=conn)
+        await _db_counters.init_shards(tenant_id, campaign_id, conn=conn)
 
     if not scheduledAt:
         from services.queue_manager import enqueue_campaign
@@ -278,7 +288,7 @@ async def start_bulk_campaign(
 async def _send_one(whatsapp: WhatsAppService, contact: dict, template_str: str,
                     campaign_id: str, tenant_id: str,
                     header_image_url: str = "", header_media_id: str = ""):
-    """Send a single template message and record the result in Firestore."""
+    """Send a single template message and record the result in the database."""
     phone = contact.get("phone") or contact.get("contact_phone")
     now = _ist_now()
     try:
@@ -292,62 +302,88 @@ async def _send_one(whatsapp: WhatsAppService, contact: dict, template_str: str,
         )
 
         if result["success"]:
-            _db_recipients.update_status(campaign_id, phone, "sent", wa_message_id=result["messageId"])
-            _db_counters.increment(campaign_id, "sent")
-
-            add_message(tenant_id, {
-                "direction": "outgoing",
-                "product_type": "bulk_message",
-                "contact_phone": phone,
-                "message_type": "template",
-                "wa_message_id": result["messageId"],
-                "campaign_id": campaign_id,
-                "status": "sent",
-                "template_name": template_str,
-                "created_at": now,
-            })
+            async with transaction() as conn:
+                await _db_recipients.update_status(
+                    tenant_id,
+                    campaign_id,
+                    phone,
+                    "sent",
+                    wa_message_id=result["messageId"],
+                    conn=conn,
+                )
+                await _db_counters.increment(tenant_id, campaign_id, "sent", conn=conn)
+                await add_message_conn(
+                    tenant_id,
+                    {
+                        "direction": "outgoing",
+                        "product_type": "bulk_message",
+                        "contact_phone": phone,
+                        "message_type": "template",
+                        "wa_message_id": result["messageId"],
+                        "campaign_id": campaign_id,
+                        "status": "sent",
+                        "template_name": template_str,
+                        "created_at": now,
+                    },
+                    conn,
+                )
         else:
             err = result.get("error", "Unknown error")
-            _db_recipients.update_status(campaign_id, phone, "failed", error_message=err)
-            _db_counters.increment(campaign_id, "failed")
+            async with transaction() as conn:
+                await _db_recipients.update_status(
+                    tenant_id,
+                    campaign_id,
+                    phone,
+                    "failed",
+                    error_message=err,
+                    conn=conn,
+                )
+                await _db_counters.increment(tenant_id, campaign_id, "failed", conn=conn)
             log_event("send_fail", tenant_id=tenant_id, campaign_id=campaign_id,
                       phone=phone, detail=err, level="WARN")
     except Exception as exc:
         err = str(exc)
-        _db_recipients.update_status(campaign_id, phone, "failed", error_message=err)
-        _db_counters.increment(campaign_id, "failed")
+        async with transaction() as conn:
+            await _db_recipients.update_status(
+                tenant_id,
+                campaign_id,
+                phone,
+                "failed",
+                error_message=err,
+                conn=conn,
+            )
+            await _db_counters.increment(tenant_id, campaign_id, "failed", conn=conn)
         log_event("send_fail", tenant_id=tenant_id, campaign_id=campaign_id,
                   phone=phone, detail=err, level="WARN")
 
 
-async def _process_campaign(campaign_id: str):
-    """Process a bulk campaign from Firestore records."""
+async def _process_campaign(campaign_id: str, tenant_id: str):
+    """Process a bulk campaign from database records."""
     if campaign_id in _worker_locks:
         log_event("campaign_skip", campaign_id=campaign_id, detail="already processing")
         return
 
     _worker_locks.add(campaign_id)
     try:
-        campaign = _db_campaigns.get(campaign_id)
+        campaign = await _db_campaigns.get(tenant_id, campaign_id)
         if not campaign:
-            log_event("campaign_abort", campaign_id=campaign_id, detail="not found in Firestore", level="WARN")
+            log_event("campaign_abort", campaign_id=campaign_id, detail="not found in database", level="WARN")
             return
 
-        tenant_id = campaign.get("tenant_id")
         template_str = campaign.get("template_name")
         delay_ms = campaign.get("delay_ms", 1000)
         header_image_url = campaign.get("header_image_url", "")
 
-        _db_campaigns.update_status(campaign_id, "running")
-        _db_campaigns.update_heartbeat(campaign_id)
+        await _db_campaigns.update_status(tenant_id, campaign_id, "running")
+        await _db_campaigns.update_heartbeat(tenant_id, campaign_id)
 
         active_campaigns[campaign_id] = {"running": True, "tenant_id": tenant_id}
 
-        settings = get_settings(tenant_id)
+        settings = await get_settings(tenant_id)
         if not settings.get("phone_number_id") or not settings.get("access_token"):
             log_event("campaign_abort", tenant_id=tenant_id, campaign_id=campaign_id,
                       detail="WhatsApp not configured", level="ERROR")
-            _db_campaigns.update_status(campaign_id, "failed", error_message="WhatsApp not configured")
+            await _db_campaigns.update_status(tenant_id, campaign_id, "failed", error_message="WhatsApp not configured")
             active_campaigns.pop(campaign_id, None)
             return
 
@@ -355,7 +391,6 @@ async def _process_campaign(campaign_id: str):
 
         log_event("campaign_process", tenant_id=tenant_id, campaign_id=campaign_id,
                   detail=f"template={template_str}")
-
         # Ensure template metadata is cached (tenant-scoped)
         await _ensure_template_cached(template_str, whatsapp, settings, tenant_id=tenant_id)
 
@@ -364,24 +399,24 @@ async def _process_campaign(campaign_id: str):
 
         try:
             while True:
-                # Check BOTH local and Firestore stop signals (multi-worker safe)
+                # Check BOTH local and DB stop signals (multi-worker safe)
                 local_running = active_campaigns.get(campaign_id, {}).get("running", False)
                 if not local_running:
-                    _db_campaigns.update_status(campaign_id, "stopped")
+                    await _db_campaigns.update_status(tenant_id, campaign_id, "stopped")
                     break
 
-                # Also check Firestore status for cross-worker stop signals
-                db_campaign = _db_campaigns.get(campaign_id)
+                # Also check DB status for cross-worker stop signals
+                db_campaign = await _db_campaigns.get(tenant_id, campaign_id)
                 if db_campaign and db_campaign.get("status") == "stopped":
                     log_event("campaign_stopped_remote", campaign_id=campaign_id,
                               detail="stop signal from another worker")
                     break
 
-                _db_campaigns.update_heartbeat(campaign_id)
+                await _db_campaigns.update_heartbeat(tenant_id, campaign_id)
 
-                pending = _db_recipients.get_pending(campaign_id, limit=BATCH_SIZE)
+                pending = await _db_recipients.get_pending(tenant_id, campaign_id, limit=BATCH_SIZE)
                 if not pending:
-                    _db_campaigns.update_status(campaign_id, "completed")
+                    await _db_campaigns.update_status(tenant_id, campaign_id, "completed")
                     break
 
                 tasks = [
@@ -399,7 +434,7 @@ async def _process_campaign(campaign_id: str):
         except Exception as exc:
             log_event("campaign_error", tenant_id=tenant_id, campaign_id=campaign_id,
                       detail=str(exc), level="ERROR")
-            _db_campaigns.update_status(campaign_id, "failed", error_message=str(exc))
+            await _db_campaigns.update_status(tenant_id, campaign_id, "failed", error_message=str(exc))
 
     finally:
         active_campaigns.pop(campaign_id, None)
@@ -418,13 +453,13 @@ async def periodical_scheduler():
         from services.queue_manager import enqueue_campaign
         while True:
             try:
-                due = _db_campaigns.get_due_scheduled()
+                due = await _db_campaigns.get_due_scheduled_global()
                 for campaign in due:
-                    cid = campaign["campaign_id"]
+                    cid = str(campaign["campaign_id"])
                     tenant_id = campaign.get("tenant_id", "")
                     log_event("scheduler_launch", campaign_id=cid, detail="enqueuing due campaign")
                     
-                    _db_campaigns.update_status(cid, "queued")
+                    await _db_campaigns.update_status(tenant_id, cid, "queued")
                     await enqueue_campaign(cid, tenant_id)
             except Exception as e:
                 log_event("scheduler_error", detail=str(e), level="ERROR")
@@ -441,14 +476,14 @@ async def stop_campaign(request: Request, campaign_id: str):
     """Stop a running campaign. Requires tenant ownership."""
     tenant_id = request.state.tenant_id
 
-    campaign = _db_campaigns.get(campaign_id)
+    campaign = await _db_campaigns.get(tenant_id, campaign_id)
     _, error = _verify_campaign_ownership(campaign, tenant_id)
     if error:
         return error
 
-    # Stop works by changing Firestore status to "stopped".
+    # Stop works by changing status to "stopped" in the database.
     # Workers reading from BullMQ check this status and will discard jobs.
-    _db_campaigns.update_status(campaign_id, "stopped")
+    await _db_campaigns.update_status(tenant_id, campaign_id, "stopped")
     log_event("campaign_stopped", tenant_id=tenant_id, campaign_id=campaign_id)
     return {"success": True, "message": "Campaign stop requested"}
 
@@ -458,12 +493,12 @@ async def get_campaign_status(request: Request, campaign_id: str):
     """Get campaign status. Requires tenant ownership."""
     tenant_id = request.state.tenant_id
 
-    campaign = _db_campaigns.get(campaign_id)
+    campaign = await _db_campaigns.get(tenant_id, campaign_id)
     campaign, error = _verify_campaign_ownership(campaign, tenant_id)
     if error:
         return error
 
-    counters = _db_counters.get(campaign_id)
+    counters = await _db_counters.get(tenant_id, campaign_id)
     return {
         "campaign": {
             "campaign_id": campaign_id,
@@ -484,14 +519,14 @@ async def delete_campaign(request: Request, campaign_id: str):
     """Delete a campaign. Requires tenant ownership."""
     tenant_id = request.state.tenant_id
 
-    campaign = _db_campaigns.get(campaign_id)
+    campaign = await _db_campaigns.get(tenant_id, campaign_id)
     _, error = _verify_campaign_ownership(campaign, tenant_id)
     if error:
         return error
 
-    _db_campaigns.delete(campaign_id)
-    _db_recipients.delete_by_campaign(campaign_id)
-    _db_counters.delete(campaign_id)
+    await _db_campaigns.delete(tenant_id, campaign_id)
+    await _db_recipients.delete_by_campaign(tenant_id, campaign_id)
+    await _db_counters.delete(tenant_id, campaign_id)
 
     log_event("campaign_deleted", tenant_id=tenant_id, campaign_id=campaign_id)
     return {"success": True, "message": "Campaign deleted"}
@@ -500,12 +535,12 @@ async def delete_campaign(request: Request, campaign_id: str):
 @router.get("/campaigns")
 async def get_all_campaigns(request: Request, limit: int = 25, cursor: str = None):
     tenant_id = request.state.tenant_id
-    campaigns_list, next_cursor = _db_campaigns.list(tenant_id, limit=limit, cursor=cursor)
+    campaigns_list, next_cursor = await _db_campaigns.list(tenant_id, limit=limit, cursor=cursor)
 
     result = []
     for c in campaigns_list:
-        cid = c.get("campaign_id", "")
-        counters = _db_counters.get(cid)
+        cid = str(c.get("campaign_id", ""))
+        counters = await _db_counters.get(tenant_id, cid)
         result.append({
             "campaign_id": cid,
             "name": c.get("name", ""),
