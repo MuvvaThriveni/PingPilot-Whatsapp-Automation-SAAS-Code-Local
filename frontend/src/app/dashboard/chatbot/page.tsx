@@ -9,6 +9,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Switch } from '@/components/ui/switch'
 import { chatbot } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Bot, Save, Loader2, RefreshCw } from 'lucide-react'
 
 interface ChatbotSettings {
@@ -93,8 +94,31 @@ export default function ChatbotPage() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <Loader2 className="h-8 w-8 animate-spin text-gray-400" />
+      <div className="space-y-6">
+        <div>
+          <Skeleton className="h-7 w-64" />
+          <Skeleton className="h-4 w-80 mt-2" />
+        </div>
+        <div className="grid gap-6 lg:grid-cols-2">
+          <Card className="lg:col-span-1">
+            <CardHeader>
+              <div className="flex items-center justify-between">
+                <div>
+                  <Skeleton className="h-5 w-36" />
+                  <Skeleton className="h-4 w-48 mt-1" />
+                </div>
+                <div className="flex items-center gap-2">
+                  <Skeleton className="h-8 w-20 rounded-md" />
+                  <Skeleton className="h-5 w-10 rounded-full" />
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <Skeleton className="h-10 w-full rounded-lg" />
+              <Skeleton className="h-10 w-full rounded-md" />
+            </CardContent>
+          </Card>
+        </div>
       </div>
     )
   }

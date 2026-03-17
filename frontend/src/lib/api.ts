@@ -98,6 +98,8 @@ export const bulkMessage = {
   status: (campaignId: string) => api.get(`/bulk-message/status/${campaignId}`),
   deleteCampaign: (campaignId: string) => api.delete(`/bulk-message/campaigns/${campaignId}`),
   campaigns: () => api.get('/bulk-message/campaigns'),
+  details: (campaignId: string) => api.get(`/bulk-message/campaigns/${campaignId}/details`),
+  resendFailed: (campaignId: string) => api.post(`/bulk-message/campaigns/${campaignId}/resend-failed`),
 };
 
 export const chatbot = {

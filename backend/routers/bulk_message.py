@@ -11,6 +11,7 @@ Security fixes:
 
 import io
 import re
+import time
 import uuid
 import asyncio
 import datetime
@@ -32,7 +33,8 @@ from observability import log_event
 from db_layer.campaigns import campaigns as _db_campaigns
 from db_layer.campaign_recipients import campaign_recipients as _db_recipients
 from db_layer.campaign_counters import campaign_counters as _db_counters
-from database import transaction
+from database import transaction, execute
+from services.queue_manager import campaign_queue
 
 router = APIRouter(prefix="/api/bulk-message", tags=["bulk-message"])
 
@@ -555,4 +557,112 @@ async def get_all_campaigns(request: Request, limit: int = 25, cursor: str = Non
     return {
         "campaigns": result,
         "next_cursor": next_cursor,
+    }
+
+
+@router.get("/campaigns/{campaign_id}/details")
+async def get_campaign_details(request: Request, campaign_id: str):
+    """Get full campaign details including all recipients. Requires tenant ownership."""
+    tenant_id = request.state.tenant_id
+
+    campaign = await _db_campaigns.get(tenant_id, campaign_id)
+    campaign, error = _verify_campaign_ownership(campaign, tenant_id)
+    if error:
+        return error
+
+    counters = await _db_counters.get(tenant_id, campaign_id)
+    recipients = await _db_recipients.list_by_campaign(tenant_id, campaign_id, limit=5000)
+
+    recipient_list = []
+    for r in recipients:
+        recipient_list.append({
+            "contact_phone": r.get("contact_phone", ""),
+            "contact_name": r.get("contact_name", ""),
+            "status": r.get("status", ""),
+            "error_message": r.get("error_message", ""),
+            "attempt_count": r.get("attempt_count", 0),
+            "updated_at": str(r.get("updated_at", "")),
+        })
+
+    return {
+        "campaign": {
+            "campaign_id": campaign_id,
+            "name": campaign.get("name", ""),
+            "template_name": campaign.get("template_name", ""),
+            "header_image_url": campaign.get("header_image_url", ""),
+            "total_contacts": campaign.get("total_contacts", 0),
+            "sent_count": counters.get("sent", 0),
+            "failed_count": counters.get("failed", 0),
+            "status": campaign.get("status", ""),
+            "delay_ms": campaign.get("delay_ms", 1000),
+            "created_at": str(campaign.get("created_at", "")),
+            "scheduled_at": str(campaign.get("scheduled_at", "")) if campaign.get("scheduled_at") else None,
+        },
+        "recipients": recipient_list,
+    }
+
+
+@router.post("/campaigns/{campaign_id}/resend-failed")
+async def resend_failed_recipients(request: Request, campaign_id: str):
+    """Re-queue all failed recipients for a campaign. Requires tenant ownership."""
+    tenant_id = request.state.tenant_id
+
+    campaign = await _db_campaigns.get(tenant_id, campaign_id)
+    campaign, error = _verify_campaign_ownership(campaign, tenant_id)
+    if error:
+        return error
+
+    if campaign.get("status") == "running":
+        return JSONResponse(status_code=400, content={"error": "Campaign is still running"})
+
+    failed = await _db_recipients.get_failed(tenant_id, campaign_id)
+    if not failed:
+        return JSONResponse(status_code=400, content={"error": "No failed recipients to resend"})
+
+    template_name = campaign.get("template_name") or ""
+    header_image_url = campaign.get("header_image_url", "")
+
+    # Reset failed recipients to pending and reset their attempt counters
+    await execute(
+        """
+        UPDATE campaign_recipients
+        SET status = 'pending', error_message = '', attempt_count = 0, updated_at = now()
+        WHERE tenant_id = %s AND campaign_id = %s::uuid AND status = 'failed'
+        """,
+        tenant_id,
+        campaign_id,
+    )
+
+    # Adjust counters: move failed_count back to 0 for the re-queued ones
+    resend_count = len(failed)
+    await execute(
+        """
+        UPDATE campaigns
+        SET failed_count = GREATEST(failed_count - %s, 0),
+            status = 'running',
+            updated_at = now()
+        WHERE tenant_id = %s AND campaign_id = %s::uuid
+        """,
+        resend_count,
+        tenant_id,
+        campaign_id,
+    )
+
+    # Enqueue the campaign for processing (worker will pick up pending recipients).
+    # Use a unique epoch so message jobIds don't collide with previous sends,
+    # and a unique campaign jobId so BullMQ doesn't deduplicate against the original launch.
+    epoch = str(int(time.time()))
+    await campaign_queue.add(
+        "process_campaign",
+        {"campaign_id": campaign_id, "tenant_id": tenant_id, "epoch": epoch},
+        opts={"jobId": f"campaign_resend_{campaign_id}_{epoch}"},
+    )
+
+    log_event("campaign_resend_failed", tenant_id=tenant_id, campaign_id=campaign_id,
+              detail=f"re-queued {resend_count} failed recipients")
+
+    return {
+        "success": True,
+        "resend_count": resend_count,
+        "message": f"Re-queued {resend_count} failed recipients",
     }

@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { logs } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Download, RefreshCw, CheckCircle, XCircle, Clock, Loader2 } from 'lucide-react'
 
 interface LogEntry {
@@ -167,8 +168,31 @@ export default function LogsPage() {
         </CardHeader>
         <CardContent>
           {loading ? (
-            <div className="flex items-center justify-center py-12">
-              <Loader2 className="h-8 w-8 animate-spin text-gray-400" />
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b">
+                    <th className="text-left py-3 px-2 font-medium text-gray-500">Status</th>
+                    <th className="text-left py-3 px-2 font-medium text-gray-500">Product</th>
+                    <th className="text-left py-3 px-2 font-medium text-gray-500">Recipient</th>
+                    <th className="text-left py-3 px-2 font-medium text-gray-500">Template</th>
+                    <th className="text-left py-3 px-2 font-medium text-gray-500">Time</th>
+                    <th className="text-left py-3 px-2 font-medium text-gray-500">Error</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Array.from({ length: 8 }).map((_, i) => (
+                    <tr key={i} className="border-b">
+                      <td className="py-3 px-2"><div className="flex items-center space-x-2"><Skeleton className="h-4 w-4 rounded-full" /><Skeleton className="h-4 w-14" /></div></td>
+                      <td className="py-3 px-2"><Skeleton className="h-6 w-20 rounded" /></td>
+                      <td className="py-3 px-2"><Skeleton className="h-4 w-28" /></td>
+                      <td className="py-3 px-2"><Skeleton className="h-4 w-24" /></td>
+                      <td className="py-3 px-2"><Skeleton className="h-4 w-32" /></td>
+                      <td className="py-3 px-2"><Skeleton className="h-4 w-20" /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           ) : logEntries.length > 0 ? (
             <div className="overflow-x-auto">

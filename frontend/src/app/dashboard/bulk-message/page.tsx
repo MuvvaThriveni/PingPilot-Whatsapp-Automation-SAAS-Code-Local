@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useCallback, useEffect } from 'react'
+import { useRouter } from 'next/navigation'
 import { useDropzone } from 'react-dropzone'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -10,6 +11,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Switch } from '@/components/ui/switch'
 import { bulkMessage } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Upload, FileSpreadsheet, X, Play, Square, Loader2, CheckCircle, XCircle, Clock, Trash2 } from 'lucide-react'
 
 interface Contact {
@@ -42,6 +44,7 @@ interface Campaign {
 
 export default function BulkMessagePage() {
   const { toast } = useToast()
+  const router = useRouter()
   const [loading, setLoading] = useState(false)
   const [parsing, setParsing] = useState(false)
   const [file, setFile] = useState<File | null>(null)
@@ -51,6 +54,7 @@ export default function BulkMessagePage() {
   const [campaignName, setCampaignName] = useState('')
   const [delayMs, setDelayMs] = useState('1000')
   const [campaigns, setCampaigns] = useState<Campaign[]>([])
+  const [loadingCampaigns, setLoadingCampaigns] = useState(true)
   const [activeCampaignId, setActiveCampaignId] = useState<string | null>(null)
   const [isScheduled, setIsScheduled] = useState(false)
   const [scheduledAt, setScheduledAt] = useState('')
@@ -96,6 +100,8 @@ export default function BulkMessagePage() {
       setCampaigns(res.data.campaigns)
     } catch (error) {
       console.error('Failed to fetch campaigns:', error)
+    } finally {
+      setLoadingCampaigns(false)
     }
   }
 
@@ -437,10 +443,36 @@ export default function BulkMessagePage() {
           <CardDescription>Track your campaign progress and history</CardDescription>
         </CardHeader>
         <CardContent>
-          {campaigns.length > 0 ? (
+          {loadingCampaigns ? (
+            <div className="space-y-3">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <div key={i} className="flex items-center justify-between p-4 border rounded-lg">
+                  <div className="flex items-center space-x-4">
+                    <Skeleton className="h-4 w-4 rounded-full" />
+                    <div>
+                      <Skeleton className="h-5 w-36" />
+                      <Skeleton className="h-4 w-52 mt-1" />
+                    </div>
+                  </div>
+                  <div className="flex items-center space-x-4">
+                    <div className="text-right">
+                      <Skeleton className="h-4 w-14" />
+                      <Skeleton className="h-4 w-14 mt-1" />
+                    </div>
+                    <Skeleton className="h-4 w-12" />
+                    <Skeleton className="h-8 w-8 rounded-md" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : campaigns.length > 0 ? (
             <div className="space-y-3">
               {campaigns.map((campaign) => (
-                <div key={campaign.campaign_id} className="flex items-center justify-between p-4 border rounded-lg">
+                <div
+                  key={campaign.campaign_id}
+                  className="flex items-center justify-between p-4 border rounded-lg cursor-pointer hover:border-gray-400 hover:shadow-sm transition-all"
+                  onClick={() => router.push(`/dashboard/bulk-message/${campaign.campaign_id}`)}
+                >
                   <div className="flex items-center space-x-4">
                     {getStatusIcon(campaign.status)}
                     <div>
@@ -468,7 +500,7 @@ export default function BulkMessagePage() {
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => handleStopCampaign(campaign.campaign_id)}
+                        onClick={(e) => { e.stopPropagation(); handleStopCampaign(campaign.campaign_id); }}
                       >
                         <Square className="h-3 w-3 mr-1" />
                         Stop
@@ -478,7 +510,7 @@ export default function BulkMessagePage() {
                       <Button
                         variant="ghost"
                         size="icon"
-                        onClick={() => handleDeleteCampaign(campaign.campaign_id)}
+                        onClick={(e) => { e.stopPropagation(); handleDeleteCampaign(campaign.campaign_id); }}
                         className="text-red-500 hover:text-red-700 hover:bg-red-50"
                       >
                         <Trash2 className="h-4 w-4" />

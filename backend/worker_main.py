@@ -100,8 +100,9 @@ async def process_campaign_job(job: Job, token: str):
     """Worker logic for campaign_queue: fetch all pending recipients and distribute to message_queue."""
     campaign_id = job.data.get("campaign_id")
     tenant_id = job.data.get("tenant_id")
+    epoch = job.data.get("epoch", "")
     
-    logger.info(f"Processing campaign setup: {campaign_id}")
+    logger.info(f"Processing campaign setup: {campaign_id} epoch={epoch}")
     
     campaign = await _db_campaigns.get(tenant_id, campaign_id)
     if not campaign:
@@ -127,7 +128,7 @@ async def process_campaign_job(job: Job, token: str):
             
         for contact in pending:
             phone = contact.get("contact_phone")
-            job_id = f"msg_{campaign_id}_{phone}"
+            job_id = f"msg_{campaign_id}_{phone}" if not epoch else f"msg_{campaign_id}_{phone}_{epoch}"
             
             # Extract dynamically generated header URL if needed
             contact_data = contact.get("contact_data", {})

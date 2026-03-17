@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { settings } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Settings, CheckCircle, XCircle, Loader2, Eye, EyeOff, ExternalLink } from 'lucide-react'
 
 export default function SettingsPage() {
@@ -118,8 +119,34 @@ export default function SettingsPage() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <Loader2 className="h-8 w-8 animate-spin text-gray-400" />
+      <div className="max-w-2xl mx-auto space-y-6">
+        <div>
+          <Skeleton className="h-7 w-48" />
+          <Skeleton className="h-4 w-72 mt-2" />
+        </div>
+        <Card>
+          <CardHeader>
+            <div className="flex items-center space-x-3">
+              <Skeleton className="h-10 w-10 rounded-lg" />
+              <div>
+                <Skeleton className="h-5 w-40" />
+                <Skeleton className="h-4 w-56 mt-1" />
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="space-y-2">
+                <Skeleton className="h-4 w-32" />
+                <Skeleton className="h-10 w-full rounded-md" />
+              </div>
+            ))}
+            <div className="flex space-x-3 pt-2">
+              <Skeleton className="h-10 w-full rounded-md" />
+              <Skeleton className="h-10 w-full rounded-md" />
+            </div>
+          </CardContent>
+        </Card>
       </div>
     )
   }

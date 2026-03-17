@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { settings } from '@/lib/api'
+import { Skeleton } from '@/components/ui/skeleton'
 import { FileText, Users, Bot, ArrowRight, CheckCircle, AlertCircle } from 'lucide-react'
 
 interface UsageStats {
@@ -49,6 +50,7 @@ const products = [
 export default function DashboardPage() {
   const [usage, setUsage] = useState<UsageStats | null>(null)
   const [isConfigured, setIsConfigured] = useState<boolean | null>(null)
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     const fetchData = async () => {
@@ -61,6 +63,8 @@ export default function DashboardPage() {
         setIsConfigured(settingsRes.data.settings?.is_configured || false)
       } catch (error) {
         console.error('Failed to fetch dashboard data:', error)
+      } finally {
+        setLoading(false)
       }
     }
     fetchData()
@@ -75,7 +79,9 @@ export default function DashboardPage() {
       </div>
 
       {/* Configuration Status */}
-      {isConfigured === false && (
+      {loading ? (
+        <Skeleton className="h-16 w-full rounded-lg" />
+      ) : isConfigured === false ? (
         <Card className="border-yellow-200 bg-yellow-50">
           <CardContent className="flex items-center justify-between py-4">
             <div className="flex items-center space-x-3">
@@ -92,45 +98,74 @@ export default function DashboardPage() {
             </Link>
           </CardContent>
         </Card>
-      )}
-
-      {isConfigured === true && (
+      ) : isConfigured === true ? (
         <Card className="border-green-200 bg-green-50">
           <CardContent className="flex items-center space-x-3 py-4">
             <CheckCircle className="h-5 w-5 text-green-600" />
             <p className="font-medium text-green-800">WhatsApp Business API connected and ready</p>
           </CardContent>
         </Card>
-      )}
+      ) : null}
 
       {/* Product Cards */}
       <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-        {products.map((product) => {
-          const Icon = product.icon
-          return (
-            <Card key={product.id} className="hover:shadow-lg transition-shadow duration-200">
-              <CardHeader>
-                <div className={`w-12 h-12 ${product.lightColor} rounded-lg flex items-center justify-center mb-3`}>
-                  <Icon className={`h-6 w-6 ${product.textColor}`} />
-                </div>
-                <CardTitle className="text-lg">{product.title}</CardTitle>
-                <CardDescription>{product.description}</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <Link href={product.href}>
-                  <Button className="w-full group">
-                    Get Started
-                    <ArrowRight className="ml-2 h-4 w-4 group-hover:translate-x-1 transition-transform" />
-                  </Button>
-                </Link>
-              </CardContent>
-            </Card>
-          )
-        })}
+        {loading
+          ? Array.from({ length: 3 }).map((_, i) => (
+              <Card key={i}>
+                <CardHeader>
+                  <Skeleton className="w-12 h-12 rounded-lg mb-3" />
+                  <Skeleton className="h-5 w-40" />
+                  <Skeleton className="h-4 w-full mt-2" />
+                  <Skeleton className="h-4 w-3/4 mt-1" />
+                </CardHeader>
+                <CardContent>
+                  <Skeleton className="h-10 w-full rounded-md" />
+                </CardContent>
+              </Card>
+            ))
+          : products.map((product) => {
+              const Icon = product.icon
+              return (
+                <Card key={product.id} className="hover:shadow-lg transition-shadow duration-200">
+                  <CardHeader>
+                    <div className={`w-12 h-12 ${product.lightColor} rounded-lg flex items-center justify-center mb-3`}>
+                      <Icon className={`h-6 w-6 ${product.textColor}`} />
+                    </div>
+                    <CardTitle className="text-lg">{product.title}</CardTitle>
+                    <CardDescription>{product.description}</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <Link href={product.href}>
+                      <Button className="w-full group">
+                        Get Started
+                        <ArrowRight className="ml-2 h-4 w-4 group-hover:translate-x-1 transition-transform" />
+                      </Button>
+                    </Link>
+                  </CardContent>
+                </Card>
+              )
+            })}
       </div>
 
       {/* Usage Stats */}
-      {usage && (
+      {loading ? (
+        <div className="grid gap-6 md:grid-cols-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Card key={i}>
+              <CardHeader className="pb-2">
+                <Skeleton className="h-4 w-28" />
+                <Skeleton className="h-9 w-16 mt-2" />
+              </CardHeader>
+              <CardContent>
+                <div className="flex space-x-4">
+                  <Skeleton className="h-4 w-16" />
+                  <Skeleton className="h-4 w-16" />
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      ) : usage ? (
         <div className="grid gap-6 md:grid-cols-3">
           <Card>
             <CardHeader className="pb-2">
@@ -178,7 +213,7 @@ export default function DashboardPage() {
             </CardContent>
           </Card>
         </div>
-      )}
+      ) : null}
     </div>
   )
 }
