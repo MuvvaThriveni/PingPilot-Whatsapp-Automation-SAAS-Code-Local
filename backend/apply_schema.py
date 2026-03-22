@@ -13,27 +13,38 @@ def main() -> int:
         print("DATABASE_URL is not set", file=sys.stderr)
         return 2
 
-    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
-    if not os.path.exists(schema_path):
-        print(f"schema.sql not found at: {schema_path}", file=sys.stderr)
-        return 2
+    base_dir = os.path.dirname(__file__)
+    schema_files = ["schema.sql", "retention_schema.sql"]
 
-    with open(schema_path, "r", encoding="utf-8") as f:
-        sql = f.read()
+    for schema_file in schema_files:
+        schema_path = os.path.join(base_dir, schema_file)
+        if not os.path.exists(schema_path):
+            if schema_file == "schema.sql":
+                print(f"{schema_file} not found at: {schema_path}", file=sys.stderr)
+                return 2
+            # retention_schema.sql is optional during transition
+            print(f"[SKIP] {schema_file} not found — skipping")
+            continue
 
-    if not sql.strip():
-        print("schema.sql is empty", file=sys.stderr)
-        return 2
+        with open(schema_path, "r", encoding="utf-8") as f:
+            sql = f.read()
 
-    try:
-        with psycopg.connect(database_url, autocommit=True) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql)
-        print("Schema applied successfully")
-        return 0
-    except Exception as e:
-        print(f"Failed to apply schema: {e}", file=sys.stderr)
-        return 1
+        if not sql.strip():
+            if schema_file == "schema.sql":
+                print("schema.sql is empty", file=sys.stderr)
+                return 2
+            continue
+
+        try:
+            with psycopg.connect(database_url, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+            print(f"{schema_file} applied successfully")
+        except Exception as e:
+            print(f"Failed to apply {schema_file}: {e}", file=sys.stderr)
+            return 1
+
+    return 0
 
 
 if __name__ == "__main__":

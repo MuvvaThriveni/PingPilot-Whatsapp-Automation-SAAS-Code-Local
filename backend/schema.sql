@@ -146,6 +146,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_tenant_wa_message_id
   ON messages (tenant_id, wa_message_id)
   WHERE wa_message_id <> '';
 
+CREATE INDEX IF NOT EXISTS idx_messages_created_at
+  ON messages (created_at ASC);
+
 
 CREATE TABLE IF NOT EXISTS chat_messages (
   id BIGSERIAL PRIMARY KEY,

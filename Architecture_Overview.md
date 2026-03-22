@@ -1,7 +1,7 @@
 # WappFlow — Architecture Overview
 
 > **Product:** Multi-tenant WhatsApp Business Automation SaaS  
-> **Version:** 1.1.0 (Phase 7)
+> **Version:** 1.2.0 (Phase 8 — Data Retention)
 
 ---
 
@@ -40,7 +40,8 @@ WappFlow is a **multi-tenant SaaS platform** that automates WhatsApp Business me
 │  │ /logs       │ │ /webhook     │ ← Meta WhatsApp (no auth)            │
 │  └─────────────┘ └──────────────┘                                      │
 │                                                                          │
-│  Background Tasks: TTL Cleanup (6h) · Campaign Scheduler (60s)          │
+│  Background Tasks:                                                      │
+│    TTL Cleanup (6h) · Campaign Scheduler (60s) · Retention Cron (24h)   │
 └──────────┬──────────────────────────────┬───────────────────────────────┘
            │                              │
            ▼                              ▼
@@ -52,8 +53,10 @@ WappFlow is a **multi-tenant SaaS platform** that automates WhatsApp Business me
 │    - message_queue  │       │  webhook_events · usage_events            │
 │    - dead_letter_q  │       │  template_cache · user_triggers           │
 │  • Rate limit keys  │       │  chatbot_config · campaign_counters       │
-│  • Token buckets    │       │                                           │
-│  • Global cooldown  │       └──────────────────────────────────────────┘
+│  • Token buckets    │       │  messages_archive · chat_messages_archive │
+│  • Global cooldown  │       │  webhook_events_archive · usage_events_ar │
+│                     │       │  daily_message_stats                      │
+│                     │       └──────────────────────────────────────────┘
 └──────────┬──────────┘
            │
            ▼
@@ -219,8 +222,10 @@ backend/
 ├── worker_main.py           # BullMQ workers (campaign + message processing)
 ├── run_server.py            # Uvicorn launcher
 ├── database.py              # Async Postgres pool (psycopg3), transaction helper
-├── schema.sql               # Complete DDL for all tables
-├── apply_schema.py          # Applies schema.sql to database
+├── schema.sql               # Complete DDL for all live tables
+├── retention_schema.sql     # DDL for archive tables + daily_message_stats
+├── apply_schema.py          # Applies retention_schema.sql to database
+├── retention.py             # Data retention engine (archive + purge) + CLI
 │
 ├── auth_middleware.py        # Firebase Auth token verification middleware
 ├── rate_limit.py             # Redis rate limiter (API + worker token bucket)
@@ -375,15 +380,19 @@ tenants (1)
   ├──< chatbot_rules (1:N)
   ├──< campaigns (1:N)
   │      └──< campaign_recipients (1:N)
-  ├──< messages (1:N)
-  ├──< chat_messages (1:N)
-  ├──< webhook_events (1:N)
-  ├──< usage_events (1:N)
+  ├──< messages (1:N)  ───archive───>  messages_archive
+  ├──< chat_messages (1:N)  ───────>  chat_messages_archive
+  ├──< webhook_events (1:N)  ──────>  webhook_events_archive
+  ├──< usage_events (1:N)  ────────>  usage_events_archive
   ├──< template_cache (1:N)
   └──< user_triggers (1:N)
+
+daily_message_stats (pre-aggregated from messages before archival)
 ```
 
 All tables use `tenant_id` as a foreign key to `tenants`. Campaigns use a composite primary key `(tenant_id, campaign_id)` for efficient tenant-scoped queries.
+
+Archive tables mirror the schema of their source tables with an additional `archived_at TIMESTAMPTZ` column. The `daily_message_stats` table stores pre-aggregated message counts per tenant/day/product/direction/status, ensuring dashboard analytics remain accurate after messages are archived.
 
 ---
 
@@ -422,20 +431,21 @@ Frontend runs separately via `npm run dev` on port 3000.
 |------|----------|---------|
 | `periodical_cleanup` | Every 6 hours | Deletes transient data older than 30 days (chat_messages, messages, webhook_events, usage_events). Never touches tenant/config data. |
 | `periodical_scheduler` | Every 60 seconds | Checks for scheduled campaigns past their `scheduled_at` time, transitions them to `queued`, and enqueues to `campaign_queue`. |
+| `periodic_archive_runner` | Every 24 hours (configurable) | Runs the data retention pipeline: (1) pre-aggregate `daily_message_stats`, (2) archive old rows from live tables to `*_archive` tables, (3) optionally purge very old archive rows. Controlled by `RETENTION_ENABLED` and `PURGE_ENABLED` env vars. |
 
-Both tasks run as `asyncio.Task` instances within the FastAPI lifespan and are gracefully cancelled on shutdown.
+All three tasks run as `asyncio.Task` instances within the FastAPI lifespan and are gracefully cancelled on shutdown.
 
 ---
 
 ## 15. Graceful Shutdown Sequence
 
 1. Signal all `active_campaigns` to stop (`running = False`)
-2. Cancel background tasks (cleanup + scheduler)
+2. Cancel background tasks (cleanup + scheduler + retention cron)
 3. Mark any still-running campaigns as `interrupted` in the database
 4. Close Redis connection
 5. Close Postgres connection pool
 
-This ensures no campaigns are silently lost during deployments or restarts.
+The retention cron task handles `CancelledError` gracefully — if an archive batch is in-progress, the current transaction rolls back automatically (no partial data movement). This ensures no campaigns or data operations are silently lost during deployments or restarts.
 
 ---
 
@@ -445,3 +455,118 @@ This ensures no campaigns are silently lost during deployments or restarts.
 - **No sensitive data logged** — tokens, keys, and message bodies are never included.
 - **Timed operations** — `timed_op()` context manager automatically logs duration for critical paths.
 - **Log levels:** `INFO` (normal ops), `WARN` (rate limits, missing config), `ERROR` (failures).
+- **Retention observability** — the archive and purge systems emit dedicated log events (`retention_start`, `retention_batch`, `retention_complete`, `purge_started`, `purge_batch`, `purge_completed`, etc.) with per-batch row counts, durations, and error details. See the [API Developer Doc Section 13.8](API_Developer_Doc.md#138-monitoring--log-events) for the full event catalog.
+
+---
+
+## 17. Data Retention Architecture
+
+The data retention system is a critical part of WappFlow's production infrastructure. It manages the lifecycle of the four high-volume transient tables.
+
+### 17.1 Data Flow
+
+```
+                    RETENTION_DAYS (default 2)
+                           │
+  Live Tables              │              Archive Tables          PURGE_RETENTION_DAYS (90)
+  ┌──────────────┐         ▼              ┌────────────────────┐         │
+  │ messages     │ ──── archive ────────> │ messages_archive   │ ── purge ──> Deleted
+  │ chat_messages│ ──── archive ────────> │ chat_messages_arch │ ── purge ──> Deleted
+  │ webhook_evts │ ──── archive ────────> │ webhook_evts_arch  │ ── purge ──> Deleted
+  │ usage_events │ ──── archive ────────> │ usage_events_arch  │ ── purge ──> Deleted
+  └──────────────┘                        └────────────────────┘
+         │
+         │ pre-aggregate (BEFORE archive)
+         ▼
+  ┌─────────────────────┐
+  │ daily_message_stats │  ← permanent, powers GET /api/settings/usage
+  └─────────────────────┘
+```
+
+### 17.2 Key Files
+
+| File | Role |
+|------|------|
+| `retention_schema.sql` | DDL for archive tables + `daily_message_stats` |
+| `retention.py` | Archive engine (`archive_old_data()`) + purge engine (`purge_old_archives()`) + CLI |
+| `main.py` | `periodic_archive_runner()` background task + health check integration |
+| `db_layer/messages.py` | `get_outgoing_by_wa_message_id_archived()` fallback + `get_usage()` reads from `daily_message_stats` |
+| `routers/webhook.py` | Fallback archive lookup for delivery status updates on archived messages |
+
+### 17.3 Safety Guarantees
+
+| Property | How |
+|----------|-----|
+| **No data loss** | Archive uses INSERT → DELETE in a single transaction. Crash = rollback = rows stay in live table. |
+| **Idempotent** | `ON CONFLICT DO NOTHING` on archive insert. Safe to re-run any number of times. |
+| **No lock contention** | `FOR UPDATE SKIP LOCKED` — archive skips any rows currently locked by webhook handlers or workers. |
+| **No API impact** | Runs as a background asyncio task with 50ms sleep between batches. Event loop is never starved. |
+| **Dashboard accuracy** | `daily_message_stats` aggregated with `GREATEST()` BEFORE any deletes. Counts only go up. |
+| **Webhook continuity** | `messages_archive` fallback lookup in webhook handler ensures delivery callbacks work for recently-archived messages. |
+| **Controlled blast radius** | Max 1000 rows/batch × 100 batches = 100k rows/table/run. Configurable via env vars. |
+| **Kill switch** | `RETENTION_ENABLED=false` and `PURGE_ENABLED=false` — instant disable, checked every cycle. |
+
+### 17.4 Configuration Reference
+
+**Archive (live → archive):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RETENTION_ENABLED` | `false` | Master switch for background automation |
+| `RETENTION_INTERVAL_HOURS` | `24` | Hours between runs |
+| `RETENTION_TIMEOUT_HOURS` | `1` | Max run duration |
+| `RETENTION_DAYS` | `2` | Archive rows older than N days |
+| `RETENTION_BATCH_SIZE` | `1000` | Rows per batch |
+| `RETENTION_MAX_BATCHES` | `100` | Max batches per table |
+
+**Purge (archive → deleted):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PURGE_ENABLED` | `false` | Master switch for purge |
+| `PURGE_RETENTION_DAYS` | `90` | Delete archive rows older than N days |
+| `PURGE_BATCH_SIZE` | `1000` | Rows per batch |
+| `PURGE_MAX_BATCHES` | `50` | Max batches per table |
+
+### 17.5 Operational Runbook
+
+**Enable retention in production:**
+```env
+RETENTION_ENABLED=true
+RETENTION_DAYS=2
+RETENTION_INTERVAL_HOURS=24
+```
+
+**Enable purge (after retention has been running for 90+ days):**
+```env
+PURGE_ENABLED=true
+PURGE_RETENTION_DAYS=90
+```
+
+**Run a manual archive (one-off, without enabling the cron):**
+```bash
+cd backend && python retention.py
+```
+
+**Run a manual purge:**
+```bash
+cd backend && python retention.py --purge-only
+```
+
+**Safe smoke test (10 rows only):**
+```bash
+RETENTION_BATCH_SIZE=10 RETENTION_MAX_BATCHES=1 python retention.py
+```
+
+**Check system status:**
+```bash
+curl http://localhost:5000/api/health | python -m json.tool
+# Look at checks.retention and checks.purge
+```
+
+**Emergency disable:**
+```env
+RETENTION_ENABLED=false
+PURGE_ENABLED=false
+```
+Restart the server. Next cycle logs `retention_skipped` / `purge_skipped`.

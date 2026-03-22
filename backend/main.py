@@ -36,6 +36,7 @@ from database import init_db_pool, close_db_pool, ping
 from auth_middleware import FirebaseAuthMiddleware
 from observability import log_event
 from rate_limit import get_redis, close_redis, redis_health_check, RateLimitMiddleware
+from retention import archive_old_data, purge_old_archives, PURGE_ENABLED as _PURGE_ENABLED_CFG
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -53,6 +54,209 @@ origins = [o.strip() for o in _env_origins.split(",") if o.strip()]
 _is_production = os.environ.get("ENVIRONMENT", "development").lower() == "production"
 if not _is_production:
     origins.append("http://localhost:3000")
+
+
+# ── Retention Configuration ────────────────────────────────────────
+
+RETENTION_ENABLED: bool = os.environ.get("RETENTION_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+RETENTION_INTERVAL_HOURS: float = float(os.environ.get("RETENTION_INTERVAL_HOURS", "24"))
+RETENTION_TIMEOUT_HOURS: float = float(os.environ.get("RETENTION_TIMEOUT_HOURS", "1"))
+
+# Shared retention health state (read by /api/health)
+_retention_state: dict = {
+    "enabled": RETENTION_ENABLED,
+    "last_run": None,
+    "last_duration_ms": None,
+    "last_status": None,
+    "last_summary": None,
+    "running": False,
+}
+
+# Shared purge health state (read by /api/health)
+_purge_state: dict = {
+    "enabled": _PURGE_ENABLED_CFG,
+    "last_run": None,
+    "last_duration_ms": None,
+    "last_status": None,
+    "last_deleted_rows": None,
+    "running": False,
+}
+
+
+# ── Retention Background Task ─────────────────────────────────────
+
+_retention_lock = asyncio.Lock()
+
+
+async def periodic_archive_runner():
+    """Run archive_old_data() on a fixed interval.
+
+    Safety features:
+      - Global asyncio.Lock prevents overlapping runs
+      - asyncio.wait_for timeout prevents runaway jobs
+      - Broad exception handling: never crashes the app
+      - Controlled by RETENTION_ENABLED env var
+    """
+    # Initial delay: let the app fully warm up before first run
+    await asyncio.sleep(60)
+
+    interval_sec = RETENTION_INTERVAL_HOURS * 3600
+    timeout_sec = RETENTION_TIMEOUT_HOURS * 3600
+
+    while True:
+        if not RETENTION_ENABLED:
+            log_event("retention_skipped", detail="RETENTION_ENABLED=false")
+            await asyncio.sleep(interval_sec)
+            continue
+
+        # Prevent overlapping runs
+        if _retention_lock.locked():
+            log_event("retention_skipped", detail="previous run still in progress")
+            await asyncio.sleep(interval_sec)
+            continue
+
+        async with _retention_lock:
+            _retention_state["running"] = True
+            t0 = datetime.datetime.now(datetime.timezone.utc)
+            log_event("retention_cron_started")
+
+            try:
+                summary = await asyncio.wait_for(
+                    archive_old_data(),
+                    timeout=timeout_sec,
+                )
+                elapsed_ms = (
+                    datetime.datetime.now(datetime.timezone.utc) - t0
+                ).total_seconds() * 1000
+
+                _retention_state.update({
+                    "last_run": t0.isoformat(),
+                    "last_duration_ms": round(elapsed_ms, 1),
+                    "last_status": "success",
+                    "last_summary": summary,
+                    "running": False,
+                })
+                log_event(
+                    "retention_cron_completed",
+                    status="ok",
+                    detail=str(summary),
+                    duration_ms=elapsed_ms,
+                )
+
+            except asyncio.TimeoutError:
+                elapsed_ms = (
+                    datetime.datetime.now(datetime.timezone.utc) - t0
+                ).total_seconds() * 1000
+                _retention_state.update({
+                    "last_run": t0.isoformat(),
+                    "last_duration_ms": round(elapsed_ms, 1),
+                    "last_status": "timeout",
+                    "running": False,
+                })
+                log_event(
+                    "retention_cron_failed",
+                    status="timeout",
+                    level="ERROR",
+                    detail=f"exceeded {RETENTION_TIMEOUT_HOURS}h timeout",
+                    duration_ms=elapsed_ms,
+                )
+
+            except asyncio.CancelledError:
+                _retention_state["running"] = False
+                _purge_state["running"] = False
+                raise  # Let shutdown propagate
+
+            except Exception as e:
+                elapsed_ms = (
+                    datetime.datetime.now(datetime.timezone.utc) - t0
+                ).total_seconds() * 1000
+                _retention_state.update({
+                    "last_run": t0.isoformat(),
+                    "last_duration_ms": round(elapsed_ms, 1),
+                    "last_status": f"error: {str(e)[:80]}",
+                    "running": False,
+                })
+                log_event(
+                    "retention_cron_failed",
+                    status="error",
+                    level="ERROR",
+                    detail=str(e)[:120],
+                    duration_ms=elapsed_ms,
+                )
+
+        # ── Phase 4: Purge old archive rows (runs AFTER archive) ──
+        if _PURGE_ENABLED_CFG:
+            _purge_state["running"] = True
+            p0 = datetime.datetime.now(datetime.timezone.utc)
+            log_event("purge_cron_started")
+
+            try:
+                purge_summary = await asyncio.wait_for(
+                    purge_old_archives(),
+                    timeout=timeout_sec,
+                )
+                p_elapsed = (
+                    datetime.datetime.now(datetime.timezone.utc) - p0
+                ).total_seconds() * 1000
+                total_deleted = sum(purge_summary.values())
+
+                _purge_state.update({
+                    "last_run": p0.isoformat(),
+                    "last_duration_ms": round(p_elapsed, 1),
+                    "last_status": "success",
+                    "last_deleted_rows": total_deleted,
+                    "running": False,
+                })
+                log_event(
+                    "purge_cron_completed",
+                    status="ok",
+                    detail=f"total_deleted={total_deleted} {purge_summary}",
+                    duration_ms=p_elapsed,
+                )
+
+            except asyncio.TimeoutError:
+                p_elapsed = (
+                    datetime.datetime.now(datetime.timezone.utc) - p0
+                ).total_seconds() * 1000
+                _purge_state.update({
+                    "last_run": p0.isoformat(),
+                    "last_duration_ms": round(p_elapsed, 1),
+                    "last_status": "timeout",
+                    "running": False,
+                })
+                log_event(
+                    "purge_cron_failed",
+                    status="timeout",
+                    level="ERROR",
+                    detail=f"purge exceeded {RETENTION_TIMEOUT_HOURS}h timeout",
+                    duration_ms=p_elapsed,
+                )
+
+            except asyncio.CancelledError:
+                _purge_state["running"] = False
+                raise
+
+            except Exception as e:
+                p_elapsed = (
+                    datetime.datetime.now(datetime.timezone.utc) - p0
+                ).total_seconds() * 1000
+                _purge_state.update({
+                    "last_run": p0.isoformat(),
+                    "last_duration_ms": round(p_elapsed, 1),
+                    "last_status": f"error: {str(e)[:80]}",
+                    "running": False,
+                })
+                log_event(
+                    "purge_cron_failed",
+                    status="error",
+                    level="ERROR",
+                    detail=str(e)[:120],
+                    duration_ms=p_elapsed,
+                )
+        else:
+            log_event("purge_skipped", detail="PURGE_ENABLED=false")
+
+        await asyncio.sleep(interval_sec)
 
 
 # ── TTL Cleanup Background Task ─────────────────────────────────────
@@ -121,7 +325,14 @@ async def lifespan(app: FastAPI):
     t2 = asyncio.create_task(periodical_scheduler())
     _background_tasks.append(t2)
 
-    log_event("app_startup", status="ok")
+    t3 = asyncio.create_task(periodic_archive_runner())
+    _background_tasks.append(t3)
+
+    log_event(
+        "app_startup",
+        status="ok",
+        detail=f"retention_enabled={RETENTION_ENABLED} interval={RETENTION_INTERVAL_HOURS}h",
+    )
 
     yield
 
@@ -239,6 +450,25 @@ async def health_check():
     checks["background_tasks"] = f"{alive_tasks}/{len(_background_tasks)} alive"
     if alive_tasks < len(_background_tasks):
         overall = "degraded"
+
+    # Retention system status
+    checks["retention"] = {
+        "enabled": _retention_state["enabled"],
+        "running": _retention_state["running"],
+        "last_run": _retention_state["last_run"],
+        "last_duration_ms": _retention_state["last_duration_ms"],
+        "last_status": _retention_state["last_status"],
+    }
+
+    # Purge system status
+    checks["purge"] = {
+        "enabled": _purge_state["enabled"],
+        "running": _purge_state["running"],
+        "last_run": _purge_state["last_run"],
+        "last_duration_ms": _purge_state["last_duration_ms"],
+        "last_deleted_rows": _purge_state["last_deleted_rows"],
+        "last_status": _purge_state["last_status"],
+    }
 
     return {"status": overall, "checks": checks}
 

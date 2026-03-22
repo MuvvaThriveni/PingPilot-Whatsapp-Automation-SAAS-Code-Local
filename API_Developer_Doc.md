@@ -1,6 +1,6 @@
 # WappFlow — Developer API Documentation
 
-> **Version:** 1.1.0  
+> **Version:** 1.2.0  
 > **Base URL:** `http://localhost:5000/api` (dev) or `https://<your-deployment>/api` (prod)  
 > **Auth:** Firebase ID Token — `Authorization: Bearer <firebase_id_token>`
 
@@ -20,6 +20,7 @@
 10. [Error Handling](#10-error-handling)
 11. [Environment Variables](#11-environment-variables)
 12. [Local Development Setup](#12-local-development-setup)
+13. [Data Retention & Archive System](#13-data-retention--archive-system)
 
 ---
 
@@ -57,12 +58,28 @@ Deep health check — verifies Postgres connectivity and background task livenes
   "checks": {
     "api": "ok",
     "postgres": "ok",
-    "background_tasks": "2/2 alive"
+    "redis": "ok",
+    "background_tasks": "3/3 alive",
+    "retention": {
+      "enabled": true,
+      "running": false,
+      "last_run": "2026-03-22T13:20:00+00:00",
+      "last_duration_ms": 4521.3,
+      "last_status": "success"
+    },
+    "purge": {
+      "enabled": false,
+      "running": false,
+      "last_run": null,
+      "last_duration_ms": null,
+      "last_deleted_rows": null,
+      "last_status": null
+    }
   }
 }
 ```
 
-`status` can be `"ok"` or `"degraded"`.
+`status` can be `"ok"` or `"degraded"`. The `retention` and `purge` objects show the current state of the background data lifecycle jobs (see [Section 13](#13-data-retention--archive-system)).
 
 ---
 
@@ -151,7 +168,7 @@ Tests connectivity to the WhatsApp Cloud API using stored credentials.
 
 `GET /api/settings/usage`
 
-Returns message counts for today, this month, and by product type (last 30 days).
+Returns message counts for today, this month, and by product type (last 30 days). Counts are sourced from a combination of the live `messages` table (recent data) and the pre-aggregated `daily_message_stats` table (historical data preserved before archival), ensuring numbers remain accurate even after old messages have been archived.
 
 **Response `200`:**
 ```json
@@ -864,23 +881,62 @@ All errors follow a consistent structure:
 |------|-------------|
 | `backend/firebase-service-account.json` | Firebase Admin SDK service account key |
 
-### Optional
+### Optional — General
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CORS_ORIGINS` | Hardcoded list | Comma-separated allowed origins |
 | `ENVIRONMENT` | `development` | Set to `production` to disable docs and restrict CORS |
 | `META_APP_SECRET` | (empty) | WhatsApp webhook signature verification |
+| `HOST` | `127.0.0.1` | Server bind address |
+| `PORT` | `5000` | Server bind port |
+
+### Optional — Postgres
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `PG_POOL_MIN` | `1` | Min Postgres connection pool size |
 | `PG_POOL_MAX` | `10` | Max Postgres connection pool size |
-| `PG_STATEMENT_TIMEOUT_MS` | `30000` | Statement timeout |
+| `PG_STATEMENT_TIMEOUT_MS` | `30000` | Statement timeout (ms) |
 | `PG_TIMEZONE` | `Asia/Kolkata` | DB session timezone |
+| `PG_CONNECT_RETRIES` | `8` | Connection retry attempts on startup |
+| `PG_CONNECT_RETRY_DELAY_S` | `0.5` | Delay between connection retries (seconds) |
+| `PG_COMMAND_TIMEOUT` | `30` | Pool-level command timeout (seconds) |
+
+### Optional — Redis & Rate Limiting
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_URL` | (empty) | Full Redis URL (overrides REDIS_HOST/PORT if set) |
 | `TENANT_RATE_LIMIT` | `10` | Worker messages per second per tenant |
 | `TENANT_BURST` | `20` | Worker max burst capacity |
 | `WA_COOLDOWN_TTL` | `5` | Global 429 cooldown duration (seconds) |
 | `QUEUE_RATE_LIMIT` | `80` | BullMQ message worker rate limit |
 | `QUEUE_RETRY_ATTEMPTS` | `3` | Max retry attempts for message jobs |
 | `DELIVERY_CONFIRM_TIMEOUT_SECONDS` | `900` | Requeue if no delivery confirmation |
+
+### Optional — Data Retention (Archive)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RETENTION_ENABLED` | `false` | Enable automated background archiving (`true`/`false`) |
+| `RETENTION_INTERVAL_HOURS` | `24` | Hours between automated archive runs |
+| `RETENTION_TIMEOUT_HOURS` | `1` | Max hours per archive run before forced timeout |
+| `RETENTION_DAYS` | `2` | Archive rows older than N days from live tables |
+| `RETENTION_BATCH_SIZE` | `1000` | Rows per archive batch |
+| `RETENTION_MAX_BATCHES` | `100` | Max batches per table per archive run |
+| `RETENTION_BATCH_SLEEP` | `0.05` | Seconds between archive batches (backpressure) |
+| `RETENTION_STATEMENT_TIMEOUT_MS` | `120000` | SQL statement timeout for archive queries (ms) |
+
+### Optional — Data Retention (Purge)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PURGE_ENABLED` | `false` | Enable automated archive purge (`true`/`false`) |
+| `PURGE_RETENTION_DAYS` | `90` | Delete archive rows older than N days |
+| `PURGE_BATCH_SIZE` | `1000` | Rows per purge batch |
+| `PURGE_MAX_BATCHES` | `50` | Max batches per table per purge run |
+| `PURGE_BATCH_SLEEP` | `0.05` | Seconds between purge batches |
 
 ---
 
@@ -952,3 +1008,233 @@ Or manually run `backend/schema.sql` against your Postgres database.
 | `usage_events` | Billable usage tracking |
 | `template_cache` | Persistent WhatsApp template metadata |
 | `user_triggers` | 24-hour rate limit for first-trigger messages |
+| `messages_archive` | Archived messages (older than RETENTION_DAYS) |
+| `chat_messages_archive` | Archived chat messages |
+| `webhook_events_archive` | Archived webhook events |
+| `usage_events_archive` | Archived usage events |
+| `daily_message_stats` | Pre-aggregated daily message counts (preserves dashboard accuracy after archival) |
+
+---
+
+## 13. Data Retention & Archive System
+
+WappFlow includes a **4-phase data lifecycle management system** that keeps live tables small and fast while preserving historical data for compliance and analytics. This section explains the full system so a new developer can understand, operate, and debug it.
+
+### 13.1 Overview — Why This Exists
+
+The four transient tables (`messages`, `chat_messages`, `webhook_events`, `usage_events`) grow continuously as users send messages. Without management, these tables would grow unbounded, slowing down queries, increasing index size, and inflating backup costs. The retention system solves this by:
+
+1. **Archiving** old rows from live tables into `*_archive` tables (fast live queries)
+2. **Purging** very old archive rows after a configurable retention period (controlled storage costs)
+3. **Pre-aggregating** message stats so dashboard analytics remain accurate after archival
+
+### 13.2 Architecture Diagram
+
+```
+ Live Tables                    Archive Tables              Deleted
+ ┌──────────┐    archive (2d)   ┌──────────────────┐  purge (90d)  
+ │ messages │ ──────────────→  │ messages_archive  │ ──────────→  Gone
+ │ chat_msg │ ──────────────→  │ chat_msg_archive  │ ──────────→  Gone
+ │ webhook  │ ──────────────→  │ webhook_archive   │ ──────────→  Gone
+ │ usage    │ ──────────────→  │ usage_archive     │ ──────────→  Gone
+ └──────────┘                   └──────────────────┘
+       │
+       │  pre-aggregate (before archive)
+       ▼
+ ┌─────────────────────┐
+ │ daily_message_stats │  (permanent — powers dashboard)
+ └─────────────────────┘
+```
+
+### 13.3 The Four Phases
+
+| Phase | What | File | Status |
+|-------|------|------|--------|
+| **Phase 1** | Schema creation — archive tables + safety indexes + webhook fallback | `retention_schema.sql`, `schema.sql`, `db_layer/messages.py`, `routers/webhook.py` | Complete |
+| **Phase 2** | Archive engine — batched data movement from live → archive | `retention.py` | Complete |
+| **Phase 3** | Controlled automation — background cron + health monitoring | `main.py` | Complete |
+| **Phase 4** | Archive cleanup — batched purge of old archive rows | `retention.py`, `main.py` | Complete |
+
+### 13.4 How Archiving Works (Phase 2)
+
+The `archive_old_data()` function in `retention.py` processes each table in batches:
+
+```
+For each table (messages, chat_messages, usage_events, webhook_events):
+  Loop (max 100 batches):
+    BEGIN TRANSACTION
+      1. SELECT id FROM {table} WHERE created_at < cutoff
+         ORDER BY id ASC LIMIT 1000
+         FOR UPDATE SKIP LOCKED
+      2. INSERT INTO {archive} (..., archived_at)
+         SELECT ..., now() FROM {table} WHERE id = ANY($1)
+         ON CONFLICT DO NOTHING
+      3. DELETE FROM {table} WHERE id = ANY($1)
+    COMMIT
+    sleep 50ms
+```
+
+**Key safety properties:**
+
+- **Batched**: Max 1000 rows per transaction — no long locks
+- **Transactional**: All 3 steps atomic — crash = full rollback, zero data loss
+- **Idempotent**: `ON CONFLICT DO NOTHING` — safe to re-run at any time
+- **Concurrency-safe**: `FOR UPDATE SKIP LOCKED` — skips rows locked by live webhooks/workers
+- **Backpressure**: 50ms sleep between batches yields control to the event loop
+
+**Special handling:**
+
+- `messages` table: `daily_message_stats` is pre-aggregated BEFORE any messages are deleted, using `GREATEST()` in `ON CONFLICT` so counts never decrease on re-runs
+- `webhook_events`: Uses composite PK `(tenant_id, event_id)` instead of `id` — handled by a separate function with `unnest()` array matching
+- Webhook status updates for archived messages: A fallback lookup in `messages_archive` was added to `routers/webhook.py` (Phase 1) so delivery callbacks for recently-archived messages still work
+
+### 13.5 How Purging Works (Phase 4)
+
+The `purge_old_archives()` function deletes old rows from archive tables using the same batched pattern:
+
+```
+For each archive table:
+  Loop (max 50 batches):
+    BEGIN TRANSACTION
+      1. SELECT id FROM {archive} WHERE archived_at < cutoff
+         ORDER BY id ASC LIMIT 1000
+         FOR UPDATE SKIP LOCKED
+      2. DELETE FROM {archive} WHERE id = ANY($1)
+    COMMIT
+    sleep 50ms
+```
+
+- Only targets `*_archive` tables — **never touches live tables**
+- Uses `archived_at` (not `created_at`) as the cutoff — only deletes data that has been in the archive for the full retention period
+- Disabled by default (`PURGE_ENABLED=false`)
+
+### 13.6 Background Automation (Phase 3)
+
+The `periodic_archive_runner()` in `main.py` runs as a background `asyncio.Task`:
+
+```
+Startup → 60s warmup delay → then every RETENTION_INTERVAL_HOURS:
+  1. If RETENTION_ENABLED=false → log "retention_skipped", sleep, loop
+  2. Acquire asyncio.Lock (prevent overlap)
+  3. await asyncio.wait_for(archive_old_data(), timeout=1h)
+  4. If PURGE_ENABLED=true:
+       await asyncio.wait_for(purge_old_archives(), timeout=1h)
+  5. Update health state dict → visible via GET /api/health
+  6. Sleep → loop
+```
+
+**Safety features:**
+
+| Feature | Mechanism |
+|---------|----------|
+| No overlap | `asyncio.Lock` — second cycle skips if first is still running |
+| Timeout | `asyncio.wait_for()` — kills runaway jobs after 1h (configurable) |
+| No crash | `except Exception` catches all errors, logs them, continues loop |
+| Graceful shutdown | `CancelledError` re-raised — lifespan cancels the task cleanly |
+| No startup blocking | 60s initial warmup delay — app fully serves requests first |
+| Kill switch | `RETENTION_ENABLED=false` / `PURGE_ENABLED=false` — checked every cycle |
+
+### 13.7 Manual CLI Usage
+
+For one-off runs or debugging, the retention system can be triggered manually:
+
+```bash
+cd backend
+
+# Archive only (move old rows to archive tables)
+python retention.py
+
+# Archive + Purge (archive then delete old archive rows)
+python retention.py --purge
+
+# Purge only (delete old archive rows without archiving)
+python retention.py --purge-only
+
+# Small test (10 rows, 1 batch — safe for production verification)
+RETENTION_BATCH_SIZE=10 RETENTION_MAX_BATCHES=1 python retention.py
+
+# Small purge test
+PURGE_BATCH_SIZE=10 PURGE_MAX_BATCHES=1 python retention.py --purge-only
+```
+
+### 13.8 Monitoring & Log Events
+
+All retention and purge operations emit structured JSON logs via `observability.log_event()`:
+
+**Archive events:**
+
+| Event | When |
+|-------|------|
+| `retention_start` | Archive run begins (includes cutoff timestamp, config) |
+| `retention_aggregate` | `daily_message_stats` pre-aggregation complete |
+| `retention_batch` | Each batch completes (includes table, batch#, rows, total, duration) |
+| `retention_complete` | Archive run finished (includes full summary) |
+| `retention_cron_started` | Background automation cycle begins |
+| `retention_cron_completed` | Background automation cycle finished |
+| `retention_cron_failed` | Background automation cycle errored/timed out |
+| `retention_skipped` | Automation disabled or overlapping run |
+
+**Purge events:**
+
+| Event | When |
+|-------|------|
+| `purge_started` | Purge run begins (includes cutoff, config) |
+| `purge_batch` | Each purge batch completes (table, batch#, rows, total, duration) |
+| `purge_completed` | Purge run finished (includes full summary) |
+| `purge_failed` | Purge run errored |
+| `purge_cron_started` | Background purge cycle begins |
+| `purge_cron_completed` | Background purge cycle finished |
+| `purge_cron_failed` | Background purge cycle errored/timed out |
+| `purge_skipped` | Purge disabled |
+
+### 13.9 Verification Queries
+
+**Check what would be archived (before running):**
+```sql
+SELECT 'messages' AS tbl, COUNT(*) FROM messages WHERE created_at < now() - interval '2 days'
+UNION ALL
+SELECT 'chat_messages', COUNT(*) FROM chat_messages WHERE created_at < now() - interval '2 days'
+UNION ALL
+SELECT 'usage_events', COUNT(*) FROM usage_events WHERE created_at < now() - interval '2 days'
+UNION ALL
+SELECT 'webhook_events', COUNT(*) FROM webhook_events WHERE created_at < now() - interval '2 days';
+```
+
+**Check archive table sizes:**
+```sql
+SELECT 'messages_archive' AS tbl, COUNT(*) FROM messages_archive
+UNION ALL
+SELECT 'chat_messages_archive', COUNT(*) FROM chat_messages_archive
+UNION ALL
+SELECT 'usage_events_archive', COUNT(*) FROM usage_events_archive
+UNION ALL
+SELECT 'webhook_events_archive', COUNT(*) FROM webhook_events_archive;
+```
+
+**Verify no data loss (live + archive = original total):**
+```sql
+SELECT
+  (SELECT COUNT(*) FROM messages) AS live,
+  (SELECT COUNT(*) FROM messages_archive) AS archived,
+  (SELECT COUNT(*) FROM messages) + (SELECT COUNT(*) FROM messages_archive) AS combined;
+```
+
+**Check daily_message_stats populated:**
+```sql
+SELECT tenant_id, stat_date, SUM(message_count) AS total
+FROM daily_message_stats
+GROUP BY tenant_id, stat_date
+ORDER BY stat_date DESC
+LIMIT 10;
+```
+
+**Confirm live tables untouched after purge:**
+```sql
+SELECT 'messages' AS tbl, COUNT(*) FROM messages
+UNION ALL
+SELECT 'chat_messages', COUNT(*) FROM chat_messages
+UNION ALL
+SELECT 'usage_events', COUNT(*) FROM usage_events
+UNION ALL
+SELECT 'webhook_events', COUNT(*) FROM webhook_events;
+```

@@ -302,6 +302,9 @@ async def handle_webhook(request: Request):
 
                     outgoing = await _db_messages.get_outgoing_by_wa_message_id(tenant_id, wa_msg_id)
                     if not outgoing:
+                        # Fallback: message may have been archived
+                        outgoing = await _db_messages.get_outgoing_by_wa_message_id_archived(tenant_id, wa_msg_id)
+                    if not outgoing:
                         continue
                     campaign_id = outgoing.get("campaign_id")
                     phone = outgoing.get("contact_phone")
