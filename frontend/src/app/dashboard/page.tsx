@@ -6,7 +6,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Button } from '@/components/ui/button'
 import { settings } from '@/lib/api'
 import { Skeleton } from '@/components/ui/skeleton'
-import { FileText, Users, Bot, ArrowRight, CheckCircle, AlertCircle } from 'lucide-react'
+import { MessageSquare, Users, Bot, ArrowRight, CheckCircle, AlertCircle } from 'lucide-react'
 
 interface UsageStats {
   today: { total: number; successful: number; failed: number }
@@ -17,9 +17,9 @@ interface UsageStats {
 const products = [
   {
     id: 'file-forward',
-    title: 'Single File Forwarding',
-    description: 'Send PDF, images, or documents via WhatsApp instantly. Perfect for invoices, reports, and confirmations.',
-    icon: FileText,
+    title: 'Live Messaging',
+    description: 'Send real-time messages, images, or documents within the 24-hour WhatsApp session window.',
+    icon: MessageSquare,
     href: '/dashboard/file-forward',
     color: 'bg-blue-500',
     lightColor: 'bg-blue-50',

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -33,14 +33,10 @@ export default function LogsPage() {
     offset: 0
   })
 
-  useEffect(() => {
-    fetchLogs()
-  }, [filters])
-
-  const fetchLogs = async () => {
+  const fetchLogs = useCallback(async () => {
     setLoading(true)
     try {
-      const params: any = { limit: filters.limit, offset: filters.offset }
+      const params: { limit: number; offset: number; product_type?: string; status?: string } = { limit: filters.limit, offset: filters.offset }
       if (filters.product_type) params.product_type = filters.product_type
       if (filters.status) params.status = filters.status
       
@@ -52,11 +48,15 @@ export default function LogsPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [filters])
+
+  useEffect(() => {
+    fetchLogs()
+  }, [fetchLogs])
 
   const handleExport = async () => {
     try {
-      const params: any = {}
+      const params: { product_type?: string; status?: string } = {}
       if (filters.product_type) params.product_type = filters.product_type
       if (filters.status) params.status = filters.status
       
@@ -90,7 +90,7 @@ export default function LogsPage() {
 
   const getProductLabel = (type: string) => {
     switch (type) {
-      case 'file_forward': return 'File Forward'
+      case 'file_forward': return 'Live Messaging'
       case 'bulk_message': return 'Bulk Message'
       case 'chatbot': return 'Chatbot'
       default: return type
@@ -130,7 +130,7 @@ export default function LogsPage() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="">All Products</SelectItem>
-                  <SelectItem value="file_forward">File Forward</SelectItem>
+                  <SelectItem value="file_forward">Live Messaging</SelectItem>
                   <SelectItem value="bulk_message">Bulk Message</SelectItem>
                   <SelectItem value="chatbot">Chatbot</SelectItem>
                 </SelectContent>

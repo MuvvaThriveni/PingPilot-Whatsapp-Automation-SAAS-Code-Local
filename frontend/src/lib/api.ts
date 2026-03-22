@@ -62,7 +62,7 @@ export const settings = {
   saveWhatsApp: (data: {
     business_account_id: string;
     phone_number_id: string;
-    access_token: string;
+    access_token?: string;
     webhook_verify_token?: string;
   }) => api.post('/settings/whatsapp', data),
   testConnection: () => api.post('/settings/whatsapp/test'),

@@ -9,7 +9,8 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { fileForward } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
-import { Upload, FileText, Image, X, Send, Loader2, Users, User, FileSpreadsheet } from 'lucide-react'
+import { Upload, FileText, Image as ImageIcon, X, Send, Loader2, Users, User, FileSpreadsheet } from 'lucide-react'
+import axios from 'axios'
 
 interface Contact {
   index: number
@@ -27,6 +28,24 @@ export default function FileForwardPage() {
   const [contactsFile, setContactsFile] = useState<File | null>(null)
   const [contacts, setContacts] = useState<Contact[]>([])
   const [parsingContacts, setParsingContacts] = useState(false)
+
+  const [sessionStatus] = useState<'unknown' | 'active'>('unknown')
+
+  const sessionBadge = (() => {
+    if (sessionStatus === 'active') {
+      return {
+        label: 'Session Active',
+        dotClassName: 'bg-green-500',
+        containerClassName: 'border-green-200 bg-green-50 text-green-700'
+      }
+    }
+
+    return {
+      label: 'Session Unknown',
+      dotClassName: 'bg-gray-400',
+      containerClassName: 'border-gray-200 bg-gray-50 text-gray-600'
+    }
+  })()
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles.length > 0) {
@@ -60,10 +79,10 @@ export default function FileForwardPage() {
         const res = await fileForward.parseContacts(formData)
         setContacts(res.data.contacts)
         toast({ title: 'Contacts loaded', description: `Found ${res.data.total} valid contacts` })
-      } catch (error: any) {
+      } catch (error: unknown) {
         toast({
           title: 'Parse failed',
-          description: error.response?.data?.error || 'Failed to parse contacts file',
+          description: axios.isAxiosError(error) ? error.response?.data?.error || 'Failed to parse contacts file' : 'Failed to parse contacts file',
           variant: 'destructive'
         })
         setContactsFile(null)
@@ -87,7 +106,7 @@ export default function FileForwardPage() {
     e.preventDefault()
     
     if (!file) {
-      toast({ title: 'Error', description: 'Please select a file', variant: 'destructive' })
+      toast({ title: 'Error', description: 'Please attach an image or document', variant: 'destructive' })
       return
     }
 
@@ -111,7 +130,7 @@ export default function FileForwardPage() {
         if (message) formData.append('message', message)
 
         await fileForward.send(formData)
-        toast({ title: 'Success', description: 'File sent successfully!' })
+        toast({ title: 'Success', description: 'Message sent successfully!' })
       } else {
         const formData = new FormData()
         formData.append('file', file)
@@ -120,8 +139,8 @@ export default function FileForwardPage() {
 
         const res = await fileForward.sendBulk(formData)
         toast({ 
-          title: 'Bulk send complete', 
-          description: `Sent to ${res.data.sent_count} of ${res.data.total} contacts` 
+          title: 'Bulk send queued', 
+          description: `Queued ${res.data.queued_count} of ${res.data.total} contacts` 
         })
       }
       
@@ -130,10 +149,10 @@ export default function FileForwardPage() {
       setMessage('')
       setContactsFile(null)
       setContacts([])
-    } catch (error: any) {
+    } catch (error: unknown) {
       toast({
         title: 'Failed to send',
-        description: error.response?.data?.error || 'Something went wrong',
+        description: axios.isAxiosError(error) ? error.response?.data?.error || 'Something went wrong' : 'Something went wrong',
         variant: 'destructive'
       })
     } finally {
@@ -143,22 +162,22 @@ export default function FileForwardPage() {
 
   const getFileIcon = () => {
     if (!file) return null
-    if (file.type.startsWith('image/')) return <Image className="h-8 w-8 text-blue-500" />
+    if (file.type.startsWith('image/')) return <ImageIcon className="h-8 w-8 text-blue-500" />
     return <FileText className="h-8 w-8 text-red-500" />
   }
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
       <div>
-        <h1 className="text-2xl font-bold text-gray-900">File Forwarding</h1>
-        <p className="text-gray-500 mt-1">Send a PDF, image, or document via WhatsApp</p>
+        <h1 className="text-2xl font-bold text-gray-900">Live Messaging</h1>
+        <p className="text-gray-500 mt-1">Send real-time messages, images, or documents within the 24-hour session window</p>
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle>Send File</CardTitle>
+          <CardTitle>Send Message</CardTitle>
           <CardDescription>
-            Upload a file and choose recipients to send
+            Compose your message and choose who to send it to
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -172,7 +191,7 @@ export default function FileForwardPage() {
                 className="flex-1"
               >
                 <User className="mr-2 h-4 w-4" />
-                Single Recipient
+                Single Contact
               </Button>
               <Button
                 type="button"
@@ -181,13 +200,28 @@ export default function FileForwardPage() {
                 className="flex-1"
               >
                 <Users className="mr-2 h-4 w-4" />
-                Bulk (Excel/CSV)
+                Bulk Send (CSV)
               </Button>
+            </div>
+
+            {/* Message */}
+            <div className="space-y-2">
+              <Label htmlFor="message">Message</Label>
+              <Textarea
+                id="message"
+                placeholder="Type your message..."
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                rows={3}
+              />
+              <p className="text-sm text-gray-500">
+                You can send messages only within 24 hours of the user&apos;s last interaction.
+              </p>
             </div>
 
             {/* File Upload */}
             <div className="space-y-2">
-              <Label>File</Label>
+              <Label>Attachment</Label>
               {!file ? (
                 <div
                   {...getRootProps()}
@@ -231,7 +265,13 @@ export default function FileForwardPage() {
             {/* Recipient - Single Mode */}
             {mode === 'single' && (
               <div className="space-y-2">
-                <Label htmlFor="recipient">Recipient WhatsApp Number</Label>
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="recipient">Recipient WhatsApp Number (with country code)</Label>
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${sessionBadge.containerClassName}`}>
+                    <span className={`mr-1.5 h-2 w-2 rounded-full ${sessionBadge.dotClassName}`} />
+                    {sessionBadge.label}
+                  </span>
+                </div>
                 <Input
                   id="recipient"
                   type="tel"
@@ -248,7 +288,7 @@ export default function FileForwardPage() {
             {/* Contacts File - Bulk Mode */}
             {mode === 'bulk' && (
               <div className="space-y-2">
-                <Label>Contacts File (Excel/CSV)</Label>
+                <Label>Contacts File (CSV)</Label>
                 {!contactsFile ? (
                   <div
                     {...getContactsRootProps()}
@@ -260,7 +300,7 @@ export default function FileForwardPage() {
                     <input {...getContactsInputProps()} />
                     <FileSpreadsheet className="h-8 w-8 mx-auto text-gray-400 mb-2" />
                     <p className="text-sm text-gray-600">
-                      {isContactsDragActive ? 'Drop the file here' : 'Upload Excel or CSV with contacts'}
+                      {isContactsDragActive ? 'Drop the file here' : 'Upload a CSV with contacts'}
                     </p>
                     <p className="text-xs text-gray-400 mt-1">
                       Columns: Name, Phone/Mobile Number
@@ -303,17 +343,14 @@ export default function FileForwardPage() {
               </div>
             )}
 
-            {/* Message */}
-            <div className="space-y-2">
-              <Label htmlFor="message">Message (Optional)</Label>
-              <Textarea
-                id="message"
-                placeholder="Add a caption or message..."
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
-                rows={3}
-              />
-            </div>
+            {mode === 'bulk' && (
+              <div className="flex justify-end">
+                <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${sessionBadge.containerClassName}`}>
+                  <span className={`mr-1.5 h-2 w-2 rounded-full ${sessionBadge.dotClassName}`} />
+                  {sessionBadge.label}
+                </span>
+              </div>
+            )}
 
             {/* Submit */}
             <Button 

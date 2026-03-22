@@ -13,6 +13,7 @@ import { bulkMessage } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Upload, FileSpreadsheet, X, Play, Square, Loader2, CheckCircle, XCircle, Clock, Trash2 } from 'lucide-react'
+import axios from 'axios'
 
 interface Contact {
   index: number
@@ -130,10 +131,10 @@ export default function BulkMessagePage() {
         setContacts(res.data.contacts)
         setTotalContacts(res.data.validContacts)
         toast({ title: 'File parsed', description: `Found ${res.data.validContacts} valid contacts` })
-      } catch (error: any) {
+      } catch (error: unknown) {
         toast({
           title: 'Parse failed',
-          description: error.response?.data?.error || 'Failed to parse file',
+          description: axios.isAxiosError(error) ? error.response?.data?.error || 'Failed to parse file' : 'Failed to parse file',
           variant: 'destructive'
         })
         setFile(null)
@@ -187,10 +188,10 @@ export default function BulkMessagePage() {
       setScheduledAt('')
 
       fetchCampaigns()
-    } catch (error: any) {
+    } catch (error: unknown) {
       toast({
         title: 'Failed to start campaign',
-        description: error.response?.data?.error || 'Something went wrong',
+        description: axios.isAxiosError(error) ? error.response?.data?.error || 'Something went wrong' : 'Something went wrong',
         variant: 'destructive'
       })
     } finally {
@@ -376,7 +377,7 @@ export default function BulkMessagePage() {
                   />
                   <p className="text-xs text-orange-600 flex items-center gap-1">
                     <Clock className="h-3 w-3" />
-                    Campaign status will remain "Scheduled" until the selected time.
+                    Campaign status will remain &quot;Scheduled&quot; until the selected time.
                   </p>
                 </div>
               )}

@@ -7,7 +7,6 @@ import { signOut } from 'firebase/auth'
 import { auth } from '@/lib/firebase'
 import {
   MessageSquare,
-  FileText,
   Users,
   Bot,
   Settings,
@@ -19,7 +18,7 @@ import {
 
 const navItems = [
   { href: '/dashboard', label: 'Dashboard', icon: Home },
-  { href: '/dashboard/file-forward', label: 'File Forward', icon: FileText },
+  { href: '/dashboard/file-forward', label: 'Live Messaging', icon: MessageSquare },
   { href: '/dashboard/bulk-message', label: 'Bulk Message', icon: Users },
   { href: '/dashboard/chatbot', label: 'Chatbot', icon: Bot },
   { href: '/dashboard/settings', label: 'Settings', icon: Settings },

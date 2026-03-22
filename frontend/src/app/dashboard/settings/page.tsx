@@ -9,6 +9,7 @@ import { settings } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Settings, CheckCircle, XCircle, Loader2, Eye, EyeOff, ExternalLink } from 'lucide-react'
+import axios from 'axios'
 
 export default function SettingsPage() {
   const { toast } = useToast()
@@ -65,7 +66,12 @@ export default function SettingsPage() {
     setSaving(true)
     try {
       // Only send access_token if user typed a new one — otherwise backend keeps existing
-      const payload: any = {
+      const payload: {
+        business_account_id: string
+        phone_number_id: string
+        webhook_verify_token: string
+        access_token?: string
+      } = {
         business_account_id: formData.business_account_id,
         phone_number_id: formData.phone_number_id,
         webhook_verify_token: formData.webhook_verify_token,
@@ -78,10 +84,10 @@ export default function SettingsPage() {
       setConnectionStatus('unknown')
       setHasExistingToken(true)
       setFormData(prev => ({ ...prev, access_token: '' }))  // clear field after save
-    } catch (error: any) {
+    } catch (error: unknown) {
       toast({
         title: 'Failed to save',
-        description: error.response?.data?.error || 'Something went wrong',
+        description: axios.isAxiosError(error) ? error.response?.data?.error || 'Something went wrong' : 'Something went wrong',
         variant: 'destructive'
       })
     } finally {
@@ -105,11 +111,11 @@ export default function SettingsPage() {
         setConnectionStatus('error')
         toast({ title: 'Connection failed', description: res.data.error, variant: 'destructive' })
       }
-    } catch (error: any) {
+    } catch (error: unknown) {
       setConnectionStatus('error')
       toast({
         title: 'Connection failed',
-        description: error.response?.data?.error || 'Failed to connect to WhatsApp API',
+        description: axios.isAxiosError(error) ? error.response?.data?.error || 'Failed to connect to WhatsApp API' : 'Failed to connect to WhatsApp API',
         variant: 'destructive'
       })
     } finally {

@@ -22,6 +22,7 @@ import {
 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
+import axios from 'axios'
 
 interface Recipient {
   contact_phone: string
@@ -64,10 +65,10 @@ export default function CampaignDetailPage() {
       const res = await bulkMessage.details(campaignId)
       setCampaign(res.data.campaign)
       setRecipients(res.data.recipients)
-    } catch (error: any) {
+    } catch (error: unknown) {
       toast({
         title: 'Error',
-        description: error.response?.data?.error || 'Failed to load campaign details',
+        description: axios.isAxiosError(error) ? error.response?.data?.error || 'Failed to load campaign details' : 'Failed to load campaign details',
         variant: 'destructive',
       })
     } finally {
@@ -84,6 +85,7 @@ export default function CampaignDetailPage() {
     if (!campaign || campaign.status !== 'running') return
     const interval = setInterval(fetchDetails, 4000)
     return () => clearInterval(interval)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [campaign?.status, fetchDetails])
 
   const handleResendFailed = async () => {
@@ -96,10 +98,10 @@ export default function CampaignDetailPage() {
       })
       // Refresh details immediately so status updates to 'running' and auto-refresh kicks in
       await fetchDetails()
-    } catch (error: any) {
+    } catch (error: unknown) {
       toast({
         title: 'Resend failed',
-        description: error.response?.data?.error || 'Something went wrong',
+        description: axios.isAxiosError(error) ? error.response?.data?.error || 'Something went wrong' : 'Something went wrong',
         variant: 'destructive',
       })
     } finally {
