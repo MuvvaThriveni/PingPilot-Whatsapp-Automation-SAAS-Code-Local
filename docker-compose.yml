@@ -1,40 +1,58 @@
 version: "3.8"
 
+# ─── Local development (default) ───────────────────────────────────
+# Uses a local Redis container.  For production, set REDIS_URL in your
+# environment or .env and optionally remove the redis service below.
+
 services:
   redis:
-    image: redis:6.2-alpine
+    image: redis:7-alpine
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
     command: redis-server --appendonly yes
+    profiles:
+      - dev
+      - default
 
   api:
     build:
       context: ./backend
     ports:
       - "5000:5000"
+    env_file:
+      - ./backend/.env
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - QUEUE_RATE_LIMIT=80
-      - QUEUE_RETRY_ATTEMPTS=5
+      # Production: set REDIS_URL in .env (takes priority over HOST/PORT)
+      - REDIS_URL=${REDIS_URL:-}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - QUEUE_RATE_LIMIT=${QUEUE_RATE_LIMIT:-80}
+      - QUEUE_RETRY_ATTEMPTS=${QUEUE_RETRY_ATTEMPTS:-5}
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+        required: false
     restart: unless-stopped
 
   worker:
     build:
       context: ./backend
     command: python worker_main.py
+    env_file:
+      - ./backend/.env
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - QUEUE_RATE_LIMIT=80
-      - QUEUE_RETRY_ATTEMPTS=5
+      - REDIS_URL=${REDIS_URL:-}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - QUEUE_RATE_LIMIT=${QUEUE_RATE_LIMIT:-80}
+      - QUEUE_RETRY_ATTEMPTS=${QUEUE_RETRY_ATTEMPTS:-5}
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+        required: false
     restart: unless-stopped
 
 volumes:

@@ -1,16 +1,8 @@
 import os
 from bullmq import Queue
-from dotenv import load_dotenv
+from rate_limit import get_redis_opts_for_bullmq
 
-load_dotenv()
-
-REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-
-redis_opts = {
-    "host": REDIS_HOST,
-    "port": REDIS_PORT,
-}
+redis_opts = get_redis_opts_for_bullmq()
 
 # Queues
 campaign_queue = Queue("campaign_queue", {"connection": redis_opts})
@@ -67,6 +59,49 @@ async def enqueue_message(
         },
         opts
     )
+
+async def enqueue_file_forward(
+    job_id: str,
+    tenant_id: str,
+    phone_number: str,
+    media_id: str,
+    media_type: str = "document",
+    filename: str = "file",
+    caption: str = "",
+    priority: int = 1,
+):
+    """Enqueue a file-forward message job (image or document via media_id)."""
+    opts = {
+        "jobId": job_id,
+        "attempts": int(os.environ.get("QUEUE_RETRY_ATTEMPTS", "3")),
+        "backoff": {
+            "type": "exponential",
+            "delay": 5000,
+        },
+        "removeOnComplete": True,
+        "removeOnFail": True,
+        "priority": priority,
+    }
+
+    await message_queue.add(
+        "send_message",
+        {
+            "tenant_id": tenant_id,
+            "campaign_id": "file_forward",
+            "contact_id": phone_number,
+            "phone_number": phone_number,
+            "template_name": "",
+            "template_variables": {},
+            "message_text": "",
+            "media_id": media_id,
+            "media_type": media_type,
+            "media_filename": filename,
+            "media_caption": caption,
+            "idempotency_key": job_id,
+        },
+        opts,
+    )
+
 
 async def enqueue_dead_letter(job_data: dict, reason: str):
     """Move failed job to dead letter queue."""

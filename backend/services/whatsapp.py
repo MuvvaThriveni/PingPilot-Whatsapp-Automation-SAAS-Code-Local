@@ -1,21 +1,26 @@
 from __future__ import annotations
 
-"""WhatsApp Cloud API service (Phase-6: hardened).
+"""WhatsApp Cloud API service (Phase-7: jitter + adaptive cooldown).
 
 Improvements:
 - Connection pooling (reusable httpx.AsyncClient per instance)
 - 429 rate-limit handling with Retry-After header support
+- Jitter on all retry delays to prevent thundering herd
+- Adaptive global cooldown via Redis on repeated 429s
 - No secrets/payloads logged
 - Consistent error handling
 """
 
 import asyncio
+import random
 import httpx
 from observability import log_event
+from rate_limit import set_global_cooldown
 
 # Retry configuration
 _MAX_RETRIES = 3
 _BASE_DELAY_S = 1.0  # first retry after ~1 s, then 2 s, then 4 s
+_CONSECUTIVE_429_THRESHOLD = 2  # trigger global cooldown after this many 429s
 
 
 def _is_retryable(exc: Exception = None, status_code: int = 0) -> bool:
@@ -47,11 +52,14 @@ class WhatsAppService:
                                   data: dict = None, files: dict = None,
                                   params: dict = None,
                                   label: str = "") -> httpx.Response:
-        """Execute an HTTP request with exponential backoff on retryable errors.
+        """Execute an HTTP request with exponential backoff + jitter on retryable errors.
 
         Handles 429 Too Many Requests with Retry-After header support.
+        Triggers a Redis-backed global cooldown after repeated 429s so all
+        workers back off simultaneously.
         """
         last_exc: Exception | None = None
+        consecutive_429 = 0
         for attempt in range(_MAX_RETRIES):
             try:
                 response = await self._client.request(
@@ -65,23 +73,42 @@ class WhatsAppService:
                 # Retryable status (5xx or 429)
                 if attempt < _MAX_RETRIES - 1:
                     if response.status_code == 429:
+                        consecutive_429 += 1
                         # Respect Retry-After header if present
                         retry_after = response.headers.get("Retry-After")
-                        delay = float(retry_after) if retry_after else _BASE_DELAY_S * (2 ** attempt)
-                        delay = min(delay, 30.0)  # Cap at 30 seconds
-                        log_event("wa_rate_limited", detail=f"{label} 429, retry in {delay:.1f}s",
+                        base_delay = float(retry_after) if retry_after else _BASE_DELAY_S * (2 ** attempt)
+                        # Add jitter: delay + random(0, 0.5 * delay)
+                        jitter = random.uniform(0, 0.5 * base_delay)
+                        delay = min(base_delay + jitter, 30.0)
+                        log_event("wa_rate_limited", detail=f"{label} 429 #{consecutive_429}, retry in {delay:.1f}s",
                                   level="WARN")
+                        # Trigger global cooldown after repeated 429s
+                        if consecutive_429 >= _CONSECUTIVE_429_THRESHOLD:
+                            try:
+                                await set_global_cooldown()
+                            except Exception:
+                                pass  # Redis failure — don't block the retry
                     else:
-                        delay = _BASE_DELAY_S * (2 ** attempt)
+                        base_delay = _BASE_DELAY_S * (2 ** attempt)
+                        jitter = random.uniform(0, 0.5 * base_delay)
+                        delay = base_delay + jitter
                         log_event("wa_retry", detail=f"{label} status={response.status_code} retry in {delay:.1f}s")
                     await asyncio.sleep(delay)
                 else:
+                    # Final attempt — trigger cooldown if we got 429
+                    if response.status_code == 429:
+                        try:
+                            await set_global_cooldown()
+                        except Exception:
+                            pass
                     return response  # final attempt — return whatever we got
                 last_exc = None
             except Exception as e:
                 last_exc = e
                 if attempt < _MAX_RETRIES - 1:
-                    delay = _BASE_DELAY_S * (2 ** attempt)
+                    base_delay = _BASE_DELAY_S * (2 ** attempt)
+                    jitter = random.uniform(0, 0.5 * base_delay)
+                    delay = base_delay + jitter
                     log_event("wa_retry", detail=f"{label} error, retry in {delay:.1f}s", level="WARN")
                     await asyncio.sleep(delay)
         # All retries exhausted with exception

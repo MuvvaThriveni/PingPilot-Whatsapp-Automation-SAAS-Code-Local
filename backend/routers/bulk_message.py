@@ -1,4 +1,4 @@
-"""Bulk WhatsApp Messaging routes (Phase-6: hardened).
+"""Bulk WhatsApp Messaging routes (Phase-7: queue-unified).
 
 Security fixes:
 - Tenant ownership validation on stop/status/delete endpoints
@@ -7,6 +7,7 @@ Security fixes:
 - UTC timestamps everywhere
 - Removed all print() logging → structured log_event()
 - Tenant-scoped template cache lookups
+- All campaign processing delegated to BullMQ workers (no direct sends)
 """
 
 import io
@@ -20,15 +21,8 @@ from fastapi.responses import JSONResponse
 import pandas as pd
 from utils.time_utils import get_ist_now_iso, get_ist_now
 
-from store import get_settings, active_campaigns, add_message, add_message_conn
+from store import get_settings
 from services.whatsapp import WhatsAppService
-from services.template_builder import (
-    get_components as _get_template_components,
-    build_components as _build_template_components,
-    ensure_cached as _ensure_template_cached,
-    upload_header_media as _upload_header_media,
-    get_template_keys_for_tenant as _get_template_keys_for_tenant,
-)
 from observability import log_event
 from db_layer.campaigns import campaigns as _db_campaigns
 from db_layer.campaign_recipients import campaign_recipients as _db_recipients
@@ -40,10 +34,6 @@ router = APIRouter(prefix="/api/bulk-message", tags=["bulk-message"])
 
 # ── Constants ────────────────────────────────────────────────────────
 MAX_UPLOAD_SIZE_BYTES = 16 * 1024 * 1024  # 16MB
-BATCH_SIZE = 10  # send up to 10 messages concurrently per batch
-
-# Process-local lock for campaign workers
-_worker_locks: set[str] = set()
 
 # Process-local lock for scheduler
 _scheduler_running: bool = False
@@ -283,164 +273,6 @@ async def start_bulk_campaign(
                   detail=f"scheduled_at={scheduledAt}")
 
     return {"success": True, "campaignId": campaign_id, "totalContacts": len(contacts), "status": status}
-
-
-# ── Campaign processing ─────────────────────────────────────────────
-
-async def _send_one(whatsapp: WhatsAppService, contact: dict, template_str: str,
-                    campaign_id: str, tenant_id: str,
-                    header_image_url: str = "", header_media_id: str = ""):
-    """Send a single template message and record the result in the database."""
-    phone = contact.get("phone") or contact.get("contact_phone")
-    now = _ist_now()
-    try:
-        components = _build_template_components(
-            template_str, contact,
-            header_media_id=header_media_id,
-            tenant_id=tenant_id,
-        )
-        result = await whatsapp.send_template_message(
-            phone, template_str, components=components if components else None
-        )
-
-        if result["success"]:
-            async with transaction() as conn:
-                await _db_recipients.update_status(
-                    tenant_id,
-                    campaign_id,
-                    phone,
-                    "sent",
-                    wa_message_id=result["messageId"],
-                    conn=conn,
-                )
-                await _db_counters.increment(tenant_id, campaign_id, "sent", conn=conn)
-                await add_message_conn(
-                    tenant_id,
-                    {
-                        "direction": "outgoing",
-                        "product_type": "bulk_message",
-                        "contact_phone": phone,
-                        "message_type": "template",
-                        "wa_message_id": result["messageId"],
-                        "campaign_id": campaign_id,
-                        "status": "sent",
-                        "template_name": template_str,
-                        "created_at": now,
-                    },
-                    conn,
-                )
-        else:
-            err = result.get("error", "Unknown error")
-            async with transaction() as conn:
-                await _db_recipients.update_status(
-                    tenant_id,
-                    campaign_id,
-                    phone,
-                    "failed",
-                    error_message=err,
-                    conn=conn,
-                )
-                await _db_counters.increment(tenant_id, campaign_id, "failed", conn=conn)
-            log_event("send_fail", tenant_id=tenant_id, campaign_id=campaign_id,
-                      phone=phone, detail=err, level="WARN")
-    except Exception as exc:
-        err = str(exc)
-        async with transaction() as conn:
-            await _db_recipients.update_status(
-                tenant_id,
-                campaign_id,
-                phone,
-                "failed",
-                error_message=err,
-                conn=conn,
-            )
-            await _db_counters.increment(tenant_id, campaign_id, "failed", conn=conn)
-        log_event("send_fail", tenant_id=tenant_id, campaign_id=campaign_id,
-                  phone=phone, detail=err, level="WARN")
-
-
-async def _process_campaign(campaign_id: str, tenant_id: str):
-    """Process a bulk campaign from database records."""
-    if campaign_id in _worker_locks:
-        log_event("campaign_skip", campaign_id=campaign_id, detail="already processing")
-        return
-
-    _worker_locks.add(campaign_id)
-    try:
-        campaign = await _db_campaigns.get(tenant_id, campaign_id)
-        if not campaign:
-            log_event("campaign_abort", campaign_id=campaign_id, detail="not found in database", level="WARN")
-            return
-
-        template_str = campaign.get("template_name")
-        delay_ms = campaign.get("delay_ms", 1000)
-        header_image_url = campaign.get("header_image_url", "")
-
-        await _db_campaigns.update_status(tenant_id, campaign_id, "running")
-        await _db_campaigns.update_heartbeat(tenant_id, campaign_id)
-
-        active_campaigns[campaign_id] = {"running": True, "tenant_id": tenant_id}
-
-        settings = await get_settings(tenant_id)
-        if not settings.get("phone_number_id") or not settings.get("access_token"):
-            log_event("campaign_abort", tenant_id=tenant_id, campaign_id=campaign_id,
-                      detail="WhatsApp not configured", level="ERROR")
-            await _db_campaigns.update_status(tenant_id, campaign_id, "failed", error_message="WhatsApp not configured")
-            active_campaigns.pop(campaign_id, None)
-            return
-
-        whatsapp = WhatsAppService(settings["phone_number_id"], settings["access_token"])
-
-        log_event("campaign_process", tenant_id=tenant_id, campaign_id=campaign_id,
-                  detail=f"template={template_str}")
-        # Ensure template metadata is cached (tenant-scoped)
-        await _ensure_template_cached(template_str, whatsapp, settings, tenant_id=tenant_id)
-
-        # Auto-upload template header media
-        header_media_id = await _upload_header_media(template_str, whatsapp, tenant_id=tenant_id)
-
-        try:
-            while True:
-                # Check BOTH local and DB stop signals (multi-worker safe)
-                local_running = active_campaigns.get(campaign_id, {}).get("running", False)
-                if not local_running:
-                    await _db_campaigns.update_status(tenant_id, campaign_id, "stopped")
-                    break
-
-                # Also check DB status for cross-worker stop signals
-                db_campaign = await _db_campaigns.get(tenant_id, campaign_id)
-                if db_campaign and db_campaign.get("status") == "stopped":
-                    log_event("campaign_stopped_remote", campaign_id=campaign_id,
-                              detail="stop signal from another worker")
-                    break
-
-                await _db_campaigns.update_heartbeat(tenant_id, campaign_id)
-
-                pending = await _db_recipients.get_pending(tenant_id, campaign_id, limit=BATCH_SIZE)
-                if not pending:
-                    await _db_campaigns.update_status(tenant_id, campaign_id, "completed")
-                    break
-
-                tasks = [
-                    _send_one(whatsapp, contact, template_str, campaign_id, tenant_id,
-                              header_image_url=header_image_url,
-                              header_media_id=header_media_id)
-                    for contact in pending
-                ]
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-                await asyncio.sleep(delay_ms / 1000)
-
-            log_event("campaign_complete", tenant_id=tenant_id, campaign_id=campaign_id)
-
-        except Exception as exc:
-            log_event("campaign_error", tenant_id=tenant_id, campaign_id=campaign_id,
-                      detail=str(exc), level="ERROR")
-            await _db_campaigns.update_status(tenant_id, campaign_id, "failed", error_message=str(exc))
-
-    finally:
-        active_campaigns.pop(campaign_id, None)
-        _worker_locks.discard(campaign_id)
 
 
 async def periodical_scheduler():

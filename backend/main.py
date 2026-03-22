@@ -1,7 +1,8 @@
-"""WappFlow Backend – FastAPI entry point (Phase-6: hardened).
+"""WappFlow Backend – FastAPI entry point (Phase-7: rate-limited).
 
-CORS from environment, rate limiting, lifespan-based startup/shutdown,
-deep health checks, and graceful campaign shutdown.
+Redis-backed API rate limiting, CORS from environment,
+lifespan-based startup/shutdown, deep health checks,
+and graceful campaign shutdown.
 """
 
 import os
@@ -34,6 +35,7 @@ from database import init_db_pool, close_db_pool, ping
 # Firebase Auth middleware — enforces tenant_id on every non-public route
 from auth_middleware import FirebaseAuthMiddleware
 from observability import log_event
+from rate_limit import get_redis, close_redis, redis_health_check, RateLimitMiddleware
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -105,6 +107,10 @@ async def lifespan(app: FastAPI):
     # ── STARTUP ──
     await init_db_pool()
 
+    # Initialize shared Redis connection for rate limiting
+    await get_redis()
+    log_event("redis_rate_limiter", status="connected")
+
     from startup_cache import prewarm_cache
     await prewarm_cache()
 
@@ -149,6 +155,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log_event("shutdown_error", detail=str(e), level="ERROR")
 
+    await close_redis()
     await close_db_pool()
 
     log_event("app_shutdown", status="complete")
@@ -175,6 +182,7 @@ app = FastAPI(
             allow_headers=["*"],
         ),
         Middleware(FirebaseAuthMiddleware),
+        Middleware(RateLimitMiddleware),
     ],
 )
 
@@ -212,6 +220,18 @@ async def health_check():
             overall = "degraded"
     except Exception as e:
         checks["postgres"] = f"error: {str(e)[:80]}"
+        overall = "degraded"
+
+    # Check Redis
+    try:
+        redis_ok = await redis_health_check()
+        if redis_ok:
+            checks["redis"] = "ok"
+        else:
+            checks["redis"] = "unavailable"
+            overall = "degraded"
+    except Exception as e:
+        checks["redis"] = f"error: {str(e)[:80]}"
         overall = "degraded"
 
     # Check background tasks

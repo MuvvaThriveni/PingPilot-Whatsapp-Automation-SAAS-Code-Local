@@ -24,6 +24,10 @@ from services.template_builder import (
     get_template_keys_for_tenant as _get_template_keys_for_tenant,
 )
 from observability import log_event
+from rate_limit import (
+    tenant_token_bucket_consume,
+    is_global_cooldown_active,
+)
 from db_layer.campaigns import campaigns as _db_campaigns
 from db_layer.campaign_recipients import campaign_recipients as _db_recipients
 from db_layer.campaign_counters import campaign_counters as _db_counters
@@ -45,7 +49,7 @@ def _is_uuid(s: str) -> bool:
 
 
 async def _maybe_finalize_campaign(tenant_id: str, campaign_id: str, max_attempts: int = 5):
-    if not campaign_id or campaign_id == "webhook":
+    if not campaign_id or campaign_id in ("webhook", "file_forward"):
         return
     if not _is_uuid(campaign_id):
         return
@@ -179,6 +183,10 @@ async def process_message_job(job: Job, token: str):
     template_name = data.get("template_name", "")
     message_text = data.get("message_text", "")
     extra_vars = data.get("template_variables", {})
+    media_id = data.get("media_id", "")
+    media_type = data.get("media_type", "")
+    media_filename = data.get("media_filename", "file")
+    media_caption = data.get("media_caption", "")
     idempotency_key = data.get("idempotency_key")
     job_opts = getattr(job, "opts", None) or {}
     try:
@@ -190,10 +198,10 @@ async def process_message_job(job: Job, token: str):
 
     # Old/stale jobs may carry non-UUID campaign IDs (e.g. "camp1").
     # Avoid DB errors from UUID casts by treating such values as "no campaign".
-    if campaign_id and campaign_id != "webhook" and not _is_uuid(campaign_id):
+    if campaign_id and campaign_id not in ("webhook", "file_forward") and not _is_uuid(campaign_id):
         campaign_id = ""
     
-    if campaign_id and campaign_id != "webhook":
+    if campaign_id and campaign_id not in ("webhook", "file_forward"):
         campaign = await _db_campaigns.get(tenant_id, campaign_id)
         if not campaign:
             logger.warning(f"Campaign not found: {campaign_id}")
@@ -299,17 +307,61 @@ async def process_message_job(job: Job, token: str):
             await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
             return "skipped"
 
+    # ── Adaptive global cooldown check ──────────────────────────────
+    # If WhatsApp has been returning 429s, all workers pause briefly.
+    try:
+        if await is_global_cooldown_active():
+            log_event(
+                "worker_global_cooldown",
+                tenant_id=tenant_id,
+                campaign_id=campaign_id,
+                phone=phone,
+                detail="global cooldown active, delaying job",
+                level="WARN",
+            )
+            raise RuntimeError("global_cooldown_active")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass  # Redis failure — proceed without throttling
+
+    # ── Tenant token bucket check ─────────────────────────────────────
+    # Ensures per-tenant fairness (default 10 msg/sec, burst 20).
+    try:
+        allowed = await tenant_token_bucket_consume(tenant_id)
+        if not allowed:
+            log_event(
+                "worker_tenant_throttled",
+                tenant_id=tenant_id,
+                campaign_id=campaign_id,
+                phone=phone,
+                detail="tenant token bucket exhausted, delaying job",
+                level="WARN",
+            )
+            # Raise to trigger BullMQ retry with backoff (500ms–1s)
+            raise RuntimeError("tenant_rate_limited")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass  # Redis failure — proceed without throttling
+
     settings = await get_settings(tenant_id)
     if not settings.get("phone_number_id") or not settings.get("access_token"):
         raise ValueError("WhatsApp not configured")
         
     whatsapp = WhatsAppService(settings["phone_number_id"], settings["access_token"])
     
-    if campaign_id and campaign_id != "webhook":
+    if campaign_id and campaign_id not in ("webhook", "file_forward"):
         log_event("worker_send_prepare", tenant_id=tenant_id, campaign_id=campaign_id, phone=phone)
     
     try:
-        if template_name:
+        if media_id:
+            # File-forward job: send pre-uploaded media (image or document)
+            if media_type == "image":
+                result = await whatsapp.send_image(phone, media_id, media_caption)
+            else:
+                result = await whatsapp.send_document(phone, media_id, media_filename, media_caption)
+        elif template_name:
             resolved_template_key, found_tpl = await _resolve_template_key(template_name, whatsapp, settings, tenant_id)
             if not found_tpl:
                 log_event(
@@ -320,7 +372,7 @@ async def process_message_job(job: Job, token: str):
                     detail=f"template={template_name}",
                     level="WARN",
                 )
-                if campaign_id and campaign_id != "webhook":
+                if campaign_id and campaign_id not in ("webhook", "file_forward"):
                     async with transaction() as conn:
                         failed_ok = await _db_recipients.transition_processing_to_failed(
                             tenant_id,
@@ -365,7 +417,7 @@ async def process_message_job(job: Job, token: str):
             wa_message_id = result["messageId"]
             logger.info(f"Send success campaign={campaign_id} phone={phone} wa_id={wa_message_id}")
             
-            if campaign_id and campaign_id != "webhook":
+            if campaign_id and campaign_id not in ("webhook", "file_forward"):
                 try:
                     async with transaction() as conn:
                         submitted_ok = await _db_recipients.transition_processing_to_submitted(
@@ -381,7 +433,7 @@ async def process_message_job(job: Job, token: str):
                             tenant_id,
                             {
                                 "direction": "outgoing",
-                                "product_type": "bulk_message" if campaign_id != "webhook" else "chatbot",
+                                "product_type": "bulk_message" if campaign_id not in ("webhook", "file_forward") else "chatbot",
                                 "contact_phone": phone,
                                 "message_type": "template" if template_name else "text",
                                 "wa_message_id": wa_message_id,
@@ -453,19 +505,34 @@ async def process_message_job(job: Job, token: str):
                             level="ERROR",
                         )
             else:
+                # Determine product_type for webhook, file_forward, or other non-campaign sends
+                if campaign_id == "file_forward":
+                    _product_type = "file_forward_bulk"
+                    _msg_type = media_type if media_id else ("template" if template_name else "text")
+                elif campaign_id == "webhook":
+                    _product_type = "chatbot"
+                    _msg_type = "template" if template_name else "text"
+                else:
+                    _product_type = "bulk_message"
+                    _msg_type = "template" if template_name else "text"
                 await _db_messages.add(tenant_id, {
                     "direction": "outgoing",
-                    "product_type": "bulk_message" if campaign_id != "webhook" else "chatbot",
+                    "product_type": _product_type,
                     "contact_phone": phone,
-                    "message_type": "template" if template_name else "text",
+                    "message_type": _msg_type,
                     "wa_message_id": wa_message_id,
-                    "campaign_id": campaign_id if campaign_id != "webhook" else "",
+                    "media_id": media_id if media_id else None,
+                    "campaign_id": campaign_id if campaign_id not in ("webhook", "file_forward") else "",
                     "status": "sent",
                     "template_name": template_name,
                     "created_at": now,
                 })
+                if campaign_id == "file_forward":
+                    from db_layer.usage_events import usage_events as _db_usage_ff
+                    await _db_usage_ff.record(tenant_id, "message_sent", "file_forward_bulk",
+                                              contact_phone=phone)
             
-            if campaign_id and campaign_id != "webhook":
+            if campaign_id and campaign_id not in ("webhook", "file_forward"):
                 await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
 
             if campaign_id == "webhook":
@@ -490,7 +557,7 @@ async def process_message_job(job: Job, token: str):
             # Non-retryable error: template missing / translation missing.
             non_retryable = "132001" in err or "Template name does not exist" in err
 
-            if campaign_id and campaign_id != "webhook":
+            if campaign_id and campaign_id not in ("webhook", "file_forward"):
                 async with transaction() as conn:
                     await _db_recipients.transition_processing_to_queued(
                         tenant_id,
@@ -509,7 +576,7 @@ async def process_message_job(job: Job, token: str):
                     detail=err,
                     level="WARN",
                 )
-                if campaign_id and campaign_id != "webhook":
+                if campaign_id and campaign_id not in ("webhook", "file_forward"):
                     async with transaction() as conn:
                         failed_ok = await _db_recipients.mark_failed(
                             tenant_id,
@@ -526,7 +593,7 @@ async def process_message_job(job: Job, token: str):
             raise RuntimeError(f"WhatsApp API Error: {err}")
             
     except Exception as e:
-        if campaign_id and campaign_id != "webhook":
+        if campaign_id and campaign_id not in ("webhook", "file_forward"):
             async with transaction() as conn:
                 await _db_recipients.transition_processing_to_queued(
                     tenant_id,
@@ -553,7 +620,7 @@ async def on_failed_message(job: Job, error: Exception):
     if job.attemptsMade >= job.opts.get("attempts", 5):
         # Final failure
         logger.error(f"Job {job.id} reached max retries. Moving to Dead Letter Queue.")
-        if campaign_id and campaign_id != "webhook":
+        if campaign_id and campaign_id not in ("webhook", "file_forward"):
             tenant_id = job.data.get("tenant_id")
             async with transaction() as conn:
                 failed_ok = await _db_recipients.mark_failed(

@@ -1,15 +1,15 @@
-"""File Forwarding routes – single and bulk (Phase-6: hardened).
+"""File Forwarding routes – single and bulk (Phase-7: queue-unified).
 
 Fixes:
 - File upload size limit (16MB)
 - Contact deduplication before bulk send
 - UTC timestamps
 - Phone number normalization with country code support
+- Bulk sends routed through message_queue for unified rate limiting
 """
 
 import io
-import datetime
-import asyncio
+import uuid
 from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from utils.time_utils import get_ist_now_iso
@@ -17,6 +17,7 @@ import pandas as pd
 
 from store import get_settings
 from services.whatsapp import WhatsAppService
+from services.queue_manager import enqueue_file_forward
 from db_layer.messages import messages as _db_messages
 from db_layer.usage_events import usage_events as _db_usage
 from observability import log_event
@@ -184,7 +185,12 @@ async def send_file_bulk(
     contactsFile: UploadFile = File(...),
     message: str = Form(""),
 ):
-    """Send a file to multiple recipients from an Excel/CSV contact list."""
+    """Send a file to multiple recipients from an Excel/CSV contact list.
+
+    Media is uploaded once, then individual send jobs are enqueued into
+    the message_queue for unified rate limiting, retry, and observability.
+    Returns immediately — delivery is asynchronous.
+    """
     tenant_id = request.state.tenant_id
     settings = await get_settings(tenant_id)
     if not settings["is_configured"]:
@@ -224,55 +230,35 @@ async def send_file_bulk(
 
     media_id = upload_result["mediaId"]
     is_image = content_type.startswith("image/")
+    media_type = "image" if is_image else "document"
 
-    sent_count = 0
-    failed_count = 0
-
-    async def send_to_contact(contact):
-        nonlocal sent_count, failed_count
+    # Enqueue individual send jobs through the unified message_queue
+    enqueued_count = 0
+    batch_id = str(uuid.uuid4())[:8]
+    for contact in contacts:
         phone = contact["phone"]
-        now = _ist_now()
+        job_id = f"ff_{batch_id}_{phone}"
+        try:
+            await enqueue_file_forward(
+                job_id=job_id,
+                tenant_id=tenant_id,
+                phone_number=phone,
+                media_id=media_id,
+                media_type=media_type,
+                filename=file_name,
+                caption=message,
+            )
+            enqueued_count += 1
+        except Exception as e:
+            log_event("file_forward_enqueue_error", tenant_id=tenant_id,
+                      phone=phone, detail=str(e), level="WARN")
 
-        if is_image:
-            result = await whatsapp.send_image(phone, media_id, message)
-        else:
-            result = await whatsapp.send_document(phone, media_id, file_name, message)
-
-        msg_type = "image" if is_image else "document"
-        if result["success"]:
-            sent_count += 1
-            await _db_messages.add(tenant_id, {
-                "direction": "outgoing", "product_type": "file_forward_bulk",
-                "contact_phone": phone, "message_type": msg_type,
-                "wa_message_id": result["messageId"],
-                "media_id": media_id, "status": "sent", "created_at": now,
-            })
-            await _db_usage.record(tenant_id, "message_sent", "file_forward_bulk",
-                                   contact_phone=phone)
-        else:
-            failed_count += 1
-            await _db_messages.add(tenant_id, {
-                "direction": "outgoing", "product_type": "file_forward_bulk",
-                "contact_phone": phone, "message_type": msg_type,
-                "media_id": media_id, "status": "failed",
-                "error_message": result["error"], "created_at": now,
-            })
-
-    # Process in batches of 10
-    batch_size = 10
-    for i in range(0, len(contacts), batch_size):
-        batch = contacts[i : i + batch_size]
-        await asyncio.gather(*[send_to_contact(c) for c in batch])
-        if i + batch_size < len(contacts):
-            await asyncio.sleep(1)  # Rate limit delay
-
-    log_event("file_forward_bulk_done", tenant_id=tenant_id,
-              detail=f"sent={sent_count} failed={failed_count} total={len(contacts)}")
+    log_event("file_forward_bulk_queued", tenant_id=tenant_id,
+              detail=f"queued={enqueued_count} total={len(contacts)}")
 
     return {
         "success": True,
-        "message": f"File sent to {sent_count} recipients, {failed_count} failed",
-        "sent_count": sent_count,
-        "failed_count": failed_count,
+        "message": f"Queued {enqueued_count} of {len(contacts)} recipients for delivery",
+        "queued_count": enqueued_count,
         "total": len(contacts),
     }

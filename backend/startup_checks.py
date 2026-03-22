@@ -43,6 +43,27 @@ def _check_whatsapp_api_version() -> list[str]:
     return errors
 
 
+def _check_redis() -> list[str]:
+    """Verify Redis configuration is present."""
+    errors: list[str] = []
+    redis_url = os.getenv("REDIS_URL", "")
+    redis_host = os.getenv("REDIS_HOST", "")
+    if not redis_url and not redis_host:
+        log_event(
+            "startup_warn",
+            detail="Neither REDIS_URL nor REDIS_HOST is set; defaulting to localhost:6379",
+            level="WARN",
+        )
+    if redis_url:
+        scheme = redis_url.split("://")[0] if "://" in redis_url else ""
+        if scheme not in ("redis", "rediss", "redis+ssl"):
+            errors.append(
+                f"REDIS_URL has unsupported scheme '{scheme}'. "
+                "Expected redis://, rediss://, or redis+ssl://."
+            )
+    return errors
+
+
 def validate_environment(*, strict: bool = True) -> None:
     """Run all startup checks. If strict=True, exit on fatal errors."""
     log_event("startup_validate", detail="running environment checks")
@@ -50,6 +71,7 @@ def validate_environment(*, strict: bool = True) -> None:
     all_errors: list[str] = []
     all_errors.extend(_check_firebase())
     all_errors.extend(_check_whatsapp_api_version())
+    all_errors.extend(_check_redis())
 
     for err in all_errors:
         log_event("startup_error", detail=err, level="ERROR")
