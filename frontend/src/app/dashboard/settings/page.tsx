@@ -36,7 +36,7 @@ export default function SettingsPage() {
 
   const webhookUrl = useMemo(() => {
     if (!user?.uid) return ''
-    const base = (process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:5000').replace(/\/+$/, '')
+    const base = (process.env.NEXT_PUBLIC_API_BASE_URL || '').replace(/\/+$/, '')
     return `${base}/api/webhook/${user.uid}`
   }, [user?.uid])
 
