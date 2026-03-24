@@ -15,12 +15,16 @@ import hmac
 import hashlib
 import datetime
 import uuid
-from fastapi import APIRouter, Query, Request
+import logging
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+
+logger = logging.getLogger(__name__)
 
 from utils.time_utils import get_ist_now_iso
 
 from store import get_settings, get_chatbot_settings
+from db_layer.encryption import decrypt_secret
 from services.whatsapp import WhatsAppService
 from services.template_builder import (
     ensure_cached as _ensure_template_cached,
@@ -108,45 +112,47 @@ async def _resolve_tenant_from_payload_async(value: dict) -> str | None:
     return None
 
 
-# ── Webhook verify token ─────────────────────────────────────────────
-_raw_verify_token: str = os.environ.get("WEBHOOK_VERIFY_TOKEN", "")
-if not _raw_verify_token:
-    raise RuntimeError(
-        "[FATAL] WEBHOOK_VERIFY_TOKEN is not set in .env. "
-        "Generate a strong secret and add it to backend/.env before starting the server."
-    )
-VERIFY_TOKEN: str = _raw_verify_token
-
-# ── Meta App Secret for webhook signature verification ───────────────
-META_APP_SECRET: str = os.environ.get("META_APP_SECRET", "")
-if not META_APP_SECRET:
+# ── Webhook verify token (LEGACY — used only by GET /api/webhook) ────
+# Per-tenant tokens stored in the DB are the preferred mechanism.
+# This env var is kept for backward compatibility with the legacy route.
+VERIFY_TOKEN: str = os.environ.get("WEBHOOK_VERIFY_TOKEN", "")
+if not VERIFY_TOKEN:
     log_event("startup_warn", level="WARN",
-              detail="META_APP_SECRET not set — webhook signature verification DISABLED. "
-                     "Set this in production to prevent forged webhooks.")
+              detail="WEBHOOK_VERIFY_TOKEN not set — legacy GET /api/webhook verification "
+                     "will only match per-tenant tokens from DB. "
+                     "This is fine if all tenants use /api/webhook/{tenant_id}.")
 
 
-def _verify_webhook_signature(request_body: bytes, signature_header: str | None) -> bool:
-    """Verify X-Hub-Signature-256 from Meta webhook payload.
+def _verify_per_tenant_signature(
+    request_body: bytes, signature_header: str | None, app_secret: str
+) -> bool:
+    """Verify X-Hub-Signature-256 using a per-tenant Meta App Secret.
 
-    Returns True if signature is valid OR if META_APP_SECRET is not configured
-    (for backward compatibility during migration).
+    Secure per-tenant verification:
+      - Requires a valid app_secret (no fallback / skip)
+      - Uses constant-time comparison (hmac.compare_digest)
+      - Is called BEFORE JSON parsing for security
+
+    Returns True only if the signature is valid.
     """
-    if not META_APP_SECRET:
-        # Not configured — skip verification (log warning at startup)
-        return True
-
-    if not signature_header:
-        log_event("webhook_sig_missing", level="WARN", detail="No X-Hub-Signature-256 header")
+    if not app_secret:
+        log_event("webhook_sig_no_secret", level="WARN",
+                  detail="Per-tenant meta_app_secret not configured")
         return False
 
-    # Header format: "sha256=<hex_digest>"
+    if not signature_header:
+        log_event("webhook_sig_missing", level="WARN",
+                  detail="No X-Hub-Signature-256 header (per-tenant)")
+        return False
+
     if not signature_header.startswith("sha256="):
-        log_event("webhook_sig_invalid", level="WARN", detail="Signature header malformed")
+        log_event("webhook_sig_invalid", level="WARN",
+                  detail="Signature header malformed (per-tenant)")
         return False
 
     expected_sig = signature_header[7:]  # Strip "sha256=" prefix
     computed_sig = hmac.new(
-        META_APP_SECRET.encode("utf-8"),
+        app_secret.encode("utf-8"),
         request_body,
         hashlib.sha256,
     ).hexdigest()
@@ -208,14 +214,17 @@ async def verify_webhook(
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
     hub_challenge: str = Query(None, alias="hub.challenge"),
 ):
-    """Verify webhook for Meta/WhatsApp.
+    """DEPRECATED: This route will be removed in a future release.
+    Use GET /api/webhook/{tenant_id} instead.
 
     Accepts the token if:
-      1. It matches WEBHOOK_VERIFY_TOKEN from .env, OR
+      1. It matches WEBHOOK_VERIFY_TOKEN from .env (if set), OR
       2. It matches a tenant's webhook_verify_token stored in the database.
 
     Returns the hub.challenge as plain text on success — required by Meta.
     """
+    # TODO: Remove this route in Phase 8 after migration is complete
+    logger.warning("DEPRECATED: GET /api/webhook used — migrate to GET /api/webhook/{tenant_id}")
     log_event("webhook_verify", detail=f"mode={hub_mode}")
 
     if hub_mode != "subscribe" or not hub_verify_token:
@@ -223,8 +232,8 @@ async def verify_webhook(
                   detail="Missing hub.mode or hub.verify_token")
         return JSONResponse(status_code=403, content={"error": "Verification failed"})
 
-    # ── Check 1: env-configured token ───────────────────────────────
-    if hmac.compare_digest(hub_verify_token, VERIFY_TOKEN):
+    # ── Check 1: env-configured token (legacy fallback) ──────────────
+    if VERIFY_TOKEN and hmac.compare_digest(hub_verify_token, VERIFY_TOKEN):
         log_event("webhook_verify", status="success", detail="env token matched")
         return PlainTextResponse(content=hub_challenge or "")
 
@@ -242,6 +251,7 @@ async def verify_webhook(
     return JSONResponse(status_code=403, content={"error": "Verification failed"})
 
 
+# TODO: Remove this route in Phase 8 after migration is complete
 @router.get("/")
 async def verify_webhook_slash(
     hub_mode: str = Query(None, alias="hub.mode"),
@@ -251,44 +261,31 @@ async def verify_webhook_slash(
     return await verify_webhook(hub_mode, hub_verify_token, hub_challenge)
 
 
-# ── POST: Handle incoming webhook ────────────────────────────────────
+# ── Shared webhook processing logic ────────────────────────────────────
 
-@router.post("")
-async def handle_webhook(request: Request):
-    """Process incoming webhook from Meta/WhatsApp.
+async def _process_webhook_body(body: dict, tenant_id_override: str | None = None):
+    """Process a parsed webhook body.
 
-    Security: Verifies X-Hub-Signature-256 before processing.
+    When tenant_id_override is provided (per-tenant route), it is used directly.
+    When None (legacy route), the tenant is resolved from the payload phone_number_id.
     """
-    # ── Step 0: Verify webhook signature ─────────────────────────────
-    raw_body = await request.body()
-    signature = request.headers.get("X-Hub-Signature-256")
-
-    if not _verify_webhook_signature(raw_body, signature):
-        log_event("webhook_sig_rejected", level="WARN",
-                  detail="Invalid or missing webhook signature — request rejected")
-        return JSONResponse(status_code=401, content={"error": "Invalid signature"})
-
-    # Parse the body as JSON
-    import json
-    try:
-        body = json.loads(raw_body)
-    except json.JSONDecodeError:
-        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
-
-    log_event("webhook_receive")
-
     for entry in body.get("entry", []):
         for change in entry.get("changes", []):
             if change.get("field") != "messages":
                 continue
             value = change.get("value", {})
 
-            # Resolve tenant from phone_number_id in payload
-            tenant_id = await _resolve_tenant_from_payload_async(value)
-            if not tenant_id:
-                phone_number_id = value.get("metadata", {}).get("phone_number_id", "")
-                log_event("webhook_no_tenant", detail=f"phone_number_id={phone_number_id}", level="WARN")
-                continue
+            # Resolve tenant
+            if tenant_id_override:
+                tenant_id = tenant_id_override
+            else:
+                tenant_id = await _resolve_tenant_from_payload_async(value)
+                if not tenant_id:
+                    phone_number_id = value.get("metadata", {}).get("phone_number_id", "")
+                    log_event("webhook_no_tenant", detail=f"phone_number_id={phone_number_id}", level="WARN")
+                    continue
+
+            logger.info(f"[WEBHOOK] tenant_id={tenant_id}")
 
             settings = await get_settings(tenant_id)
             chatbot = await get_chatbot_settings(tenant_id)
@@ -298,6 +295,7 @@ async def handle_webhook(request: Request):
                 wa_msg_id = status_obj.get("id", "")
                 new_status = status_obj.get("status", "")
                 if wa_msg_id and new_status:
+                    logger.info(f"[WEBHOOK] tenant_id={tenant_id} event=status status={new_status}")
                     await _db_messages.update_status(wa_msg_id, new_status, tenant_id)
 
                     outgoing = await _db_messages.get_outgoing_by_wa_message_id(tenant_id, wa_msg_id)
@@ -402,6 +400,7 @@ async def handle_webhook(request: Request):
                             await _maybe_finalize_campaign(tenant_id, campaign_id_str, max_attempts=max_attempts)
 
             for message in value.get("messages", []):
+                logger.info(f"[WEBHOOK] tenant_id={tenant_id} event=message type={message.get('type', 'text')}")
                 wa_message_id = message.get("id", "")
                 sender_phone = message.get("from", "")
                 sender_name = (
@@ -555,9 +554,115 @@ async def handle_webhook(request: Request):
                 if wa_message_id:
                     await _db_webhook.mark_processed(tenant_id, wa_message_id)
 
+
+# ── POST: Handle incoming webhook (legacy) ─────────────────────────────
+
+@router.post("")
+async def handle_webhook(request: Request):
+    """DEPRECATED: This route will be removed in a future release.
+    Use POST /api/webhook/{tenant_id} instead.
+
+    This route has NO signature validation — kept for backward compatibility.
+    """
+    # TODO: Remove this route in Phase 8 after migration is complete
+    logger.warning("DEPRECATED: POST /api/webhook used — migrate to POST /api/webhook/{tenant_id}")
+    raw_body = await request.body()
+
+    import json
+    try:
+        body = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
+    log_event("webhook_receive")
+    await _process_webhook_body(body)
     return {"status": "ok"}
 
 
+# TODO: Remove this route in Phase 8 after migration is complete
 @router.post("/")
 async def handle_webhook_slash(request: Request):
     return await handle_webhook(request)
+
+
+# ── Per-tenant webhook routes ──────────────────────────────────────────
+
+@router.get("/{tenant_id}")
+async def verify_webhook_per_tenant(
+    tenant_id: str,
+    request: Request,
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+):
+    """Meta webhook verification for a specific tenant.
+
+    Meta sends:
+      GET /api/webhook/{tenant_id}?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
+
+    Returns the hub.challenge as plain text if the verify token matches
+    the tenant's stored webhook_verify_token.
+    """
+    if hub_mode != "subscribe" or not hub_verify_token:
+        log_event("webhook_verify_tenant", tenant_id=tenant_id, status="failed", level="WARN",
+                  detail="Missing hub.mode or hub.verify_token")
+        return JSONResponse(status_code=403, content={"error": "Verification failed"})
+
+    # Look up tenant
+    tenant = await _db_tenants.get(tenant_id)
+    if not tenant:
+        log_event("webhook_verify_tenant", detail=f"tenant_id={tenant_id} not found", level="WARN")
+        return JSONResponse(status_code=404, content={"error": "Tenant not found"})
+
+    # Compare verify token (constant-time)
+    stored_token = tenant.get("webhook_verify_token", "")
+    if not stored_token or not hmac.compare_digest(hub_verify_token, stored_token):
+        log_event("webhook_verify_tenant", tenant_id=tenant_id, status="failed", level="WARN",
+                  detail="verify_token mismatch")
+        return JSONResponse(status_code=403, content={"error": "Verification failed"})
+
+    log_event("webhook_verify_tenant", tenant_id=tenant_id, status="success")
+    return PlainTextResponse(content=hub_challenge or "")
+
+
+@router.post("/{tenant_id}")
+async def handle_webhook_per_tenant(tenant_id: str, request: Request):
+    """Per-tenant webhook endpoint.
+
+    SECURE FLOW:
+      1. Read raw body (before any JSON parsing)
+      2. Look up tenant
+      3. Decrypt per-tenant meta_app_secret
+      4. Verify X-Hub-Signature-256
+      5. Parse JSON and process webhook payload
+    """
+    # ── Step 1: Read raw body BEFORE parsing ─────────────────────────
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256")
+
+    # ── Step 2: Look up tenant ───────────────────────────────────────
+    tenant = await _db_tenants.get(tenant_id)
+    if not tenant:
+        log_event("webhook_tenant_not_found", detail=f"tenant_id={tenant_id}", level="WARN")
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # ── Step 3: Decrypt per-tenant meta_app_secret ───────────────────
+    encrypted_secret = tenant.get("meta_app_secret", "")
+    app_secret = decrypt_secret(encrypted_secret) if encrypted_secret else ""
+
+    # ── Step 4: Verify signature ─────────────────────────────────────
+    if not _verify_per_tenant_signature(raw_body, signature, app_secret):
+        log_event("webhook_sig_rejected", tenant_id=tenant_id, level="WARN",
+                  detail="Invalid or missing webhook signature — request rejected")
+        return JSONResponse(status_code=401, content={"error": "Invalid signature"})
+
+    # ── Step 5: Parse JSON and process ───────────────────────────────
+    import json
+    try:
+        body = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
+    log_event("webhook_per_tenant", tenant_id=tenant_id, detail="signature verified, processing")
+    await _process_webhook_body(body, tenant_id_override=tenant_id)
+    return {"status": "ok", "tenant_id": tenant_id}

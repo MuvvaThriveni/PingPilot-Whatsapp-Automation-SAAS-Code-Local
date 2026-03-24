@@ -18,6 +18,7 @@ _is_production = os.environ.get("ENVIRONMENT", "development").lower() == "produc
 # Paths that never require authentication
 _PUBLIC_PREFIXES = (
     "/api/webhook",
+    "/webhook",
     "/api/health",
 )
 

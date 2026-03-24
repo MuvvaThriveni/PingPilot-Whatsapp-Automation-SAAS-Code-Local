@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS tenants (
   access_token TEXT NOT NULL DEFAULT '',
   token_ref TEXT NOT NULL DEFAULT '',
   webhook_verify_token TEXT NOT NULL DEFAULT '',
+  meta_app_secret TEXT NOT NULL DEFAULT '',
   is_configured BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

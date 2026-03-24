@@ -18,6 +18,7 @@ from db_layer.chatbot import chatbot_config as _db_chatbot_config, chatbot_rules
 from db_layer.chat_messages import chat_messages as _db_chat_messages
 from db_layer.messages import messages as _db_messages
 from db_layer.secrets import secrets as _secrets
+from db_layer.encryption import encrypt_secret
 
 # Cache layer
 from cache import cache, fetch_cached_async, tenant_key, chatbot_config_key, chatbot_rules_key, settings_key
@@ -29,6 +30,7 @@ _DEFAULT_SETTINGS: Dict = {
     "phone_number_id": "",
     "access_token": "",
     "webhook_verify_token": "",
+    "meta_app_secret": "",
     "is_configured": False,
 }
 
@@ -56,6 +58,7 @@ async def get_settings(tenant_id: str) -> Dict:
                 "phone_number_id": tenant.get("phone_number_id", ""),
                 "access_token": token,
                 "webhook_verify_token": tenant.get("webhook_verify_token", ""),
+                "meta_app_secret": tenant.get("meta_app_secret", ""),
                 "is_configured": tenant.get("is_configured", False),
             }
         return dict(_DEFAULT_SETTINGS)
@@ -103,6 +106,8 @@ async def save_settings(tenant_id: str, settings_data: Dict):
     if access_token.lower().startswith("bearer "):
         access_token = access_token[7:].strip()
 
+    meta_app_secret = settings_data.get("meta_app_secret", "").strip()
+
     upsert_data = {
         "business_account_id": settings_data.get("business_account_id", ""),
         "phone_number_id": settings_data.get("phone_number_id", ""),
@@ -115,6 +120,18 @@ async def save_settings(tenant_id: str, settings_data: Dict):
         log_event("settings_saved", tenant_id=tenant_id, detail="token updated")
     else:
         log_event("settings_saved", tenant_id=tenant_id, detail="token preserved (no new value)")
+
+    # Only overwrite meta_app_secret if a new one was explicitly provided
+    if meta_app_secret and meta_app_secret.strip():
+        if not isinstance(meta_app_secret, str):
+            raise ValueError("meta_app_secret must be a string")
+        if meta_app_secret.startswith("enc:"):
+            # Already encrypted → keep as-is
+            upsert_data["meta_app_secret"] = meta_app_secret
+        else:
+            # Plain text → encrypt
+            upsert_data["meta_app_secret"] = encrypt_secret(meta_app_secret)
+        log_event("settings_saved", tenant_id=tenant_id, detail="meta_app_secret updated")
 
     await _db_tenants.upsert(tenant_id, upsert_data)
     # Invalidate cache so next read picks up new values

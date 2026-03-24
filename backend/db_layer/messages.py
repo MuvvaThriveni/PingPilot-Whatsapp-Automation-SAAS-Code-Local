@@ -70,8 +70,8 @@ class _Messages:
                 data.get("status", ""),
                 data.get("template_name", ""),
                 data.get("campaign_id") or None,
-                data.get("media_id", ""),
-                data.get("error_message", ""),
+                data.get("media_id") or "",
+                data.get("error_message") or "",
                 created_at if created_at else None,
             )
             if conn is not None:
@@ -166,8 +166,8 @@ class _Messages:
                 data.get("status", ""),
                 data.get("template_name", ""),
                 data.get("campaign_id") or None,
-                data.get("media_id", ""),
-                data.get("error_message", ""),
+                data.get("media_id") or "",
+                data.get("error_message") or "",
                 created_at if created_at else None,
             )
             if conn is not None:

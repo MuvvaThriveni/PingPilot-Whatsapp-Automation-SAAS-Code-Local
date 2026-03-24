@@ -182,7 +182,7 @@ _HEAVY_ROUTES: tuple[tuple[str, str], ...] = (
 
 # Paths that are never rate-limited
 # /api/webhook is called by WhatsApp servers — rate limiting risks webhook deregistration
-_SKIP_PATHS = ("/api/health", "/docs", "/openapi.json", "/api/webhook")
+_SKIP_PATHS = ("/api/health", "/docs", "/openapi.json", "/api/webhook", "/webhook")
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):

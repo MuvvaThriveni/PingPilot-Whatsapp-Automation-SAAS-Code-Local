@@ -1,6 +1,6 @@
 # WappFlow — Developer API Documentation
 
-> **Version:** 1.2.0  
+> **Version:** 2.0.0 (Phase 9 — Per-Tenant Webhooks & Encryption at Rest)  
 > **Base URL:** `http://localhost:5000/api` (dev) or `https://<your-deployment>/api` (prod)  
 > **Auth:** Firebase ID Token — `Authorization: Bearer <firebase_id_token>`
 
@@ -18,9 +18,11 @@
 8. [Webhook API](#8-webhook-api)
 9. [Rate Limiting](#9-rate-limiting)
 10. [Error Handling](#10-error-handling)
-11. [Environment Variables](#11-environment-variables)
-12. [Local Development Setup](#12-local-development-setup)
-13. [Data Retention & Archive System](#13-data-retention--archive-system)
+11. [Encryption at Rest](#11-encryption-at-rest)
+12. [Environment Variables](#12-environment-variables)
+13. [Local Development Setup](#13-local-development-setup)
+14. [Data Retention & Archive System](#14-data-retention--archive-system)
+15. [Onboarding Quick-Start Guide](#15-onboarding-quick-start-guide)
 
 ---
 
@@ -91,7 +93,7 @@ Prefix: `/api/settings`
 
 `GET /api/settings/whatsapp`
 
-Returns the tenant's WhatsApp Business API configuration. **The access token is never returned.**
+Returns the tenant's WhatsApp Business API configuration. **Secrets (access token, Meta App Secret) are never returned** — only boolean flags indicating whether they are set.
 
 **Response `200`:**
 ```json
@@ -101,7 +103,8 @@ Returns the tenant's WhatsApp Business API configuration. **The access token is 
     "phone_number_id": "987654321",
     "webhook_verify_token": "my_verify_token",
     "is_configured": true,
-    "has_access_token": true
+    "has_access_token": true,
+    "has_meta_app_secret": true
   }
 }
 ```
@@ -118,7 +121,8 @@ Returns the tenant's WhatsApp Business API configuration. **The access token is 
   "business_account_id": "123456789",
   "phone_number_id": "987654321",
   "access_token": "EAAxxxxxxx",
-  "webhook_verify_token": "my_verify_token"
+  "webhook_verify_token": "my_verify_token",
+  "meta_app_secret": "abc123def456"
 }
 ```
 
@@ -128,6 +132,7 @@ Returns the tenant's WhatsApp Business API configuration. **The access token is 
 | `phone_number_id` | string | Yes | Alphanumeric + underscores only |
 | `access_token` | string | No | Omit to keep existing token. `Bearer ` prefix auto-stripped |
 | `webhook_verify_token` | string | No | Token used for Meta webhook verification |
+| `meta_app_secret` | string | No | Per-tenant Meta App Secret for webhook signature verification. Encrypted at rest via Fernet (see [Section 11](#11-encryption-at-rest)). Omit to keep existing value |
 
 **Response `200`:**
 ```json
@@ -761,33 +766,73 @@ Prefix: `/api/logs`
 
 ## 8. Webhook API
 
-Prefix: `/api/webhook` — **No authentication required** (called by Meta servers).
+Prefix: `/api/webhook` — **No Firebase authentication required** (called by Meta servers).
 
-### 8.1 Webhook Verification (Meta handshake)
+WappFlow supports two webhook modes: **per-tenant** (recommended, secure) and **legacy** (deprecated). New deployments should always use per-tenant routes.
 
-`GET /api/webhook`
+### 8.1 Per-Tenant Webhook Verification (Recommended)
 
-Called by Meta during webhook setup. Verifies the token matches either the environment variable `WEBHOOK_VERIFY_TOKEN` or a per-tenant token stored in the database.
+`GET /api/webhook/{tenant_id}`
+
+Called by Meta during webhook setup. Verifies the token matches the tenant's stored `webhook_verify_token` from the database.
 
 **Query Params (set by Meta):**
 - `hub.mode` = `subscribe`
 - `hub.verify_token` = your verification token
 - `hub.challenge` = challenge string
 
-**Response:** Returns `hub.challenge` as plain text on success, `403` on failure.
+**Response:** Returns `hub.challenge` as plain text on success, `403` on failure, `404` if tenant not found.
 
 ---
 
-### 8.2 Incoming Webhook
+### 8.2 Per-Tenant Incoming Webhook (Recommended)
 
-`POST /api/webhook`
+`POST /api/webhook/{tenant_id}`
 
-Receives incoming messages and delivery status updates from WhatsApp.
+Receives incoming messages and delivery status updates from WhatsApp. This is the **secure** endpoint with full signature verification.
 
-- **Signature verification:** `X-Hub-Signature-256` header is validated using `META_APP_SECRET` (if configured).
-- **Deduplication:** Uses `webhook_events` table to prevent duplicate processing.
-- **Message routing:** Incoming text/button messages are matched against chatbot rules and button mappings. Replies are enqueued into the message queue.
-- **Delivery status handling:** Updates message status, triggers campaign finalization, handles retries for failed deliveries.
+**Security flow (in order):**
+1. Read raw body **before** JSON parsing
+2. Look up tenant from the URL path `{tenant_id}`
+3. Decrypt the tenant's `meta_app_secret` (stored encrypted via Fernet — see [Section 11](#11-encryption-at-rest))
+4. Verify `X-Hub-Signature-256` header using HMAC-SHA256 with the decrypted secret (constant-time comparison)
+5. Only then parse JSON and process the payload
+
+**If signature verification fails:** Returns `401 Invalid signature` — the payload is never processed.
+
+**Processing pipeline:**
+- **Deduplication:** Uses `webhook_events` table to prevent duplicate processing
+- **Message routing:** Incoming text/button/interactive messages matched against:
+  1. Per-tenant button→template mappings (configurable in DB, cached 1h)
+  2. Keyword-based chatbot rules (DB-backed)
+  3. First-trigger fallback (24h rate-limited per sender)
+- **Delivery status handling:** Updates message status in `messages` table, triggers campaign finalization, handles retries for failed deliveries with automatic re-enqueue
+- **Archive fallback:** If a message was recently archived, the webhook handler looks up `messages_archive` so delivery callbacks still work
+
+**Response `200`:**
+```json
+{
+  "status": "ok",
+  "tenant_id": "firebase_uid_here"
+}
+```
+
+**Error `401`:**
+```json
+{
+  "error": "Invalid signature"
+}
+```
+
+---
+
+### 8.3 Legacy Webhook Routes (Deprecated)
+
+> ⚠️ **Deprecated** — These routes will be removed in a future release. Migrate to `/api/webhook/{tenant_id}`.
+
+`GET /api/webhook` — Legacy verification. Checks token against `WEBHOOK_VERIFY_TOKEN` env var or any tenant's stored token.
+
+`POST /api/webhook` — Legacy incoming webhook. **No signature verification.** Tenant is resolved from the `phone_number_id` in the payload metadata (requires a lookup against all tenants).
 
 **Response `200`:**
 ```json
@@ -795,6 +840,18 @@ Receives incoming messages and delivery status updates from WhatsApp.
   "status": "ok"
 }
 ```
+
+### 8.4 Webhook Setup Guide (for new tenants)
+
+1. In the WappFlow Settings page, save your `webhook_verify_token` and `meta_app_secret` (from Meta App Dashboard)
+2. In Meta App Dashboard → Webhooks, set the callback URL to:
+   ```
+   https://<your-deployment>/api/webhook/<your_tenant_id>
+   ```
+3. Set the Verify Token to the same value you saved in step 1
+4. Meta will call `GET /api/webhook/{tenant_id}?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`
+5. WappFlow verifies the token and returns the challenge — webhook is now active
+6. All incoming messages and delivery updates will be POSTed to `POST /api/webhook/{tenant_id}` with `X-Hub-Signature-256` verification
 
 ---
 
@@ -864,16 +921,67 @@ All errors follow a consistent structure:
 
 ---
 
-## 11. Environment Variables
+## 11. Encryption at Rest
+
+WappFlow encrypts sensitive secrets (e.g., `meta_app_secret`) before storing them in Postgres using **Fernet symmetric encryption** (AES-128-CBC via the `cryptography` Python library).
+
+### 11.1 How It Works
+
+```
+Tenant saves meta_app_secret via POST /api/settings/whatsapp
+  │
+  ▼
+store.py → encrypt_secret(plain_text)
+  │
+  ├── ENCRYPTION_KEY set? → Fernet.encrypt() → stored as "enc:<ciphertext>"
+  └── ENCRYPTION_KEY not set? → stored as plain text (backward compat)
+
+Webhook receives POST /api/webhook/{tenant_id}
+  │
+  ▼
+webhook.py → decrypt_secret(stored_value)
+  │
+  ├── Starts with "enc:" → Fernet.decrypt() → plain text for HMAC verification
+  ├── No prefix → returned as-is (pre-encryption migration data)
+  └── Empty → returned empty
+```
+
+### 11.2 Key Files
+
+| File | Role |
+|------|------|
+| `db_layer/encryption.py` | `encrypt_secret()` / `decrypt_secret()` — Fernet wrapper with backward compatibility |
+| `db_layer/secrets.py` | `secrets.resolve_wa_token()` — runtime token resolution (DB → env fallback) |
+| `store.py` | Calls `encrypt_secret()` when saving `meta_app_secret` |
+| `routers/webhook.py` | Calls `decrypt_secret()` to verify webhook signatures |
+
+### 11.3 Generating an Encryption Key
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Set the output as `ENCRYPTION_KEY` in your `.env` file. **Keep this key safe** — if lost, encrypted secrets cannot be decrypted.
+
+### 11.4 Backward Compatibility
+
+- Values stored **before** encryption was enabled (plain text) are returned as-is by `decrypt_secret()` — no migration required.
+- If `ENCRYPTION_KEY` is not set, `encrypt_secret()` stores values in plain text and logs a warning.
+- The `"enc:"` prefix distinguishes encrypted values from plain text.
+
+---
+
+## 12. Environment Variables
 
 ### Required
 
 | Variable | Description |
 |----------|-------------|
 | `DATABASE_URL` | Postgres connection string (Neon DB) |
-| `WEBHOOK_VERIFY_TOKEN` | Strong secret for Meta webhook verification |
+| `WEBHOOK_VERIFY_TOKEN` | Strong secret for Meta webhook verification (legacy routes; per-tenant tokens are preferred) |
 | `REDIS_HOST` | Redis hostname (default: `localhost`) |
 | `REDIS_PORT` | Redis port (default: `6379`) |
+| `ENCRYPTION_KEY` | Fernet encryption key for secrets at rest. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 
 ### Required Files
 
@@ -940,7 +1048,7 @@ All errors follow a consistent structure:
 
 ---
 
-## 12. Local Development Setup
+## 13. Local Development Setup
 
 ### Prerequisites
 
@@ -1016,11 +1124,11 @@ Or manually run `backend/schema.sql` against your Postgres database.
 
 ---
 
-## 13. Data Retention & Archive System
+## 14. Data Retention & Archive System
 
 WappFlow includes a **4-phase data lifecycle management system** that keeps live tables small and fast while preserving historical data for compliance and analytics. This section explains the full system so a new developer can understand, operate, and debug it.
 
-### 13.1 Overview — Why This Exists
+### 14.1 Overview — Why This Exists
 
 The four transient tables (`messages`, `chat_messages`, `webhook_events`, `usage_events`) grow continuously as users send messages. Without management, these tables would grow unbounded, slowing down queries, increasing index size, and inflating backup costs. The retention system solves this by:
 
@@ -1028,7 +1136,7 @@ The four transient tables (`messages`, `chat_messages`, `webhook_events`, `usage
 2. **Purging** very old archive rows after a configurable retention period (controlled storage costs)
 3. **Pre-aggregating** message stats so dashboard analytics remain accurate after archival
 
-### 13.2 Architecture Diagram
+### 14.2 Architecture Diagram
 
 ```
  Live Tables                    Archive Tables              Deleted
@@ -1046,7 +1154,7 @@ The four transient tables (`messages`, `chat_messages`, `webhook_events`, `usage
  └─────────────────────┘
 ```
 
-### 13.3 The Four Phases
+### 14.3 The Four Phases
 
 | Phase | What | File | Status |
 |-------|------|------|--------|
@@ -1055,7 +1163,7 @@ The four transient tables (`messages`, `chat_messages`, `webhook_events`, `usage
 | **Phase 3** | Controlled automation — background cron + health monitoring | `main.py` | Complete |
 | **Phase 4** | Archive cleanup — batched purge of old archive rows | `retention.py`, `main.py` | Complete |
 
-### 13.4 How Archiving Works (Phase 2)
+### 14.4 How Archiving Works (Phase 2)
 
 The `archive_old_data()` function in `retention.py` processes each table in batches:
 
@@ -1088,7 +1196,7 @@ For each table (messages, chat_messages, usage_events, webhook_events):
 - `webhook_events`: Uses composite PK `(tenant_id, event_id)` instead of `id` — handled by a separate function with `unnest()` array matching
 - Webhook status updates for archived messages: A fallback lookup in `messages_archive` was added to `routers/webhook.py` (Phase 1) so delivery callbacks for recently-archived messages still work
 
-### 13.5 How Purging Works (Phase 4)
+### 14.5 How Purging Works (Phase 4)
 
 The `purge_old_archives()` function deletes old rows from archive tables using the same batched pattern:
 
@@ -1108,7 +1216,7 @@ For each archive table:
 - Uses `archived_at` (not `created_at`) as the cutoff — only deletes data that has been in the archive for the full retention period
 - Disabled by default (`PURGE_ENABLED=false`)
 
-### 13.6 Background Automation (Phase 3)
+### 14.6 Background Automation (Phase 3)
 
 The `periodic_archive_runner()` in `main.py` runs as a background `asyncio.Task`:
 
@@ -1134,7 +1242,7 @@ Startup → 60s warmup delay → then every RETENTION_INTERVAL_HOURS:
 | No startup blocking | 60s initial warmup delay — app fully serves requests first |
 | Kill switch | `RETENTION_ENABLED=false` / `PURGE_ENABLED=false` — checked every cycle |
 
-### 13.7 Manual CLI Usage
+### 14.7 Manual CLI Usage
 
 For one-off runs or debugging, the retention system can be triggered manually:
 
@@ -1157,7 +1265,7 @@ RETENTION_BATCH_SIZE=10 RETENTION_MAX_BATCHES=1 python retention.py
 PURGE_BATCH_SIZE=10 PURGE_MAX_BATCHES=1 python retention.py --purge-only
 ```
 
-### 13.8 Monitoring & Log Events
+### 14.8 Monitoring & Log Events
 
 All retention and purge operations emit structured JSON logs via `observability.log_event()`:
 
@@ -1187,7 +1295,7 @@ All retention and purge operations emit structured JSON logs via `observability.
 | `purge_cron_failed` | Background purge cycle errored/timed out |
 | `purge_skipped` | Purge disabled |
 
-### 13.9 Verification Queries
+### 14.9 Verification Queries
 
 **Check what would be archived (before running):**
 ```sql
@@ -1238,3 +1346,134 @@ SELECT 'usage_events', COUNT(*) FROM usage_events
 UNION ALL
 SELECT 'webhook_events', COUNT(*) FROM webhook_events;
 ```
+
+---
+
+## 15. Onboarding Quick-Start Guide
+
+This section is for **new developers joining the team**. It walks you through the entire system so you can understand, run, and contribute to WappFlow within your first day.
+
+### 15.1 What Does WappFlow Do?
+
+WappFlow is a **multi-tenant WhatsApp automation SaaS**. Each user (tenant) connects their own WhatsApp Business Account and can:
+
+1. **Bulk Messaging** — Upload a CSV of contacts, pick a pre-approved WhatsApp template, and send thousands of personalized messages. Campaigns can be scheduled, paused, and retried.
+2. **File Forwarding** — Send documents/images to one or many recipients via the WhatsApp Cloud API.
+3. **Auto-Reply Chatbot** — Configure keyword-based rules that automatically reply to incoming WhatsApp messages. Supports interactive button flows and a 24h rate-limited first-trigger fallback.
+
+### 15.2 How the Pieces Fit Together
+
+```
+Browser (Next.js)
+  │  Firebase Auth login → gets ID token
+  │  Every API call includes: Authorization: Bearer <token>
+  ▼
+FastAPI Backend (Python)
+  │  Middleware stack: CORS → Firebase Auth → Rate Limit
+  │  Routes: /settings, /bulk-message, /file-forward, /chatbot, /logs, /webhook
+  │  Background tasks: TTL cleanup, campaign scheduler, retention cron
+  ▼
+Redis                          Neon Postgres
+  │  BullMQ queues               │  All tenant data, messages, campaigns
+  │  Rate limit counters         │  Archive tables + daily_message_stats
+  ▼                              │
+BullMQ Worker (worker_main.py)  │
+  │  Picks jobs from queues      │
+  │  Sends via WhatsApp API  ────┘ (updates DB with results)
+  ▼
+WhatsApp Cloud API (Meta)
+  │  Sends messages to end users
+  │  Sends webhooks back to our server
+  ▼
+POST /api/webhook/{tenant_id}
+  │  Signature verified → message processed → chatbot reply enqueued
+```
+
+### 15.3 Key Concepts to Understand
+
+| Concept | Explanation |
+|---------|-------------|
+| **Tenant** | A single user identified by their Firebase Auth UID. All data is isolated per tenant via `tenant_id` columns. |
+| **Campaign** | A bulk message job. Contains a template, a list of recipients, and counters tracking progress. |
+| **Recipient status machine** | `pending → queued → processing → submitted → sent` (via webhook). Failed recipients can be retried. |
+| **Template** | A pre-approved WhatsApp message format (created in Meta Business Manager). WappFlow caches template metadata locally. |
+| **BullMQ** | A Redis-backed job queue. `campaign_queue` fans out recipients; `message_queue` sends individual messages with rate limiting. |
+| **Per-tenant webhook** | Each tenant gets their own webhook URL (`/api/webhook/{tenant_id}`) with HMAC signature verification using their encrypted `meta_app_secret`. |
+| **Encryption at rest** | Sensitive values like `meta_app_secret` are Fernet-encrypted before storage. See [Section 11](#11-encryption-at-rest). |
+| **Data retention** | Old rows are archived from live tables → `*_archive` tables, keeping queries fast. See [Section 14](#14-data-retention--archive-system). |
+
+### 15.4 Your First Local Setup
+
+```bash
+# 1. Clone the repo
+git clone <repo-url> && cd SaaS-Product-
+
+# 2. Start Redis (required for queues + rate limiting)
+docker-compose up redis -d
+
+# 3. Backend setup
+cd backend
+pip install -r requirements.txt
+cp .env.example .env
+# Fill in: DATABASE_URL, WEBHOOK_VERIFY_TOKEN, ENCRYPTION_KEY
+# Place firebase-service-account.json in backend/
+
+# 4. Apply database schema
+python apply_schema.py
+
+# 5. Start the API server (Terminal 1)
+python run_server.py
+
+# 6. Start the BullMQ worker (Terminal 2)
+cd backend && python worker_main.py
+
+# 7. Frontend setup (Terminal 3)
+cd frontend
+npm install
+cp .env.local.example .env.local
+# Set NEXT_PUBLIC_API_URL=http://localhost:5000
+npm run dev
+```
+
+Open `http://localhost:3000` → register/login → configure WhatsApp settings → you're ready to test.
+
+### 15.5 Important Files to Read First
+
+As a new developer, read these files in order to build a mental model:
+
+| Order | File | Why |
+|-------|------|-----|
+| 1 | `schema.sql` + `retention_schema.sql` | Understand the data model — every table, column, and relationship |
+| 2 | `main.py` | See how the app starts, middleware stack, background tasks, health check |
+| 3 | `auth_middleware.py` | Understand how every request gets a `tenant_id` |
+| 4 | `store.py` | The cached read/write layer — how settings and chatbot config are loaded |
+| 5 | `routers/bulk_message.py` | The most complex product — campaign lifecycle from start to completion |
+| 6 | `worker_main.py` | How jobs are picked up, rate-limited, and sent via WhatsApp API |
+| 7 | `routers/webhook.py` | How incoming WhatsApp messages flow through the system |
+| 8 | `services/queue_manager.py` | How jobs are enqueued (campaign, message, file-forward, dead-letter) |
+| 9 | `rate_limit.py` | API rate limiting (middleware) + worker token bucket (Lua script) |
+| 10 | `retention.py` | Data lifecycle — archiving + purging |
+
+### 15.6 Common Development Tasks
+
+**Add a new API endpoint:**
+1. Create or edit a file in `routers/`
+2. Add the DB query in `db_layer/`
+3. Register the router in `main.py` (if new file)
+4. Update `frontend/src/lib/api.ts` with the new API call
+
+**Add a new database table:**
+1. Add the `CREATE TABLE` to `schema.sql`
+2. Run `python apply_schema.py`
+3. Create a new file in `db_layer/` for the CRUD operations
+
+**Debug a campaign that's stuck:**
+1. Check campaign status: `GET /api/bulk-message/status/{id}`
+2. Check recipient details: `GET /api/bulk-message/campaigns/{id}/details`
+3. Verify the worker is running (`python worker_main.py`)
+4. Check logs for `worker_send_prepare`, `worker_finalize_sent`, or `worker_finalize_error`
+
+**Test webhooks locally:**
+1. Use `ngrok http 5000` to get a public URL
+2. Set the webhook URL in Meta App Dashboard to `https://<ngrok-url>/api/webhook/{tenant_id}`
+3. Send a message to your WhatsApp Business number — watch the logs

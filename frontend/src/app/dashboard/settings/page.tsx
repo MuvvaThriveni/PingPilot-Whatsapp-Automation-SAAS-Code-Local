@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -8,15 +8,19 @@ import { Label } from '@/components/ui/label'
 import { settings } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Settings, CheckCircle, XCircle, Loader2, Eye, EyeOff, ExternalLink } from 'lucide-react'
+import { Settings, CheckCircle, XCircle, Loader2, Eye, EyeOff, ExternalLink, Copy, Check } from 'lucide-react'
 import axios from 'axios'
+import { useAuth } from '@/contexts/AuthContext'
 
 export default function SettingsPage() {
   const { toast } = useToast()
+  const { user } = useAuth()
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [showToken, setShowToken] = useState(false)
+  const [showMetaAppSecret, setShowMetaAppSecret] = useState(false)
+  const [copied, setCopied] = useState(false)
   const [connectionStatus, setConnectionStatus] = useState<'unknown' | 'success' | 'error'>('unknown')
   const [connectionInfo, setConnectionInfo] = useState<{ phoneNumber?: string; verifiedName?: string } | null>(null)
 
@@ -24,9 +28,25 @@ export default function SettingsPage() {
     business_account_id: '',
     phone_number_id: '',
     access_token: '',
-    webhook_verify_token: ''
+    webhook_verify_token: '',
+    meta_app_secret: ''
   })
   const [hasExistingToken, setHasExistingToken] = useState(false)
+  const [hasExistingMetaAppSecret, setHasExistingMetaAppSecret] = useState(false)
+
+  const webhookUrl = useMemo(() => {
+    if (!user?.uid) return ''
+    const base = (process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:5000').replace(/\/+$/, '')
+    return `${base}/api/webhook/${user.uid}`
+  }, [user?.uid])
+
+  const handleCopyWebhookUrl = () => {
+    if (!webhookUrl) return
+    navigator.clipboard.writeText(webhookUrl)
+    setCopied(true)
+    toast({ title: 'Copied', description: 'Webhook URL copied to clipboard' })
+    setTimeout(() => setCopied(false), 2000)
+  }
 
   useEffect(() => {
     fetchSettings()
@@ -40,10 +60,12 @@ export default function SettingsPage() {
           business_account_id: res.data.settings.business_account_id || '',
           phone_number_id: res.data.settings.phone_number_id || '',
           access_token: '',   // never pre-fill token in UI for security
-          webhook_verify_token: res.data.settings.webhook_verify_token || ''
+          webhook_verify_token: res.data.settings.webhook_verify_token || '',
+          meta_app_secret: ''  // never pre-fill secret in UI for security
         })
         // Mark whether a token already exists so we don't require re-entry
         setHasExistingToken(res.data.settings.is_configured === true)
+        setHasExistingMetaAppSecret(res.data.settings.has_meta_app_secret === true)
       }
     } catch (error) {
       console.error('Failed to fetch settings:', error)
@@ -71,6 +93,7 @@ export default function SettingsPage() {
         phone_number_id: string
         webhook_verify_token: string
         access_token?: string
+        meta_app_secret?: string
       } = {
         business_account_id: formData.business_account_id,
         phone_number_id: formData.phone_number_id,
@@ -79,11 +102,15 @@ export default function SettingsPage() {
       if (formData.access_token.trim()) {
         payload.access_token = formData.access_token.trim()
       }
+      if (formData.meta_app_secret.trim()) {
+        payload.meta_app_secret = formData.meta_app_secret.trim()
+      }
       await settings.saveWhatsApp(payload)
       toast({ title: 'Settings saved', description: 'WhatsApp configuration updated successfully' })
       setConnectionStatus('unknown')
       setHasExistingToken(true)
-      setFormData(prev => ({ ...prev, access_token: '' }))  // clear field after save
+      if (formData.meta_app_secret.trim()) setHasExistingMetaAppSecret(true)
+      setFormData(prev => ({ ...prev, access_token: '', meta_app_secret: '' }))  // clear secret fields after save
     } catch (error: unknown) {
       toast({
         title: 'Failed to save',
@@ -265,6 +292,60 @@ export default function SettingsPage() {
               Used to verify webhook requests from WhatsApp (for chatbot feature)
             </p>
           </div>
+
+          {/* Meta App Secret */}
+          <div className="space-y-2">
+            <Label htmlFor="meta_app_secret">Meta App Secret {hasExistingMetaAppSecret ? '(leave blank to keep existing)' : '(Optional)'}</Label>
+            <div className="relative">
+              <Input
+                id="meta_app_secret"
+                type={showMetaAppSecret ? 'text' : 'password'}
+                placeholder={hasExistingMetaAppSecret ? '(unchanged — enter new secret to update)' : 'Enter your Meta App Secret'}
+                value={formData.meta_app_secret}
+                onChange={(e) => setFormData({ ...formData, meta_app_secret: e.target.value })}
+                className="pr-10"
+              />
+              <button
+                type="button"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                onClick={() => setShowMetaAppSecret(!showMetaAppSecret)}
+              >
+                {showMetaAppSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
+            <p className="text-xs text-gray-500">
+              {hasExistingMetaAppSecret
+                ? 'A secret is already saved. Only enter a new one if you want to update it.'
+                : 'Found in Meta Developer Portal → App Settings → Basic. Used to verify webhook signatures.'}
+            </p>
+          </div>
+
+          {/* Per-Tenant Webhook URL */}
+          {webhookUrl && (
+            <div className="space-y-2">
+              <Label>Your Webhook URL</Label>
+              <div className="flex items-center space-x-2">
+                <Input
+                  readOnly
+                  value={webhookUrl}
+                  className="bg-gray-50 text-sm font-mono"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={handleCopyWebhookUrl}
+                  title="Copy webhook URL"
+                >
+                  {copied ? <Check className="h-4 w-4 text-green-600" /> : <Copy className="h-4 w-4" />}
+                </Button>
+              </div>
+              <p className="text-xs text-gray-500">
+                Use this URL in your Meta App → Webhooks configuration. Requests are verified using your Meta App Secret.
+                This URL is environment-specific (development vs production).
+              </p>
+            </div>
+          )}
 
           {/* Actions */}
           <div className="flex space-x-3 pt-4">

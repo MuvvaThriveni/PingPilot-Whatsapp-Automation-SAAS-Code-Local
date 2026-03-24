@@ -64,6 +64,7 @@ export const settings = {
     phone_number_id: string;
     access_token?: string;
     webhook_verify_token?: string;
+    meta_app_secret?: string;
   }) => api.post('/settings/whatsapp', data),
   testConnection: () => api.post('/settings/whatsapp/test'),
   getUsage: () => api.get('/settings/usage'),
