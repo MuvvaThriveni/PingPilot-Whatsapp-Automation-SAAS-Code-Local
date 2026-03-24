@@ -979,8 +979,8 @@ Set the output as `ENCRYPTION_KEY` in your `.env` file. **Keep this key safe** â
 |----------|-------------|
 | `DATABASE_URL` | Postgres connection string (Neon DB) |
 | `WEBHOOK_VERIFY_TOKEN` | Strong secret for Meta webhook verification (legacy routes; per-tenant tokens are preferred) |
-| `REDIS_HOST` | Redis hostname (default: `localhost`) |
-| `REDIS_PORT` | Redis port (default: `6379`) |
+| `REDIS_HOST` | Redis hostname (default: `localhost`). Only used if `REDIS_URL` is not set |
+| `REDIS_PORT` | Redis port (default: `6379`). Only used if `REDIS_URL` is not set |
 | `ENCRYPTION_KEY` | Fernet encryption key for secrets at rest. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 
 ### Required Files
@@ -1015,7 +1015,7 @@ Set the output as `ENCRYPTION_KEY` in your `.env` file. **Keep this key safe** â
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `REDIS_URL` | (empty) | Full Redis URL (overrides REDIS_HOST/PORT if set) |
+| `REDIS_URL` | (empty) | Full Redis URL (overrides REDIS_HOST/PORT if set). **Use `rediss://` (double `s`) for TLS** â€” required by cloud providers like Upstash. Example: `rediss://default:password@host:6379` |
 | `TENANT_RATE_LIMIT` | `10` | Worker messages per second per tenant |
 | `TENANT_BURST` | `20` | Worker max burst capacity |
 | `WA_COOLDOWN_TTL` | `5` | Global 429 cooldown duration (seconds) |
@@ -1054,7 +1054,7 @@ Set the output as `ENCRYPTION_KEY` in your `.env` file. **Keep this key safe** â
 
 - Python 3.11+
 - Node.js 18+
-- Redis 6+
+- Redis 6+ (local Docker) or a managed Redis with TLS (e.g. Upstash â€” use `rediss://` URL scheme)
 - Postgres (or Neon DB connection string)
 - Firebase project with Auth enabled
 

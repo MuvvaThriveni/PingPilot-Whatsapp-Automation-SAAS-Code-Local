@@ -95,7 +95,8 @@ def get_redis_opts_for_bullmq() -> dict:
         if parsed.username:
             opts["username"] = parsed.username
         if use_ssl:
-            opts["tls"] = True
+            opts["ssl"] = True
+            opts["ssl_cert_reqs"] = None
         return opts
     return {
         "host": REDIS_HOST,

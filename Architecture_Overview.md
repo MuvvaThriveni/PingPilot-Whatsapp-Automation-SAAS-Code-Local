@@ -51,7 +51,7 @@ Every tenant is fully isolated: separate WhatsApp credentials, separate webhook 
            │                              │
            ▼                              ▼
 ┌─────────────────────┐       ┌──────────────────────────────────────────┐
-│    REDIS 6.2        │       │          NEON POSTGRES                    │
+│    REDIS (TLS)      │       │          NEON POSTGRES                    │
 │                     │       │                                           │
 │  • BullMQ Queues    │       │  tenants · campaigns · campaign_recipients│
 │    - campaign_queue │       │  messages · chat_messages · chatbot_rules │
@@ -98,7 +98,7 @@ Every tenant is fully isolated: separate WhatsApp credentials, separate webhook 
 | **Auth** | Firebase Auth (client + server) | Google sign-in, email/password, ID token verification |
 | **Backend** | FastAPI (Python 3.11+) | Async REST API with Pydantic validation |
 | **Database** | Neon Postgres (serverless) | Multi-tenant data store via `psycopg` + connection pooling |
-| **Queue** | BullMQ (Redis-backed) | Async job processing for message sending |
+| **Queue** | BullMQ (Redis-backed) | Async job processing for message sending. Supports TLS via `rediss://` URL scheme for cloud Redis (e.g. Upstash) |
 | **Cache** | In-memory (Python) + Redis | TTL-based settings/rules cache (6h) + rate-limit state |
 | **External API** | WhatsApp Cloud API (Meta Graph v18.0) | Message sending, template management, media uploads |
 | **Deployment** | Vercel (frontend), Render (backend), Docker Compose (local) | CI/CD and containerization |
@@ -431,14 +431,14 @@ Render ──────────────── FastAPI (api service, po
   │                     BullMQ Worker (worker_main.py)
   │
   ├──→ Neon Postgres ── Serverless Postgres (connection pooling)
-  └──→ Redis (managed)─ BullMQ queues + rate limiting
+  └──→ Redis (managed)─ BullMQ queues + rate limiting (TLS via `rediss://`)
 ```
 
 ### Local Development (Docker Compose)
 
 ```
 docker-compose.yml defines:
-  • redis (6.2-alpine, port 6379, AOF persistence)
+  • redis (6.2-alpine, port 6379, AOF persistence, no TLS locally)
   • api (FastAPI, port 5000, depends on redis)
   • worker (worker_main.py, depends on redis)
 ```
@@ -746,7 +746,8 @@ npm run dev             # Terminal 3: Next.js on port 3000
 | `DATABASE_URL` | Backend | Postgres connection string |
 | `ENCRYPTION_KEY` | Backend | Fernet key for encrypting secrets at rest |
 | `WEBHOOK_VERIFY_TOKEN` | Backend | Legacy webhook verification (per-tenant tokens preferred) |
-| `REDIS_HOST` / `REDIS_PORT` | Backend | Redis for queues + rate limiting |
+| `REDIS_URL` | Backend | Full Redis URL. Use `rediss://` for TLS (required by Upstash). Overrides `REDIS_HOST`/`REDIS_PORT` |
+| `REDIS_HOST` / `REDIS_PORT` | Backend | Redis host/port for local dev (only used if `REDIS_URL` is not set) |
 | `NEXT_PUBLIC_API_URL` | Frontend | Backend URL (e.g., `http://localhost:5000`) |
 | `NEXT_PUBLIC_FIREBASE_*` | Frontend | Firebase Auth configuration |
 
@@ -771,6 +772,7 @@ npm run dev             # Terminal 3: Next.js on port 3000
 | Gotcha | Explanation |
 |--------|-------------|
 | **Worker not running** | Campaigns will be created but messages won't send. Always run `python worker_main.py` in a separate terminal. |
+| **Redis TLS (`Connection closed by server`)** | Cloud Redis providers (Upstash, Redis Cloud) require TLS. Use `rediss://` (double `s`) in `REDIS_URL`, not `redis://`. The `rate_limit.py` module auto-detects the scheme and passes `ssl=True` to both the `aioredis` client and BullMQ workers. |
 | **Stale cache** | Settings and chatbot rules are cached for 6 hours. After manual DB changes, restart the server or wait for cache expiry. |
 | **Webhook signature failures** | Ensure `meta_app_secret` in WappFlow matches the App Secret in Meta Dashboard. If you get 401s, check `webhook_sig_rejected` logs. |
 | **Template not found** | Templates must be approved in Meta Business Manager first. WappFlow caches template metadata — if a new template isn't showing, wait for cache refresh or restart. |
