@@ -76,12 +76,14 @@ class _Tenants:
                     access_token,
                     token_ref,
                     webhook_verify_token,
+                    meta_app_secret,
                     is_configured,
                     created_at,
                     updated_at
                 )
                 VALUES (
                     %s,
+                    COALESCE(%s, ''),
                     COALESCE(%s, ''),
                     COALESCE(%s, ''),
                     COALESCE(%s, ''),
@@ -97,6 +99,7 @@ class _Tenants:
                     access_token = COALESCE(%s, tenants.access_token),
                     token_ref = COALESCE(%s, tenants.token_ref),
                     webhook_verify_token = COALESCE(%s, tenants.webhook_verify_token),
+                    meta_app_secret = COALESCE(%s, tenants.meta_app_secret),
                     is_configured = COALESCE(%s, tenants.is_configured),
                     updated_at = now()
                 """,
@@ -106,12 +109,14 @@ class _Tenants:
                 data.get("access_token"),
                 data.get("token_ref"),
                 data.get("webhook_verify_token"),
+                data.get("meta_app_secret"),
                 data.get("is_configured"),
                 data.get("business_account_id"),
                 data.get("phone_number_id"),
                 data.get("access_token"),
                 data.get("token_ref"),
                 data.get("webhook_verify_token"),
+                data.get("meta_app_secret"),
                 data.get("is_configured"),
             )
             # Invalidate cache

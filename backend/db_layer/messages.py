@@ -70,8 +70,8 @@ class _Messages:
                 data.get("status", ""),
                 data.get("template_name", ""),
                 data.get("campaign_id") or None,
-                data.get("media_id", ""),
-                data.get("error_message", ""),
+                data.get("media_id") or "",
+                data.get("error_message") or "",
                 created_at if created_at else None,
             )
             if conn is not None:
@@ -166,8 +166,8 @@ class _Messages:
                 data.get("status", ""),
                 data.get("template_name", ""),
                 data.get("campaign_id") or None,
-                data.get("media_id", ""),
-                data.get("error_message", ""),
+                data.get("media_id") or "",
+                data.get("error_message") or "",
                 created_at if created_at else None,
             )
             if conn is not None:
@@ -231,6 +231,35 @@ class _Messages:
             return dict(row) if row else None
         except Exception as e:
             log_event("db_error", detail=f"messages.get_outgoing_by_wa_message_id failed: {e}", level="ERROR")
+            return None
+
+    @staticmethod
+    async def get_outgoing_by_wa_message_id_archived(tenant_id: str, wa_message_id: str) -> dict | None:
+        """Fallback lookup in messages_archive for webhook reconciliation.
+
+        Used when a status callback arrives for a message that has already been
+        archived out of the live table.  Returns the same columns as
+        get_outgoing_by_wa_message_id so callers can treat the result identically.
+        """
+        try:
+            row = await fetchrow(
+                """
+                SELECT id, tenant_id, campaign_id, contact_phone, status, template_name, created_at
+                FROM messages_archive
+                WHERE tenant_id = %s
+                  AND wa_message_id = %s
+                  AND direction = 'outgoing'
+                LIMIT 1
+                """,
+                tenant_id,
+                wa_message_id,
+            )
+            if row:
+                log_event("archive_fallback_hit", tenant_id=tenant_id,
+                          detail=f"wa_message_id={wa_message_id} found in messages_archive")
+            return dict(row) if row else None
+        except Exception as e:
+            log_event("db_error", detail=f"messages.get_outgoing_by_wa_message_id_archived failed: {e}", level="ERROR")
             return None
 
     @staticmethod
@@ -396,13 +425,25 @@ class _Messages:
 
     @staticmethod
     async def get_usage(tenant_id: str) -> dict:
-        """Get usage statistics for dashboard. Cached for 6 hours."""
+        """Get usage statistics for dashboard. Cached for 6 hours.
+
+        Archive-safe: combines daily_message_stats (past archived days) with
+        live messages table (recent/unarchived days).  When daily_message_stats
+        is empty (before archiving begins), the live table provides all data —
+        producing identical results to the original query.
+        """
         async def _fetch():
             try:
                 now_ist = get_ist_now()
                 today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
                 month_start_ist = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
+                today_start_utc = today_start_ist.astimezone(datetime.timezone.utc).isoformat()
+                month_start_utc = month_start_ist.astimezone(datetime.timezone.utc).isoformat()
+                today_date_str = today_start_ist.strftime("%Y-%m-%d")
+                month_start_date_str = month_start_ist.strftime("%Y-%m-%d")
+
+                # Today: always from live table (today is never archived)
                 today_row = await fetchrow(
                     """
                     SELECT
@@ -413,9 +454,32 @@ class _Messages:
                     WHERE tenant_id = %s AND created_at >= %s::timestamptz
                     """,
                     tenant_id,
-                    today_start_ist.astimezone(datetime.timezone.utc).isoformat(),
+                    today_start_utc,
                 )
-                month_row = await fetchrow(
+
+                # Month: aggregated past days + live current data
+                # Part A: daily_message_stats for completed days this month (before today)
+                agg_row = await fetchrow(
+                    """
+                    SELECT
+                      COALESCE(SUM(message_count), 0) AS total,
+                      COALESCE(SUM(message_count) FILTER (
+                          WHERE status IN ('sent','delivered','read')), 0) AS successful,
+                      COALESCE(SUM(message_count) FILTER (
+                          WHERE status = 'failed'), 0) AS failed
+                    FROM daily_message_stats
+                    WHERE tenant_id = %s
+                      AND stat_date >= %s::date
+                      AND stat_date < %s::date
+                    """,
+                    tenant_id,
+                    month_start_date_str,
+                    today_date_str,
+                )
+
+                # Part B: live messages table for all data from month start
+                # (includes today + any days not yet aggregated)
+                live_month_row = await fetchrow(
                     """
                     SELECT
                       COUNT(*) AS total,
@@ -425,8 +489,19 @@ class _Messages:
                     WHERE tenant_id = %s AND created_at >= %s::timestamptz
                     """,
                     tenant_id,
-                    month_start_ist.astimezone(datetime.timezone.utc).isoformat(),
+                    month_start_utc,
                 )
+
+                # Combine: agg covers archived days, live covers remaining days.
+                # Before archiving starts, agg is 0 and live has everything — identical to original.
+                agg_total = int((agg_row or {}).get("total") or 0)
+                agg_successful = int((agg_row or {}).get("successful") or 0)
+                agg_failed = int((agg_row or {}).get("failed") or 0)
+
+                live_total = int((live_month_row or {}).get("total") or 0)
+                live_successful = int((live_month_row or {}).get("successful") or 0)
+                live_failed = int((live_month_row or {}).get("failed") or 0)
+
                 return {
                     "today": {
                         "total": int((today_row or {}).get("total") or 0),
@@ -434,9 +509,9 @@ class _Messages:
                         "failed": int((today_row or {}).get("failed") or 0),
                     },
                     "month": {
-                        "total": int((month_row or {}).get("total") or 0),
-                        "successful": int((month_row or {}).get("successful") or 0),
-                        "failed": int((month_row or {}).get("failed") or 0),
+                        "total": agg_total + live_total,
+                        "successful": agg_successful + live_successful,
+                        "failed": agg_failed + live_failed,
                     },
                     "byProduct": [],
                 }

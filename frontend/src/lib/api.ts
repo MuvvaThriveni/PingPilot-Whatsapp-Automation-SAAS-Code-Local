@@ -1,12 +1,12 @@
 import axios from 'axios';
 import { auth } from '@/lib/firebase';
 
-export const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
+export const API = process.env.NEXT_PUBLIC_API_BASE_URL || '';
 
 const normalizeApiBaseUrl = (baseUrl: string) => {
   let url = (baseUrl || '').trim();
   if (!url) {
-    return 'http://localhost:5000/api';
+    return '/api';
   }
 
   url = url.replace(/\/+$/, '');
@@ -64,6 +64,7 @@ export const settings = {
     phone_number_id: string;
     access_token?: string;
     webhook_verify_token?: string;
+    meta_app_secret?: string;
   }) => api.post('/settings/whatsapp', data),
   testConnection: () => api.post('/settings/whatsapp/test'),
   getUsage: () => api.get('/settings/usage'),

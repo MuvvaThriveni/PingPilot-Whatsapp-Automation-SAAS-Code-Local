@@ -23,6 +23,7 @@ class WhatsAppSettings(BaseModel):
     phone_number_id: str
     access_token: Optional[str] = ""   # optional — omit to keep existing token
     webhook_verify_token: Optional[str] = ""
+    meta_app_secret: Optional[str] = ""  # optional — omit to keep existing secret
 
     @field_validator("business_account_id", "phone_number_id")
     @classmethod
@@ -37,7 +38,7 @@ class WhatsAppSettings(BaseModel):
 async def get_whatsapp_settings(request: Request):
     tenant_id = request.state.tenant_id
     settings = await get_settings(tenant_id)
-    # SECURITY: Never return the access token to the frontend
+    # SECURITY: Never return access_token or meta_app_secret to the frontend
     return {
         "settings": {
             "business_account_id": settings["business_account_id"],
@@ -45,6 +46,7 @@ async def get_whatsapp_settings(request: Request):
             "webhook_verify_token": settings["webhook_verify_token"],
             "is_configured": settings["is_configured"],
             "has_access_token": bool(settings.get("access_token")),
+            "has_meta_app_secret": bool(settings.get("meta_app_secret")),
         }
     }
 
@@ -61,6 +63,7 @@ async def save_whatsapp_settings(request: Request, data: WhatsAppSettings):
         "phone_number_id": (data.phone_number_id or "").strip(),
         "access_token": access_token,
         "webhook_verify_token": (data.webhook_verify_token or "").strip(),
+        "meta_app_secret": (data.meta_app_secret or "").strip(),
         "is_configured": True,
     }
     await save_settings(tenant_id, settings_data)

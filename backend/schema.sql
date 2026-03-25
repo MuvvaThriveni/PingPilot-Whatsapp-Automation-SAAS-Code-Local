@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS tenants (
   access_token TEXT NOT NULL DEFAULT '',
   token_ref TEXT NOT NULL DEFAULT '',
   webhook_verify_token TEXT NOT NULL DEFAULT '',
+  meta_app_secret TEXT NOT NULL DEFAULT '',
   is_configured BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -145,6 +146,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_tenant_campaign_created_at
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_tenant_wa_message_id
   ON messages (tenant_id, wa_message_id)
   WHERE wa_message_id <> '';
+
+CREATE INDEX IF NOT EXISTS idx_messages_created_at
+  ON messages (created_at ASC);
 
 
 CREATE TABLE IF NOT EXISTS chat_messages (
