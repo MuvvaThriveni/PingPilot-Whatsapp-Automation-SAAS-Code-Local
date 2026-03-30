@@ -13,6 +13,8 @@ import re
 from store import get_settings, save_settings
 from services.whatsapp import WhatsAppService
 from db_layer.messages import messages as _db_messages
+from db_layer.tenants import tenants as _db_tenants
+from db_layer.quota import get_quota_status
 from observability import log_event
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -95,4 +97,28 @@ async def test_whatsapp_connection(request: Request):
 @router.get("/usage")
 async def get_usage_stats(request: Request):
     tenant_id = request.state.tenant_id
-    return await _db_messages.get_usage(tenant_id)
+    usage = await _db_messages.get_usage(tenant_id)
+
+    tenant = await _db_tenants.get(tenant_id)
+    bulk_quota_limit = int((tenant or {}).get("bulk_quota_limit", 100))
+    quota = await get_quota_status(tenant_id, bulk_quota_limit)
+
+    if isinstance(usage, dict):
+        usage["bulk_quota"] = {
+            "used":         quota.used,
+            "limit":        quota.limit,
+            "remaining":    quota.remaining,
+            "resets_at":    quota.resets_at,
+            "percent_used": round(quota.used / quota.limit * 100, 1) if quota.limit > 0 else 100.0,
+        }
+        return usage
+
+    return {
+        "bulk_quota": {
+            "used":         quota.used,
+            "limit":        quota.limit,
+            "remaining":    quota.remaining,
+            "resets_at":    quota.resets_at,
+            "percent_used": round(quota.used / quota.limit * 100, 1) if quota.limit > 0 else 100.0,
+        }
+    }

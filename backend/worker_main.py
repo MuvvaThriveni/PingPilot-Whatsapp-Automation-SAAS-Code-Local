@@ -32,6 +32,8 @@ from db_layer.campaigns import campaigns as _db_campaigns
 from db_layer.campaign_recipients import campaign_recipients as _db_recipients
 from db_layer.campaign_counters import campaign_counters as _db_counters
 from db_layer.messages import messages as _db_messages
+from db_layer.tenants import tenants as _db_tenants
+from db_layer.quota import get_quota_status, try_consume_quota
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("worker")
@@ -122,15 +124,35 @@ async def process_campaign_job(job: Job, token: str):
     
     await _db_campaigns.update_status(tenant_id, campaign_id, "running")
     
+    # ── Quota-capped fan-out ────────────────────────────────────────
+    tenant = await _db_tenants.get(tenant_id)
+    bulk_quota_limit = int((tenant or {}).get("bulk_quota_limit", 100))
+    quota = await get_quota_status(tenant_id, bulk_quota_limit)
+    quota_remaining = quota.remaining
+
+    if quota_remaining <= 0:
+        # Entire campaign is over quota — mark all pending as quota_exceeded
+        excess = await _db_recipients.mark_excess_recipients_quota_exceeded(tenant_id, campaign_id)
+        log_event("quota_campaign_blocked", tenant_id=tenant_id, campaign_id=campaign_id,
+                  detail=f"remaining=0 excess_marked={excess}")
+        logger.info(f"Campaign {campaign_id}: quota exhausted, marked {excess} recipients as quota_exceeded.")
+        await _maybe_finalize_campaign(tenant_id, campaign_id)
+        return "quota_exhausted"
+
     # Process recipients in large batches
     total_enqueued = 0
     limit = 1000
     while True:
+        if total_enqueued >= quota_remaining:
+            break
+
         pending = await _db_recipients.get_pending(tenant_id, campaign_id, limit=limit)
         if not pending:
             break
             
         for contact in pending:
+            if total_enqueued >= quota_remaining:
+                break
             phone = contact.get("contact_phone")
             job_id = f"msg_{campaign_id}_{phone}" if not epoch else f"msg_{campaign_id}_{phone}_{epoch}"
             
@@ -168,7 +190,13 @@ async def process_campaign_job(job: Job, token: str):
                 await _db_recipients.transition_pending_to_queued(tenant_id, campaign_id, phone)
                 total_enqueued += 1
             
-    logger.info(f"Campaign {campaign_id}: enqueued {total_enqueued} distinct messages.")
+    # Mark any remaining pending recipients as quota_exceeded
+    excess = await _db_recipients.mark_excess_recipients_quota_exceeded(tenant_id, campaign_id)
+    if excess > 0:
+        log_event("quota_cap_applied", tenant_id=tenant_id, campaign_id=campaign_id,
+                  detail=f"enqueued={total_enqueued} cap={quota_remaining} excess_marked={excess}")
+
+    logger.info(f"Campaign {campaign_id}: enqueued {total_enqueued} distinct messages (quota_cap={quota_remaining}, excess={excess}).")
     
     # The campaign remains "running" until all messages finish. The API can check `campaign_counters` to determine completion.
     return "done"
@@ -299,6 +327,21 @@ async def process_message_job(job: Job, token: str):
             logger.info(f"Skip send; max attempts reached attempts={r.get('attempt_count')} max={max_attempts} campaign={campaign_id} phone={phone}")
             await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
             return "skipped"
+
+        # ── Atomic quota consume before sending ─────────────────────
+        tenant = await _db_tenants.get(tenant_id)
+        bulk_quota_limit = int((tenant or {}).get("bulk_quota_limit", 100))
+        consumed = await try_consume_quota(tenant_id, bulk_quota_limit)
+        if not consumed:
+            log_event("quota_exceeded_worker", tenant_id=tenant_id, campaign_id=campaign_id,
+                      phone=phone, detail="atomic quota consume failed")
+            await _db_recipients.mark_failed(
+                tenant_id, campaign_id, phone,
+                "Monthly bulk message quota exhausted",
+            )
+            await _db_counters.increment(tenant_id, campaign_id, "failed")
+            await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+            return "quota_exceeded"
 
         ok = await _db_recipients.transition_to_processing(tenant_id, campaign_id, phone)
         if not ok:

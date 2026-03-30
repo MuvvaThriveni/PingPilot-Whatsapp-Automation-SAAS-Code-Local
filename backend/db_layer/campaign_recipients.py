@@ -528,7 +528,7 @@ class _CampaignRecipients:
                 FROM campaign_recipients
                 WHERE tenant_id = %s AND campaign_id = %s::uuid
                   AND (
-                    status IN ('submitted', 'sent')
+                    status IN ('submitted', 'sent', 'quota_exceeded')
                     OR (status = 'failed' AND attempt_count >= %s)
                   )
                 """
@@ -542,6 +542,40 @@ class _CampaignRecipients:
             return int(row.get("cnt") or 0)
         except Exception as e:
             log_event("db_error", detail=f"campaign_recipients.count_done failed: {e}", level="ERROR")
+            return 0
+
+    @staticmethod
+    async def mark_excess_recipients_quota_exceeded(
+        tenant_id: str,
+        campaign_id: str,
+        conn=None,
+    ) -> int:
+        """Mark all remaining 'pending' recipients as 'quota_exceeded'.
+
+        Called after the capped fan-out has enqueued the allowed batch.
+        Returns the number of rows affected.
+        """
+        try:
+            q = """
+                UPDATE campaign_recipients
+                SET
+                    status = 'quota_exceeded',
+                    error_message = 'Monthly bulk message quota exhausted',
+                    updated_at = now()
+                WHERE tenant_id = %s AND campaign_id = %s::uuid AND status = 'pending'
+                """
+            if conn is not None:
+                result = await execute_conn(conn, q, tenant_id, campaign_id)
+            else:
+                result = await execute(q, tenant_id, campaign_id)
+            # execute returns the command tag string like "UPDATE 5"
+            if result and isinstance(result, str):
+                parts = result.split()
+                if len(parts) >= 2:
+                    return int(parts[-1])
+            return 0
+        except Exception as e:
+            log_event("db_error", detail=f"campaign_recipients.mark_excess_recipients_quota_exceeded failed: {e}", level="ERROR")
             return 0
 
     @staticmethod

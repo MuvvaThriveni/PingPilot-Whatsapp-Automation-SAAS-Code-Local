@@ -12,8 +12,17 @@ import { Switch } from '@/components/ui/switch'
 import { bulkMessage } from '@/lib/api'
 import { useToast } from '@/hooks/use-toast'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Upload, FileSpreadsheet, X, Play, Square, Loader2, CheckCircle, XCircle, Clock, Trash2 } from 'lucide-react'
+import { Upload, FileSpreadsheet, X, Play, Square, Loader2, CheckCircle, XCircle, Clock, Trash2, AlertTriangle } from 'lucide-react'
 import axios from 'axios'
+
+interface QuotaInfo {
+  used: number
+  limit: number
+  remaining: number
+  month_key: string
+  resets_at: string
+  percent_used: number
+}
 
 interface Contact {
   index: number
@@ -61,14 +70,25 @@ export default function BulkMessagePage() {
   const [scheduledAt, setScheduledAt] = useState('')
   const [templates, setTemplates] = useState<Template[]>([])
   const [loadingTemplates, setLoadingTemplates] = useState(false)
+  const [quota, setQuota] = useState<QuotaInfo | null>(null)
   const selectedTemplate = templates.find(t => t.display === templateName)
   const templateHasParams = selectedTemplate && selectedTemplate.param_count > 0
+
+  const fetchQuota = async () => {
+    try {
+      const res = await bulkMessage.quota()
+      setQuota(res.data)
+    } catch (error) {
+      console.error('Failed to fetch quota:', error)
+    }
+  }
 
   useEffect(() => {
     fetchCampaigns()
     fetchTemplates()
+    fetchQuota()
     // Periodic fallback to refresh the whole list (e.g., for status changes not caught by active poller)
-    const interval = setInterval(fetchCampaigns, 10000)
+    const interval = setInterval(() => { fetchCampaigns(); fetchQuota() }, 10000)
     return () => clearInterval(interval)
   }, [])
 
@@ -85,6 +105,7 @@ export default function BulkMessagePage() {
           // Keep polling if it's running OR still scheduled
           if (campaign.status !== 'running' && campaign.status !== 'scheduled') {
             setActiveCampaignId(null)
+            fetchQuota()
           }
         } catch (error) {
           console.error('Failed to fetch campaign status:', error)
@@ -179,6 +200,7 @@ export default function BulkMessagePage() {
 
       toast({ title: 'Campaign started', description: `Sending to ${res.data.totalContacts} contacts` })
 
+      fetchQuota()
       setFile(null)
       setContacts([])
       setTotalContacts(0)
@@ -189,11 +211,23 @@ export default function BulkMessagePage() {
 
       fetchCampaigns()
     } catch (error: unknown) {
+      let description = 'Something went wrong'
+      if (axios.isAxiosError(error)) {
+        const detail = error.response?.data?.detail
+        if (detail?.error === 'quota_exceeded') {
+          description = `Monthly quota exhausted (${detail.used}/${detail.limit} used). Resets ${new Date(detail.resets_at).toLocaleDateString()}.`
+        } else if (detail?.error === 'quota_would_exceed') {
+          description = detail.message || `Campaign exceeds remaining quota (${detail.remaining} left).`
+        } else {
+          description = error.response?.data?.error || detail?.message || description
+        }
+      }
       toast({
         title: 'Failed to start campaign',
-        description: axios.isAxiosError(error) ? error.response?.data?.error || 'Something went wrong' : 'Something went wrong',
+        description,
         variant: 'destructive'
       })
+      fetchQuota()
     } finally {
       setLoading(false)
     }
@@ -234,6 +268,43 @@ export default function BulkMessagePage() {
         <h1 className="text-2xl font-bold text-gray-900">Bulk WhatsApp Messaging</h1>
         <p className="text-gray-500 mt-1">Send messages to multiple contacts using Excel/CSV</p>
       </div>
+
+      {/* Quota Bar */}
+      {quota && (
+        <Card>
+          <CardContent className="pt-6 pb-4">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium text-gray-700">Monthly Message Quota</span>
+                {quota.remaining <= 0 && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-red-50 text-red-700 border border-red-200">
+                    <AlertTriangle className="h-3 w-3" />
+                    Exhausted
+                  </span>
+                )}
+              </div>
+              <span className="text-sm text-gray-500">
+                {quota.used} / {quota.limit} used &bull; {quota.remaining} remaining
+              </span>
+            </div>
+            <div className="w-full bg-gray-100 rounded-full h-2.5">
+              <div
+                className={`h-2.5 rounded-full transition-all ${
+                  quota.percent_used >= 100
+                    ? 'bg-red-500'
+                    : quota.percent_used >= 80
+                    ? 'bg-orange-500'
+                    : 'bg-green-500'
+                }`}
+                style={{ width: `${Math.min(quota.percent_used, 100)}%` }}
+              />
+            </div>
+            <p className="text-xs text-gray-400 mt-1.5">
+              Resets {new Date(quota.resets_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
+            </p>
+          </CardContent>
+        </Card>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-2">
         {/* Upload & Configure */}
@@ -383,11 +454,25 @@ export default function BulkMessagePage() {
               )}
             </div>
 
+            {/* Quota warning for this campaign */}
+            {quota && totalContacts > 0 && totalContacts > quota.remaining && (
+              <div className="flex items-start gap-2 p-3 rounded-lg bg-orange-50 border border-orange-200 text-sm text-orange-800">
+                <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+                <div>
+                  {quota.remaining <= 0 ? (
+                    <p>Monthly quota exhausted. You cannot start a campaign until it resets on {new Date(quota.resets_at).toLocaleDateString()}.</p>
+                  ) : (
+                    <p>This campaign has {totalContacts} contacts but only {quota.remaining} messages remaining this month.</p>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Start Button */}
             <Button
               className="w-full"
               onClick={handleStartCampaign}
-              disabled={loading || !file || !templateName}
+              disabled={loading || !file || !templateName || (quota !== null && quota.remaining <= 0) || (quota !== null && totalContacts > quota.remaining)}
             >
               {loading ? (
                 <>
@@ -397,7 +482,7 @@ export default function BulkMessagePage() {
               ) : (
                 <>
                   <Play className="mr-2 h-4 w-4" />
-                  Start Campaign
+                  Start Campaign {quota && totalContacts > 0 ? `(${totalContacts} / ${quota.remaining} remaining)` : ''}
                 </>
               )}
             </Button>

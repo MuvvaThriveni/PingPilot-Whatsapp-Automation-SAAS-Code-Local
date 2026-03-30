@@ -230,3 +230,20 @@ CREATE TABLE IF NOT EXISTS user_triggers (
 
 CREATE INDEX IF NOT EXISTS idx_user_triggers_tenant_updated_at
   ON user_triggers (tenant_id, updated_at DESC);
+
+
+-- ── Per-tenant bulk message quota ───────────────────────────────────
+
+-- Add quota limit column to tenants table
+ALTER TABLE tenants
+  ADD COLUMN IF NOT EXISTS bulk_quota_limit INTEGER NOT NULL DEFAULT 100;
+
+-- New counter table for per-tenant monthly quota tracking
+-- month_key format: 'YYYY-MM' (matches usage_events convention)
+CREATE TABLE IF NOT EXISTS tenant_quota_usage (
+  tenant_id       TEXT        NOT NULL,
+  month_key       TEXT        NOT NULL,
+  messages_sent   INTEGER     NOT NULL DEFAULT 0,
+  last_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, month_key)
+);

@@ -86,6 +86,7 @@ export const fileForward = {
 };
 
 export const bulkMessage = {
+  quota: () => api.get('/bulk-message/quota'),
   templates: () => api.get('/bulk-message/templates'),
   parse: (formData: FormData) =>
     api.post('/bulk-message/parse', formData, {
