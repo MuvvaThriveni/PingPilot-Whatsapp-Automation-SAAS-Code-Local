@@ -687,16 +687,33 @@ async def main():
     # Limiter setup: max 80 requests per second (1000ms)
     rate_limit = int(os.environ.get("QUEUE_RATE_LIMIT", "80"))
     
+    # Worker settings to reduce Redis polling (Fix #2: Redis command optimization)
+    # - stalledInterval: 5 minutes (default: 30s) — check for stalled jobs less frequently
+    # - lockDuration: 5 minutes (default: 30s) — matches stalledInterval, prevents premature stall detection
+    # - drainDelay: 5 seconds — wait before polling again when queue is empty
+    # - maxStalledCount: 1 — minimize stalled job check iterations
+    # Lock duration safety: worst-case job execution with 5 retries = ~125s, well within 300s lock
+    worker_settings = {
+        "stalledInterval": 300000,      # 5 minutes (300,000ms)
+        "maxStalledCount": 1,            # Minimize stalled checks
+        "lockDuration": 300000,          # 5 minutes (300,000ms) — matches stalledInterval
+        "drainDelay": 5,                 # Wait 5s before next poll when idle
+    }
+    
     worker_options = {
         "limiter": {
             "max": rate_limit, 
             "duration": 1000 
         },
-        "connection": redis_opts
+        "connection": redis_opts,
+        "settings": worker_settings,
     }
 
     # Worker for Campaign splits
-    campaign_worker = Worker("campaign_queue", process_campaign_job, {"connection": redis_opts})
+    campaign_worker = Worker("campaign_queue", process_campaign_job, {
+        "connection": redis_opts,
+        "settings": worker_settings,
+    })
     
     # Worker for concurrent messages
     message_worker = Worker("message_queue", process_message_job, worker_options)

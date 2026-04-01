@@ -1,4 +1,5 @@
 import os
+import re
 from bullmq import Queue
 from rate_limit import get_redis_opts_for_bullmq
 
@@ -32,7 +33,45 @@ async def enqueue_message(
     message_text: str = "",
     priority: int = 1
 ):
-    """Enqueue individual message job."""
+    """Enqueue individual message job with idempotent deduplication for campaigns.
+    
+    For campaign-based jobs (campaign_id != "webhook" or "file_forward"):
+        - Overrides job_id with format: {campaign_id}:{normalized_phone}:{safe_template}
+        - Normalizes phone numbers to ensure consistent format (prepends 91 for 10-digit numbers)
+        - Sanitizes template_name to ensure safe, consistent jobId keys
+        - Ensures deduplication of identical messages to the same recipient
+        - Sets contact_id to normalized_phone for data consistency
+    
+    For webhook/file_forward jobs:
+        - Uses the provided job_id as-is (preserves existing behavior)
+    """
+    
+    # Override jobId for campaign-based message jobs to ensure idempotent deduplication
+    if campaign_id not in ("webhook", "file_forward"):
+        # Normalize phone number: remove all non-digit characters
+        normalized_phone = "".join(filter(str.isdigit, phone_number))
+        
+        # Ensure consistent format: prepend default country code (91) for 10-digit numbers
+        # This prevents duplicates from "9876543210" vs "919876543210"
+        if len(normalized_phone) == 10 and normalized_phone[0] in ('6', '7', '8', '9'):
+            normalized_phone = '91' + normalized_phone
+        
+        # Sanitize template_name for safe jobId generation
+        # - Default to "text" if empty
+        # - Convert to lowercase
+        # - Replace spaces with underscores
+        # - Remove any non-alphanumeric/underscore characters
+        safe_template = re.sub(r'[^a-zA-Z0-9_]', '', (template_name or "text").lower().replace(" ", "_"))
+        
+        # Generate composite jobId: campaign_id:normalized_phone:safe_template
+        # Including template_name ensures different templates for the same user are not blocked
+        job_id = f"{campaign_id}:{normalized_phone}:{safe_template}"
+        
+        # Update contact_id to normalized_phone for data consistency
+        contact_id = normalized_phone
+    
+    # For webhook/file_forward jobs, use the provided job_id as-is
+    
     opts = {
         "jobId": job_id, 
         "attempts": int(os.environ.get("QUEUE_RETRY_ATTEMPTS", "3")),

@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from observability import log_event
 
 import redis.asyncio as aioredis
+from redis.exceptions import NoScriptError
 from urllib.parse import urlparse
 
 # ── Redis connection (shared singleton) ─────────────────────────────
@@ -115,8 +116,117 @@ def _client_ip(request: Request) -> str:
     return "unknown"
 
 
+# ── Token Bucket Rate Limiter (Lua-based, single Redis command) ────
+# Reduces Redis commands from ~5 to 1 per request using EVALSHA.
+
+# Feature flag for gradual rollout
+USE_TOKEN_BUCKET = os.getenv("USE_TOKEN_BUCKET", "true").lower() == "true"
+
+# Lua script for atomic token bucket with refill logic
+_TOKEN_BUCKET_RATE_LIMIT_LUA = """
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+local data = redis.call("HMGET", key, "tokens", "last_refill")
+local tokens = tonumber(data[1])
+local last_refill = tonumber(data[2])
+
+if tokens == nil then
+    tokens = capacity
+    last_refill = now
+end
+
+local delta = math.max(0, now - last_refill)
+local refill = delta * refill_rate
+tokens = math.min(capacity, tokens + refill)
+
+if tokens < 1 then
+    redis.call("HMSET", key, "tokens", tokens, "last_refill", now)
+    redis.call("EXPIRE", key, ttl)
+    return {0, tokens}
+end
+
+tokens = tokens - 1
+redis.call("HMSET", key, "tokens", tokens, "last_refill", now)
+redis.call("EXPIRE", key, ttl)
+
+return {1, tokens}
+"""
+
+# SHA cache for EVALSHA (loaded lazily on first use)
+_TOKEN_BUCKET_SHA: str | None = None
+
+
+async def _get_token_bucket_sha(r: aioredis.Redis) -> str:
+    """Get cached SHA or load Lua script into Redis.
+    
+    Uses module-level cache to avoid repeated SCRIPT LOAD calls.
+    """
+    global _TOKEN_BUCKET_SHA
+    if _TOKEN_BUCKET_SHA is None:
+        _TOKEN_BUCKET_SHA = await r.script_load(_TOKEN_BUCKET_RATE_LIMIT_LUA)
+    return _TOKEN_BUCKET_SHA
+
+
+async def check_rate_limit_token_bucket(
+    key: str,
+    capacity: int,
+    refill_rate: float,
+) -> tuple[bool, float]:
+    """Token bucket rate limiter using single EVALSHA call.
+    
+    Args:
+        key: Redis key for this rate limit bucket
+        capacity: Maximum tokens (burst capacity)
+        refill_rate: Tokens refilled per second
+    
+    Returns:
+        (allowed: bool, retry_after_seconds: int)
+    """
+    r = await get_redis()
+    now = time.time()
+    ttl = math.ceil(capacity / max(refill_rate, 1e-6))
+    
+    try:
+        # Try EVALSHA first (fast path)
+        sha = await _get_token_bucket_sha(r)
+        result = await r.evalsha(sha, 1, key, capacity, refill_rate, now, ttl)
+    except NoScriptError:
+        # Reset cached SHA
+        global _TOKEN_BUCKET_SHA
+        _TOKEN_BUCKET_SHA = None
+
+        # Fallback to EVAL (guaranteed execution)
+        result = await r.eval(
+            _TOKEN_BUCKET_RATE_LIMIT_LUA,
+            1,
+            key,
+            capacity,
+            refill_rate,
+            now,
+            ttl,
+        )
+
+        # Re-cache SHA for future calls
+        _TOKEN_BUCKET_SHA = await r.script_load(_TOKEN_BUCKET_RATE_LIMIT_LUA)
+    
+    allowed = bool(result[0])
+    remaining_tokens = float(result[1])
+    
+    if not allowed:
+        # Calculate retry_after based on tokens needed
+        retry_after = math.ceil(max(0, (1 - remaining_tokens) / refill_rate))
+        return False, retry_after
+    
+    return True, 0
+
+
 # ── Sliding-window rate limiter (generic) ───────────────────────────
 # Uses Redis sorted sets for precise sliding window counting.
+# KEPT AS FALLBACK for safe rollout.
 
 async def _check_rate_limit(
     key: str,
@@ -217,7 +327,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     max_req, window = 300, 60
                     key = f"rl:tenant:{tenant_id}:general"
 
-                allowed, retry_after = await _check_rate_limit(key, max_req, window)
+                if USE_TOKEN_BUCKET:
+                    # Token bucket: convert max_req/window to capacity and refill_rate
+                    capacity = max_req
+                    refill_rate = max_req / window  # tokens per second
+                    allowed, retry_after = await check_rate_limit_token_bucket(
+                        key, capacity, refill_rate
+                    )
+                else:
+                    # Fallback to sliding window
+                    allowed, retry_after = await _check_rate_limit(key, max_req, window)
                 if not allowed:
                     log_event(
                         "api_rate_limited",
@@ -243,7 +362,14 @@ def rate_limit_by_ip(max_requests: int = 60, window_seconds: int = 60):
     async def dependency(request: Request):
         ip = _client_ip(request)
         key = f"rl:ip:{ip}:{request.url.path}"
-        allowed, retry_after = await _check_rate_limit(key, max_requests, window_seconds)
+        if USE_TOKEN_BUCKET:
+            capacity = max_requests
+            refill_rate = max_requests / window_seconds
+            allowed, retry_after = await check_rate_limit_token_bucket(
+                key, capacity, refill_rate
+            )
+        else:
+            allowed, retry_after = await _check_rate_limit(key, max_requests, window_seconds)
         if not allowed:
             log_event(
                 "api_rate_limited",
@@ -267,7 +393,14 @@ def rate_limit_by_tenant(max_requests: int = 300, window_seconds: int = 60):
             # Auth middleware hasn't run yet or public route — skip
             return None
         key = f"rl:tenant:{tenant_id}:{request.url.path}"
-        allowed, retry_after = await _check_rate_limit(key, max_requests, window_seconds)
+        if USE_TOKEN_BUCKET:
+            capacity = max_requests
+            refill_rate = max_requests / window_seconds
+            allowed, retry_after = await check_rate_limit_token_bucket(
+                key, capacity, refill_rate
+            )
+        else:
+            allowed, retry_after = await _check_rate_limit(key, max_requests, window_seconds)
         if not allowed:
             log_event(
                 "api_rate_limited",
@@ -348,16 +481,36 @@ async def tenant_token_bucket_consume(tenant_id: str) -> bool:
 GLOBAL_COOLDOWN_KEY = "wa:global_cooldown"
 GLOBAL_COOLDOWN_TTL = int(os.environ.get("WA_COOLDOWN_TTL", "5"))  # seconds
 
+# In-memory cache for cooldown status (Fix #3: Redis command optimization)
+# Reduces Redis GET calls from ~1,000/campaign to ~10/campaign
+_cooldown_cache = {"value": False, "expires_at": 0.0}
+
 
 async def set_global_cooldown():
     """Activate global cooldown after repeated WhatsApp 429 responses."""
     r = await get_redis()
     await r.set(GLOBAL_COOLDOWN_KEY, "1", ex=GLOBAL_COOLDOWN_TTL)
     log_event("wa_global_cooldown_set", detail=f"ttl={GLOBAL_COOLDOWN_TTL}s", level="WARN")
+    # Invalidate cache immediately when cooldown is set
+    _cooldown_cache["expires_at"] = 0.0
 
 
 async def is_global_cooldown_active() -> bool:
-    """Check if the global cooldown is currently active."""
+    """Check if the global cooldown is currently active.
+    
+    Uses a 2-second in-memory cache to reduce Redis GET commands during
+    high-throughput message processing (e.g., 1,000-message campaigns).
+    """
+    now = time.time()
+    if now < _cooldown_cache["expires_at"]:
+        return _cooldown_cache["value"]
+    
+    # Cache expired — fetch from Redis
     r = await get_redis()
     val = await r.get(GLOBAL_COOLDOWN_KEY)
-    return val is not None
+    active = val is not None
+    
+    # Update cache with 2-second TTL
+    _cooldown_cache["value"] = active
+    _cooldown_cache["expires_at"] = now + 2.0
+    return active

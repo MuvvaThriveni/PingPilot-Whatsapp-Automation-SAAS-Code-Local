@@ -18,10 +18,13 @@ Whether you are dispatching a 10,000-contact campaign or instantly responding to
 
 - **Multi-Tenant Isolation**: Complete data separation at the API layer via Firebase Auth tokens, ensuring cross-tenant data leaks are impossible.
 - **Robust Queuing Architecture**: Uses Redis + BullMQ for true asynchronous message processing, preventing WhatsApp rate-limit bans (max 80 req/sec configuration).
-- **Campaign State Management**: Chunk-based campaign processing with instant "Stop/Cancel" capabilities via cross-worker Firestore signals.
-- **Resilient Webhook Handlers**: Processes incoming WhatsApp webhooks, validates `X-Hub-Signature-256`, deduplicates payloads, and routes them to a priority chatbot responder.
+- **Campaign State Management**: Chunk-based campaign processing with instant "Stop/Cancel" capabilities, per-tenant monthly bulk message quotas, and resend-failed workflows.
+- **Resilient Webhook Handlers**: Per-tenant webhook URLs with `X-Hub-Signature-256` HMAC verification, deduplication, and priority chatbot response routing.
 - **Intelligent Template Caching**: Tenant-scoped caching for approved WhatsApp templates to reduce round trips to Meta.
 - **Time Standardization**: Enforces IST (Indian Standard Time) consistently across logging, database timestamps, and telemetry.
+- **Encryption at Rest**: Sensitive secrets (e.g., `meta_app_secret`) are Fernet-encrypted before storage in Postgres.
+- **Data Retention**: Automated archive + purge system keeps live tables fast while preserving historical data.
+- **Per-Tenant Bulk Quotas**: Monthly message caps with atomic three-layer enforcement (API → worker fan-out → per-message).
 
 ---
 
@@ -30,31 +33,34 @@ Whether you are dispatching a 10,000-contact campaign or instantly responding to
 WappFlow separates concerns into three primary domains: **Frontend**, **API Server**, and **Background Workers**.
 
 ```text
-┌─────────────────┐      ┌─────────────┐       ┌───────────────┐
-│ Next.js Next.js │      │   FastAPI   │       │   Worker(s)   │
-│   (Frontend)    │ ────▶│  (Backend)  │ ────▶ │ BullMQ / Async│
-└─────────────────┘      └──────┬──────┘       └──────┬────────┘
-                                │                     │
-                                │                     │
-                         ┌──────▼──────┐       ┌──────▼────────┐
-                         │  Firestore  │       │ WhatsApp API  │
-                         │ (Serverless)│       │ (Meta Cloud)  │
-                         └─────────────┘       └───────────────┘
-                                ▲                     ▲
-                                │                     │
-                                └─────────────────────┘
-                                  Webhook Callbacks
+┌─────────────────┐      ┌──────────────┐       ┌───────────────┐
+│   Next.js 14    │      │   FastAPI     │       │   Worker(s)   │
+│   (Frontend)    │ ────▶│  (Backend)    │ ────▶ │ BullMQ / Async│
+└─────────────────┘      └──────┬───────┘       └──────┬────────┘
+                                │                      │
+                     ┌──────────┴──────────┐           │
+                     │                     │           │
+              ┌──────▼──────┐    ┌────────▼──┐  ┌────▼──────────┐
+              │ Neon Postgres│    │   Redis   │  │ WhatsApp API  │
+              │ (Serverless) │    │ (BullMQ)  │  │ (Meta Cloud)  │
+              └─────────────┘    └──────────┘  └───────────────┘
+                      ▲                               ▲
+                      │                               │
+                      └───────────────────────────────┘
+                          Webhook Callbacks
 ```
 
 ### Tech Stack
 
 | Category | Technologies |
 | --- | --- |
-| **Frontend** | Next.js 14, React 18, Tailwind CSS, Radix UI, Framer Motion |
-| **Backend API** | FastAPI (Python), Uvicorn |
-| **Queues / caching**| Redis, BullMQ (Python Port) |
-| **Database** | Firebase / Firestore (NoSQL) |
+| **Frontend** | Next.js 14, React 18, Tailwind CSS, shadcn/ui, Radix UI, Framer Motion |
+| **Backend API** | FastAPI (Python 3.11+), Uvicorn, Pydantic |
+| **Queues / Caching** | Redis, BullMQ (Python Port) |
+| **Database** | Neon Postgres (Serverless PostgreSQL) via `psycopg3` + connection pooling |
 | **Authentication** | Firebase Auth (JWT verification middleware) |
+| **Encryption** | Fernet (AES-128-CBC) for secrets at rest |
+| **Deployment** | Vercel (frontend), Render (backend), Docker Compose (local) |
 
 ---
 
@@ -71,21 +77,24 @@ User
  │ 1. Uploads CSV
  ▼
 API (FastAPI) 
- │ 2. Validates user, creates Campaign & Recipients in Firestore
- │ 3. Enqueues job to 'campaign_queue'
+ │ 2. Validates user, checks monthly quota
+ │ 3. Creates Campaign & Recipients in Postgres
+ │ 4. Enqueues job to 'campaign_queue'
  ▼
 Redis
- │ 4. Persists job
+ │ 5. Persists job
  ▼
 Worker (campaign_queue)
- │ 5. Locks campaign, fetches recipients in batches
- │ 6. Dispatches individual jobs to 'message_queue'
+ │ 6. Reads quota remaining, caps fan-out
+ │ 7. Dispatches individual jobs to 'message_queue'
+ │ 8. Marks excess recipients as 'quota_exceeded'
  ▼
 Worker (message_queue)
- │ 7. Rate-limited execution (80 req/sec)
- │ 8. Calls Meta WhatsApp Cloud API
- │ 9. On success: Updates Firestore counters
- │ 10. On failure: Auto-retries with exponential backoff
+ │ 9.  Atomic quota consume (per-message)
+ │ 10. Rate-limited execution (80 req/sec)
+ │ 11. Calls Meta WhatsApp Cloud API
+ │ 12. On success: Updates Postgres counters
+ │ 13. On failure: Auto-retries with exponential backoff
  ▼
 WhatsApp Cloud API
 ```
@@ -96,16 +105,17 @@ When a user replies to a WappFlow business number, Meta fires a webhook back to 
 
 ```text
 WhatsApp API
- │ 1. Sends payload to /api/webhook
+ │ 1. Sends payload to /api/webhook/{tenant_id}
  ▼
 API (FastAPI)
- │ 2. Verifies HMAC signature, deduplicates by Message ID
- │ 3. Evaluates Chatbot Rules (DB lookup) or Default Buttons
- │ 4. Enqueues a HIGH-PRIORITY (Priority: 0) job to 'message_queue'
+ │ 2. Verifies HMAC-SHA256 signature (per-tenant encrypted secret)
+ │ 3. Deduplicates by Message ID
+ │ 4. Evaluates Chatbot Rules (button mappings → keyword rules → first-trigger fallback)
+ │ 5. Enqueues a HIGH-PRIORITY (Priority: 0) job to 'message_queue'
  ▼
 Worker (message_queue)
- │ 5. Bypasses bulk messages in queue
- │ 6. Instantly dispatches reply via WhatsApp API
+ │ 6. Bypasses bulk messages in queue
+ │ 7. Instantly dispatches reply via WhatsApp API
  ▼
 User receives instant reply
 ```
@@ -118,19 +128,28 @@ WappFlow embraces asynchronous job processing to overcome common Node/Python bot
 
 We use **3 primary queues**:
 
-1. **`campaign_queue`**: A lightweight queue. A job here represents "Launch Campaign X". The worker picks this up, connects to Firestore, slices the audience into chunks, and floods the message queue. 
+1. **`campaign_queue`**: A lightweight queue. A job here represents "Launch Campaign X". The worker picks this up, reads quota remaining, caps fan-out, and floods the message queue. 
 2. **`message_queue`**: The heavy-lifter. Processes individual API calls to Meta. Features:
    - **Rate Limiting**: Strictly capped at 80 messages per second to avoid Meta API bans.
-   - **Retry & Backoff**: Configured for 5 attempts with `exponential` delay starting at 5 seconds (5s → 10s → 20s → 40s).
+   - **Retry & Backoff**: Configured for 3 attempts (default) with `exponential` delay starting at 5 seconds.
    - **Idempotency**: Utilizes calculated unique IDs to prevent duplicate sends if a worker crashes during execution.
    - **Priority Routing**: Chatbot webhook replies are queued as priority `0` (highest), ensuring customer support isn't delayed by a marketing blast.
-3. **`dead_letter_queue`**: Messages that exhaust all 5 retries are gracefully moved here with the `permanently_failed` event, ensuring the main queue isn't clogged by continuously failing payloads.
+   - **Per-Tenant Token Bucket**: 10 msg/sec per tenant (burst 20) for fair resource sharing.
+3. **`dead_letter_queue`**: Messages that exhaust all retries are gracefully moved here with the `permanently_failed` event, ensuring the main queue isn't clogged by continuously failing payloads.
 
 ---
 
 ## 💻 Getting Started (Local Development)
 
-You can spin up the full WappFlow environment natively within minutes.
+You can spin up the full WappFlow environment within minutes.
+
+### Prerequisites
+
+- Python 3.11+
+- Node.js 18+
+- Docker (for Redis)
+- Postgres connection string (Neon DB or local)
+- Firebase project with Auth enabled
 
 ### 1. Clone & Install
 ```bash
@@ -145,15 +164,16 @@ npm run install:all
 
 **Backend (`backend/.env`)**
 ```env
-ENVIRONMENT=development
-CORS_ORIGINS=http://localhost:3000
-FIREBASE_CREDENTIALS_PATH=./firebase-service-account.json
+# Copy from the comprehensive example:
+cp backend/.env.example backend/.env
+
+# Required values to fill in:
+DATABASE_URL=postgresql://user:password@host:5432/dbname?sslmode=require
+WEBHOOK_VERIFY_TOKEN=your_custom_secure_token
+ENCRYPTION_KEY=<generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())">
 
 REDIS_HOST=localhost
 REDIS_PORT=6379
-
-WEBHOOK_VERIFY_TOKEN=your_custom_secure_token
-META_APP_SECRET=your_whatsapp_app_secret
 ```
 
 **Frontend (`frontend/.env.local`)**
@@ -166,21 +186,28 @@ NEXT_PUBLIC_FIREBASE_PROJECT_ID=xxx
 
 *(Place your Firebase Admin SDK credential file at `backend/firebase-service-account.json`)*
 
-### 3. Start Infrastructure
+### 3. Apply Database Schema
+```bash
+cd backend
+python apply_schema.py
+```
+
+### 4. Start Infrastructure
 
 WappFlow requires Redis. We provide a docker-compose file for this:
 ```bash
 docker-compose up redis -d
 ```
 
-### 4. Start the Application
+### 5. Start the Application
 
 You need to run BOTH the auto-reloading API+Frontend and the worker script.
 
-**Terminal 1: Start API & Frontend**
+**Terminal 1: Start API**
 ```bash
-# This uses concurrently to spin up Next.js (port 3000) and FastAPI (port 5000)
-npm run dev
+cd backend
+pip install -r requirements.txt
+python run_server.py
 ```
 
 **Terminal 2: Start the Background Worker**
@@ -189,6 +216,15 @@ npm run dev
 cd backend
 python worker_main.py
 ```
+
+**Terminal 3: Start Frontend**
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000` → register/login → configure WhatsApp settings → you're ready to test.
 
 ---
 
@@ -204,10 +240,11 @@ Deploy the `frontend/` directory directly to **Vercel**.
 ### Backend (API + Workers)
 The backend is best deployed via **Docker** on a VPS (AWS EC2, DigitalOcean) or a PaaS like **Render** or **Railway**.
 
-1. **Redis**: Provision a managed Redis instance (e.g., Upstash).
-2. **API Service**: Run the Uvicorn web server.
+1. **Postgres**: Provision a serverless Postgres instance (e.g., Neon DB).
+2. **Redis**: Provision a managed Redis instance with TLS (e.g., Upstash). Use `rediss://` (double `s`) URL scheme.
+3. **API Service**: Run the Uvicorn web server.
    `uvicorn main:app --host 0.0.0.0 --port 5000`
-3. **Worker Service**: Run the Python worker as an independent background process.
+4. **Worker Service**: Run the Python worker as an independent background process.
    `python worker_main.py`
 
 ### 📈 Scaling the System
@@ -221,8 +258,11 @@ The backend is best deployed via **Docker** on a VPS (AWS EC2, DigitalOcean) or 
 | Issue | Cause / Solution |
 | --- | --- |
 | **Campaign Stuck at 0 Sent** | Worker isn't running. Ensure you are running `worker_main.py` in a separate terminal. |
-| **Webhooks not triggering** | Meta Cloud cannot reach localhost. Run `ngrok http 5000` and update your Meta App Webhook URL. |
-| **Invalid Signature (401)** | `META_APP_SECRET` does not match the Meta dashboard, or the trailing whitespace is polluting the `.env`. |
+| **Webhooks not triggering** | Meta Cloud cannot reach localhost. Run `ngrok http 5000` and update your Meta App Webhook URL to `https://<ngrok>/api/webhook/{tenant_id}`. |
+| **Invalid Signature (401)** | `meta_app_secret` does not match the Meta dashboard, or the trailing whitespace is polluting the `.env`. Check `webhook_sig_rejected` logs. |
+| **Redis TLS Errors** | Cloud Redis (Upstash, Redis Cloud) requires TLS. Use `rediss://` (double `s`) in `REDIS_URL`, not `redis://`. |
+| **Stale Settings/Rules** | Settings and chatbot rules are cached for 6 hours. After manual DB changes, restart the server or wait for cache expiry. |
+| **Quota Not Updating** | Quota is tracked per `YYYY-MM` month key. Frontend auto-refreshes every 10 seconds. |
 
 ---
 
@@ -231,15 +271,53 @@ The backend is best deployed via **Docker** on a VPS (AWS EC2, DigitalOcean) or 
 ```text
 ├── backend/
 │   ├── main.py               # FastAPI entry point, CORS, Health Checks, Lifespan
-│   ├── worker_main.py        # BullMQ Worker definition
-│   ├── routers/              # Controllers (bulk_message, webhook, chatbot)
-│   ├── services/             # Abstractions (queue_manager, whatsapp)
-│   ├── db_layer/             # Firestore repository adapters
+│   ├── worker_main.py        # BullMQ Worker definition (campaign + message processing)
+│   ├── database.py           # Async Postgres pool (psycopg3), transaction helper
+│   ├── schema.sql            # Complete DDL for all live tables
+│   ├── retention_schema.sql  # DDL for archive tables + daily_message_stats
+│   ├── retention.py          # Data retention engine (archive + purge) + CLI
+│   ├── auth_middleware.py    # Firebase Auth token verification middleware
+│   ├── rate_limit.py         # Redis rate limiter (API + worker token bucket)
+│   ├── cache.py              # In-memory TTL cache (6h default)
+│   ├── store.py              # Cached read/write layer for settings + chatbot config
+│   ├── observability.py      # Structured JSON logging
+│   ├── routers/              # Controllers (settings, bulk_message, file_forward, chatbot, logs, webhook)
+│   ├── services/             # Abstractions (queue_manager, whatsapp, template_builder, chatgpt)
+│   ├── db_layer/             # Postgres repository adapters (15 modules)
+│   ├── utils/                # Time utilities (IST helpers)
 │   └── requirements.txt      
 ├── frontend/                 # Next.js 14 Web Application
-│   ├── src/app/              
+│   ├── src/app/              # App Router pages (dashboard, login, register)
+│   ├── src/components/       # Reusable UI components (shadcn/ui based)
+│   ├── src/contexts/         # React contexts (auth)
+│   ├── src/lib/              # API client, Firebase config, utilities
 │   ├── package.json          
 │   └── tailwind.config.ts    
-├── docker-compose.yml        # Local Redis orchestration
+├── docker-compose.yml        # Local Redis + Full stack orchestration
+├── API_Developer_Doc.md      # Complete API reference (all endpoints, schemas, errors)
+├── Architecture_Overview.md  # Deep architecture documentation (for onboarding)
 └── package.json              # Global dependency runner
 ```
+
+---
+
+## 📚 Documentation
+
+| Document | Purpose | Audience |
+|----------|---------|----------|
+| **[API_Developer_Doc.md](API_Developer_Doc.md)** | Complete API reference with request/response schemas, error codes, rate limits, encryption details, data retention, quota system, and onboarding quick-start | Backend developers, frontend integrators |
+| **[Architecture_Overview.md](Architecture_Overview.md)** | Deep system architecture — multi-tenancy model, request lifecycle, data flows, security layers, queue architecture, retention system, and phase history | New team members, architects |
+| **[Technical_Readme.md](Technical_Readme.md)** | Concise technical summary of every system component | Quick reference |
+
+---
+
+## 🔒 Security Highlights
+
+- **Firebase Auth** on every request (except webhooks/health)
+- **Row-level tenant isolation** on all DB tables
+- **Per-tenant HMAC webhook verification** (X-Hub-Signature-256)
+- **Fernet encryption at rest** for sensitive secrets
+- **Redis sliding-window rate limiting** (API + worker tiers)
+- **Input validation** via Pydantic models
+- **CSV injection protection** on exports
+- **OpenAPI/Swagger disabled** in production
