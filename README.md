@@ -33,17 +33,17 @@ Whether you are dispatching a 10,000-contact campaign or instantly responding to
 WappFlow separates concerns into three primary domains: **Frontend**, **API Server**, and **Background Workers**.
 
 ```text
-┌─────────────────┐      ┌──────────────┐       ┌───────────────┐
-│   Next.js 14    │      │   FastAPI     │       │   Worker(s)   │
-│   (Frontend)    │ ────▶│  (Backend)    │ ────▶ │ BullMQ / Async│
-└─────────────────┘      └──────┬───────┘       └──────┬────────┘
+┌─────────────────┐       ┌──────────────┐         ┌───────────────┐
+│   Next.js 14    │       │   FastAPI    │         │   Worker(s)   │
+│   (Frontend)    │ ────▶│  (Backend)   │ ────▶   │ BullMQ / Async│
+└─────────────────┘       └──────┬───────┘         └──────┬────────┘
                                 │                      │
                      ┌──────────┴──────────┐           │
                      │                     │           │
-              ┌──────▼──────┐    ┌────────▼──┐  ┌────▼──────────┐
-              │ Neon Postgres│    │   Redis   │  │ WhatsApp API  │
-              │ (Serverless) │    │ (BullMQ)  │  │ (Meta Cloud)  │
-              └─────────────┘    └──────────┘  └───────────────┘
+              ┌──────▼──────┐     ┌────────▼──┐   ┌────▼──────────┐
+              │ Neon Postgres│    │   Redis   │   │ WhatsApp API  │
+              │ (Serverless) │    │ (BullMQ)  │   │ (Meta Cloud)  │
+              └─────────────┘     └───────────┘   └───────────────┘
                       ▲                               ▲
                       │                               │
                       └───────────────────────────────┘
