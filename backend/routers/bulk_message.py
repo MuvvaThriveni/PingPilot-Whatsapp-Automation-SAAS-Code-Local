@@ -27,8 +27,11 @@ from observability import log_event
 from db_layer.campaigns import campaigns as _db_campaigns
 from db_layer.campaign_recipients import campaign_recipients as _db_recipients
 from db_layer.campaign_counters import campaign_counters as _db_counters
+from db_layer.tenants import tenants as _db_tenants
+from db_layer.quota import get_quota_status
 from database import transaction, execute
 from services.queue_manager import campaign_queue
+from fastapi.exceptions import HTTPException
 
 router = APIRouter(prefix="/api/bulk-message", tags=["bulk-message"])
 
@@ -195,6 +198,23 @@ async def get_templates(request: Request):
     return {"templates": approved}
 
 
+@router.get("/quota")
+async def get_bulk_quota(request: Request):
+    """Return current bulk message quota status for the tenant."""
+    tenant_id = request.state.tenant_id
+    tenant = await _db_tenants.get(tenant_id)
+    limit = int((tenant or {}).get("bulk_quota_limit", 100))
+    quota = await get_quota_status(tenant_id, limit)
+    return {
+        "used":         quota.used,
+        "limit":        quota.limit,
+        "remaining":    quota.remaining,
+        "month_key":    quota.month_key,
+        "resets_at":    quota.resets_at,
+        "percent_used": round(quota.used / quota.limit * 100, 1) if quota.limit > 0 else 100.0,
+    }
+
+
 @router.post("/parse")
 async def parse_contacts_file(file: UploadFile = File(...)):
     try:
@@ -237,6 +257,39 @@ async def start_bulk_campaign(
 
     if not contacts:
         return JSONResponse(status_code=400, content={"error": "No valid contacts found"})
+
+    # ── Quota enforcement ─────────────────────────────────────────────
+    tenant = await _db_tenants.get(tenant_id)
+    bulk_quota_limit = int((tenant or {}).get("bulk_quota_limit", 100))
+    quota = await get_quota_status(tenant_id, bulk_quota_limit)
+
+    if quota.remaining <= 0:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error":     "quota_exceeded",
+                "message":   "Monthly bulk message quota exhausted.",
+                "used":      quota.used,
+                "limit":     quota.limit,
+                "remaining": 0,
+                "resets_at": quota.resets_at,
+            },
+        )
+
+    total_contacts = len(contacts)
+    if total_contacts > quota.remaining:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error":     "quota_would_exceed",
+                "message":   f"Campaign has {total_contacts} contacts but only {quota.remaining} messages remaining this month.",
+                "remaining": quota.remaining,
+                "resets_at": quota.resets_at,
+            },
+        )
+
+    log_event("quota_check_passed", tenant_id=tenant_id,
+              detail=f"remaining={quota.remaining} contacts={total_contacts}")
 
     campaign_id = str(uuid.uuid4())
     now = _ist_now()

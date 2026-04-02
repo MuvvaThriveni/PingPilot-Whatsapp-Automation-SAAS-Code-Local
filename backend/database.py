@@ -4,6 +4,10 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any
 
+
+if os.name == "nt":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 try:
     import psycopg
     from psycopg.rows import dict_row

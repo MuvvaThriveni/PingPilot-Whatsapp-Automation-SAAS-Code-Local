@@ -13,7 +13,6 @@ Security improvements:
 import os
 import hmac
 import hashlib
-import datetime
 import uuid
 import logging
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -23,15 +22,8 @@ logger = logging.getLogger(__name__)
 
 from utils.time_utils import get_ist_now_iso
 
-from store import get_settings, get_chatbot_settings
+from store import get_chatbot_settings
 from db_layer.encryption import decrypt_secret
-from services.whatsapp import WhatsAppService
-from services.template_builder import (
-    ensure_cached as _ensure_template_cached,
-    upload_header_media as _upload_header_media,
-    build_components as _build_template_components,
-    get_template_keys_for_tenant as _get_template_keys_for_tenant,
-)
 from db_layer.tenants import tenants as _db_tenants
 from observability import log_event
 from db_layer.webhook_events import webhook_events as _db_webhook
@@ -287,7 +279,6 @@ async def _process_webhook_body(body: dict, tenant_id_override: str | None = Non
 
             logger.info(f"[WEBHOOK] tenant_id={tenant_id}")
 
-            settings = await get_settings(tenant_id)
             chatbot = await get_chatbot_settings(tenant_id)
 
             # --- Handle status updates ---
@@ -472,58 +463,59 @@ async def _process_webhook_body(body: dict, tenant_id_override: str | None = Non
                 cache.invalidate(chat_users_key(tenant_id))
 
                 # ── Chatbot Decision Logic ───────────────────────────────
-                whatsapp = WhatsAppService(
-                    settings["phone_number_id"],
-                    settings["access_token"],
-                )
-
+                # All auto-reply logic is gated by chatbot["is_enabled"].
+                # When the chatbot is disabled in the dashboard, NO templates,
+                # keyword rules, or first_trigger fallbacks should fire.
                 response_text = ""
                 response_template = ""
                 matched_rule = False
 
-                # 1. Configurable button→template mappings (per-tenant)
-                clean_text = message_text.strip()
-                text_map, id_map = await _get_button_mappings(tenant_id)
+                if chatbot["is_enabled"]:
+                    # 1. Configurable button→template mappings (per-tenant)
+                    clean_text = message_text.strip()
+                    text_map, id_map = await _get_button_mappings(tenant_id)
 
-                if not matched_rule:
-                    # Check text-based button match
-                    if clean_text in text_map:
-                        response_template = text_map[clean_text]
-                        matched_rule = True
-                        log_event("button_match", tenant_id=tenant_id, phone=sender_phone,
-                                  status="matched", detail=f"text={clean_text!r} → {response_template}")
+                    if not matched_rule:
+                        # Check text-based button match
+                        if clean_text in text_map:
+                            response_template = text_map[clean_text]
+                            matched_rule = True
+                            log_event("button_match", tenant_id=tenant_id, phone=sender_phone,
+                                      status="matched", detail=f"text={clean_text!r} → {response_template}")
 
-                    # Check button ID match
-                    elif interactive_button_id and interactive_button_id in id_map:
-                        response_template = id_map[interactive_button_id]
-                        matched_rule = True
-                        log_event("button_id_match", tenant_id=tenant_id, phone=sender_phone,
-                                  status="matched", detail=f"id={interactive_button_id!r} → {response_template}")
+                        # Check button ID match
+                        elif interactive_button_id and interactive_button_id in id_map:
+                            response_template = id_map[interactive_button_id]
+                            matched_rule = True
+                            log_event("button_id_match", tenant_id=tenant_id, phone=sender_phone,
+                                      status="matched", detail=f"id={interactive_button_id!r} → {response_template}")
 
-                # 2. Existing Chatbot Rules (DB-based)
-                if not matched_rule and chatbot["is_enabled"]:
-                    rules = await _db_chatbot_rules.get_active(tenant_id)
-                    message_lower = message_text.lower().strip()
-                    for rule in rules:
-                        keyword = rule.get("keyword", "").strip().lower()
-                        if keyword and keyword in message_lower:
-                            response_text = rule.get("response", "")
-                            if response_text:
-                                matched_rule = True
-                                break
+                    # 2. Existing Chatbot Rules (DB-based)
+                    if not matched_rule:
+                        rules = await _db_chatbot_rules.get_active(tenant_id)
+                        message_lower = message_text.lower().strip()
+                        for rule in rules:
+                            keyword = rule.get("keyword", "").strip().lower()
+                            if keyword and keyword in message_lower:
+                                response_text = rule.get("response", "")
+                                if response_text:
+                                    matched_rule = True
+                                    break
 
-                # 3. Fallback Trigger (First Trigger) - Rate limited to once every 24 hours
-                if not matched_rule:
-                    if await users_db.should_send_trigger(tenant_id, sender_phone):
-                        await users_db.record_trigger(tenant_id, sender_phone)
-                        response_template = "first_trigger"
-                        matched_rule = True
-                        log_event("fallback_trigger", tenant_id=tenant_id, phone=sender_phone,
-                                  detail="first_trigger sent (24h lock)")
+                    # 3. Fallback Trigger (First Trigger) - Rate limited to once every 24 hours
+                    if not matched_rule:
+                        if await users_db.should_send_trigger(tenant_id, sender_phone):
+                            await users_db.record_trigger(tenant_id, sender_phone)
+                            response_template = "first_trigger"
+                            matched_rule = True
+                            log_event("fallback_trigger", tenant_id=tenant_id, phone=sender_phone,
+                                      detail="first_trigger sent (24h lock)")
+                else:
+                    log_event("chatbot_disabled", tenant_id=tenant_id, phone=sender_phone,
+                              detail="chatbot is_enabled=False — skipping all auto-reply logic")
 
                 # --- Execute Reply via Queue ---
                 if matched_rule or response_text or response_template:
-                    import uuid
                     uid = str(uuid.uuid4())
                     
                     if response_template:

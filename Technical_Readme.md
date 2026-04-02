@@ -1,234 +1,320 @@
-WappFlow Technical Architecture & System Audit
+# WappFlow — Technical Architecture & System Summary
 
-WappFlow — Technical Architecture & System Audit Documentation
+> **Version:** 2.2.0 | **Last Updated:** 2026-04-01  
+> **Full Details:** [Architecture_Overview.md](Architecture_Overview.md) | **API Reference:** [API_Developer_Doc.md](API_Developer_Doc.md)
 
-Short Technical Summary
-• WappFlow is a multi-tenant WhatsApp automation platform where tenants are identified by Firebase Auth UID (tenant_id).
-• Frontend is built with Next.js 14 App Router and Firebase client authentication.
-• Backend is FastAPI with Firebase Admin middleware validating all requests except public webhook and health endpoints.
-• Primary database is Neon PostgreSQL accessed via psycopg AsyncConnectionPool.
-• Asynchronous processing uses BullMQ with Redis queues.
-• Core modules include Bulk Campaign Messaging, File Forwarding, Webhook Chatbot Automation, Settings, and Logs.
-• External integrations include Meta WhatsApp Cloud API, Firebase Authentication, and optional OpenAI integration.
-• Observability uses structured JSON logging with additional health checks.
-• Configuration is environment-variable driven.
+---
 
-1. Project Structure Analysis
-Top Level:
-backend/ – FastAPI backend, workers, database layer, services
-frontend/ – Next.js application and UI
-docker-compose.yml – runtime stack for Redis, API, worker
-architecture diagrams – architecture visualization
-package.json – development orchestration
+## Short Technical Summary
 
-Backend Components
-main.py – FastAPI entrypoint
-worker_main.py – background workers
-database.py – database connection pool
-schema.sql – database schema
-db_layer – database access modules
-services – integrations and business logic
-routers – API endpoints
-auth_middleware – Firebase authentication middleware
-cache.py – TTL in-memory caching
-observability.py – structured logging
+- WappFlow is a **multi-tenant WhatsApp automation platform** where tenants are identified by Firebase Auth UID (`tenant_id`).
+- Frontend is built with **Next.js 14** App Router and Firebase client authentication.
+- Backend is **FastAPI** with Firebase Admin middleware validating all requests except public webhook and health endpoints.
+- Primary database is **Neon PostgreSQL** accessed via `psycopg3` AsyncConnectionPool with connection pooling.
+- Asynchronous processing uses **BullMQ** with Redis queues (supports TLS via `rediss://` for cloud providers).
+- Core modules: Bulk Campaign Messaging (with monthly quotas), File Forwarding, Webhook Chatbot Automation, Settings, and Logs.
+- **Encryption at rest** via Fernet (AES-128-CBC) for sensitive secrets like `meta_app_secret`.
+- **Per-tenant webhooks** with HMAC-SHA256 signature verification.
+- **Data retention** with automated archive + purge pipeline.
+- External integrations: Meta WhatsApp Cloud API, Firebase Authentication, optional OpenAI integration.
+- Observability uses structured JSON logging with deep health checks (Postgres, Redis, background tasks, retention status).
+- Configuration is environment-variable driven with comprehensive `.env.example`.
 
-Frontend Components
-src/app – Next.js App Router pages
-src/lib/firebase.ts – Firebase client setup
-src/lib/api.ts – Axios API client
-src/contexts/AuthContext.tsx – authentication state management
-src/components – UI components
+---
 
-2. System Architecture
-Architecture pattern:
-Next.js frontend + FastAPI backend + BullMQ worker tier + Redis + PostgreSQL.
+## 1. Project Structure
 
-Runtime components:
-Frontend authenticates via Firebase and communicates through Axios.
-Backend processes API requests and enqueues background tasks.
-Worker processes queued jobs and interacts with WhatsApp API.
-Redis provides queue infrastructure.
-PostgreSQL stores tenants, campaigns, messages, and logs.
+### Top Level
+| Path | Purpose |
+|------|---------|
+| `backend/` | FastAPI backend, workers, database layer, services |
+| `frontend/` | Next.js 14 application and UI |
+| `docker-compose.yml` | Runtime stack for Redis, API, worker |
+| `API_Developer_Doc.md` | Complete API reference (1700+ lines) |
+| `Architecture_Overview.md` | Deep architecture documentation (900+ lines) |
+| `package.json` | Development orchestration |
 
-3. Core Product Modules
-Bulk Campaign System
-Uploads Excel/CSV contact lists and sends WhatsApp templates.
-Worker processes recipients and sends messages asynchronously.
+### Backend Components
+| File/Dir | Purpose |
+|----------|---------|
+| `main.py` | FastAPI entrypoint, middleware stack, lifespan, health check |
+| `worker_main.py` | BullMQ workers (campaign + message processing, quota enforcement) |
+| `database.py` | Async Postgres pool (psycopg3), transaction helper |
+| `schema.sql` | Complete database DDL (18+ tables) |
+| `retention_schema.sql` | Archive tables + `daily_message_stats` DDL |
+| `retention.py` | Data retention engine (archive + purge) + CLI |
+| `auth_middleware.py` | Firebase Auth token verification middleware |
+| `rate_limit.py` | Redis rate limiter (API sliding window + worker token bucket + global cooldown) |
+| `cache.py` | In-memory TTL caching (6h default) |
+| `store.py` | Cached read/write layer for settings + chatbot config |
+| `observability.py` | Structured JSON logging |
+| `startup_checks.py` | Environment validation on boot |
+| `startup_cache.py` | Pre-warm caches on startup |
+| `db_layer/` | 15 Postgres repository adapter modules |
+| `services/` | Business logic (queue_manager, whatsapp, template_builder, chatgpt) |
+| `routers/` | 6 API endpoint modules (settings, bulk_message, file_forward, chatbot, logs, webhook) |
+| `utils/` | IST time utilities |
 
-File Forwarding
-Allows sending documents or images to individual or bulk recipients.
+### Frontend Components
+| File/Dir | Purpose |
+|----------|---------|
+| `src/app/` | Next.js App Router pages (dashboard, login, register) |
+| `src/lib/firebase.ts` | Firebase client setup |
+| `src/lib/api.ts` | Axios API client with Firebase token interceptor |
+| `src/contexts/AuthContext.tsx` | Authentication state management |
+| `src/components/` | UI components (shadcn/ui based) |
 
-Webhook Chatbot
-Processes inbound WhatsApp messages and triggers automated responses.
+---
 
-Settings
-Stores tenant WhatsApp credentials and performs connectivity tests.
+## 2. System Architecture
 
-Logs
-Provides message logs, analytics, and CSV exports.
+**Pattern:** Next.js frontend → FastAPI backend → BullMQ worker tier → Redis + PostgreSQL
 
-4. API Layer Documentation
-Public Endpoints
-GET /api/health – system health status
-GET /api/webhook – webhook verification
-POST /api/webhook – receive inbound WhatsApp messages
+**Runtime flow:**
+1. Frontend authenticates via Firebase and communicates through Axios with Bearer token
+2. Backend processes API requests through middleware (CORS → Firebase Auth → Rate Limit)
+3. Write operations enqueue background tasks to Redis (BullMQ)
+4. Worker processes queued jobs and interacts with WhatsApp Cloud API
+5. Redis provides queue infrastructure + rate limiting state
+6. PostgreSQL (Neon) stores all tenant data, campaigns, messages, logs, and quotas
 
-Settings Endpoints
-GET /api/settings/whatsapp
-POST /api/settings/whatsapp
-POST /api/settings/whatsapp/test
-GET /api/settings/usage
+---
 
-File Forward Endpoints
-POST /api/file-forward/parse-contacts
-POST /api/file-forward/send
-POST /api/file-forward/send-bulk
+## 3. Core Product Modules
 
-Bulk Messaging Endpoints
-GET /api/bulk-message/templates
-POST /api/bulk-message/parse
-POST /api/bulk-message/start
-POST /api/bulk-message/stop/{campaign_id}
-GET /api/bulk-message/status/{campaign_id}
-GET /api/bulk-message/campaigns
-DELETE /api/bulk-message/campaigns/{campaign_id}
+### Bulk Campaign System
+- Uploads Excel/CSV contact lists and sends WhatsApp templates
+- Worker processes recipients asynchronously with rate limiting
+- **Monthly quota enforcement** at three levels (API → campaign worker → per-message)
+- Supports scheduling, pause/resume, resend-failed workflows
+- Recipient status machine: `pending → queued → processing → submitted → sent/failed/quota_exceeded`
 
-Chatbot Endpoints
-GET /api/chatbot/settings
-PUT /api/chatbot/settings
-GET /api/chatbot/rules
-POST /api/chatbot/rules
-PUT /api/chatbot/rules/{rule_id}
-DELETE /api/chatbot/rules/{rule_id}
+### File Forwarding
+- Send documents, images, and PDFs to individual or bulk recipients
+- Files uploaded once, then URL shared with all recipients via queue
 
-Logs Endpoints
-GET /api/logs
-GET /api/logs/export
-GET /api/logs/stats
+### Webhook Chatbot
+- Per-tenant webhook URLs with HMAC-SHA256 signature verification
+- Three-layer chatbot response engine: button→template mappings → keyword rules → first-trigger fallback
+- Priority queue routing (chatbot replies bypass bulk campaign traffic)
 
-5. Database Architecture
-Primary database: PostgreSQL.
+### Settings
+- Tenant WhatsApp credentials CRUD with connectivity testing
+- Sensitive secrets (meta_app_secret) encrypted at rest via Fernet
+- Usage statistics with quota status
 
-Key Tables:
-tenants – stores tenant configuration
-campaigns – campaign metadata
-campaign_recipients – recipients list per campaign
-messages – message history
-chat_messages – chat history
-webhook_events – inbound webhook deduplication
-usage_events – analytics events
-template_cache – WhatsApp template metadata
-user_triggers – trigger cooldown tracking
+### Logs
+- Unified message logs across all products with filtering and cursor pagination
+- CSV export with formula injection protection
+- Log statistics (total/sent/delivered/failed/read)
 
-Relationships:
-tenants is root entity with cascade relationships to child tables.
+---
 
-6. Message & Job Processing
-Queues:
-campaign_queue – expands campaigns into message jobs
-message_queue – sends WhatsApp messages
-dead_letter_queue – stores failed jobs
+## 4. API Endpoints Summary
 
-Features:
-Rate limiting
-Retry with exponential backoff
-Idempotent message recording
+### Public Endpoints (No Auth)
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/health` | Deep health check (Postgres, Redis, background tasks, retention/purge status) |
+| GET | `/api/webhook/{tenant_id}` | Per-tenant Meta webhook verification |
+| POST | `/api/webhook/{tenant_id}` | Per-tenant incoming webhooks (HMAC verified) |
 
-7. External Integrations
-Meta WhatsApp Cloud API
-Endpoints for sending messages, uploading media, fetching templates.
+### Settings Endpoints
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/settings/whatsapp` | Get WhatsApp configuration |
+| POST | `/api/settings/whatsapp` | Save WhatsApp credentials |
+| POST | `/api/settings/whatsapp/test` | Test WhatsApp connectivity |
+| GET | `/api/settings/usage` | Usage stats + quota status |
 
-Firebase Authentication
-Frontend login and backend token validation.
+### Bulk Messaging Endpoints
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/bulk-message/templates` | Fetch approved templates |
+| GET | `/api/bulk-message/quota` | Get quota status |
+| POST | `/api/bulk-message/parse` | Parse contacts file |
+| POST | `/api/bulk-message/start` | Start campaign (quota-enforced) |
+| POST | `/api/bulk-message/stop/{id}` | Stop running campaign |
+| GET | `/api/bulk-message/status/{id}` | Get campaign status |
+| GET | `/api/bulk-message/campaigns` | List all campaigns |
+| GET | `/api/bulk-message/campaigns/{id}/details` | Get campaign + recipients |
+| POST | `/api/bulk-message/campaigns/{id}/resend-failed` | Resend failed recipients |
+| DELETE | `/api/bulk-message/campaigns/{id}` | Delete campaign |
 
-OpenAI
-Optional AI chatbot integration (currently disabled).
+### File Forward Endpoints
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/file-forward/parse-contacts` | Parse contacts file |
+| POST | `/api/file-forward/send` | Send single file |
+| POST | `/api/file-forward/send-bulk` | Send bulk file |
 
-8. Authentication & Multi-tenancy
-Authentication uses Firebase ID tokens.
-Backend middleware validates token and extracts tenant ID.
-Every database query is tenant-scoped.
+### Chatbot Endpoints
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/chatbot/settings` | Get chatbot config |
+| PUT | `/api/chatbot/settings` | Update chatbot config |
+| GET | `/api/chatbot/rules` | Get all rules |
+| POST | `/api/chatbot/rules` | Create rule |
+| PUT | `/api/chatbot/rules/{id}` | Update rule |
+| DELETE | `/api/chatbot/rules/{id}` | Delete rule |
+| GET | `/api/chatbot/users` | List chat users (cached 15s) |
+| GET | `/api/chatbot/conversations` | All conversations |
+| GET | `/api/chatbot/conversations/{phone}` | User conversations |
 
-9. Configuration System
-Backend Environment Variables:
-DATABASE_URL
-REDIS_HOST
-REDIS_PORT
-QUEUE_RATE_LIMIT
-QUEUE_RETRY_ATTEMPTS
-META_APP_SECRET
-WEBHOOK_VERIFY_TOKEN
+### Logs Endpoints
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/logs` | Message logs (filtered, paginated) |
+| GET | `/api/logs/export` | CSV export (max 5000 records) |
+| GET | `/api/logs/stats` | Message statistics |
 
-Frontend Variables:
-NEXT_PUBLIC_FIREBASE_API_KEY
-NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN
-NEXT_PUBLIC_FIREBASE_PROJECT_ID
-NEXT_PUBLIC_API_URL
+---
 
-10. Frontend Architecture
-Next.js 14 App Router application.
-Firebase authentication.
-Axios API client with token interceptor.
-Dashboard pages for campaigns, chatbot, logs, settings.
+## 5. Database Architecture
 
-11. Data Flow
-Campaign Workflow:
-Upload contacts → create campaign → enqueue jobs → worker sends messages → update counters.
+**Engine:** Neon Postgres (serverless) via `psycopg3` + async connection pooling
 
-Webhook Workflow:
-Receive webhook → validate → store inbound message → determine response → enqueue reply job.
+### Key Tables
+| Table | Purpose | Key Design |
+|-------|---------|------------|
+| `tenants` | Tenant config + credentials | PK: `tenant_id`, includes `bulk_quota_limit` |
+| `campaigns` | Campaign metadata | Composite PK: `(tenant_id, campaign_id)` |
+| `campaign_recipients` | Per-recipient status | Composite PK: `(tenant_id, campaign_id, contact_phone)` |
+| `messages` | Unified message log | Unique index on `(tenant_id, wa_message_id)` |
+| `chat_messages` | Conversation history | Indexed by phone + timestamp |
+| `webhook_events` | Deduplication | Composite PK: `(tenant_id, event_id)` |
+| `tenant_quota_usage` | Monthly quota tracking | Composite PK: `(tenant_id, month_key)` |
+| `daily_message_stats` | Pre-aggregated analytics | Permanent, powers dashboard after archival |
 
-File Forward Workflow:
-Upload file → send message(s) → log results.
+### Archive Tables (Data Retention)
+`messages_archive`, `chat_messages_archive`, `webhook_events_archive`, `usage_events_archive` — mirror live table schemas with additional `archived_at` column.
 
-12. Performance & Scalability
-Strengths:
-Asynchronous workers
-Queue-based architecture
-Cursor pagination
+---
 
-Potential Bottlenecks:
-In-memory cache per instance
-Webhook processing synchronous until enqueue
+## 6. Message & Job Processing
 
-13. Error Handling & Reliability
-Retry logic with backoff.
-Dead-letter queue for permanent failures.
-Transaction rollback on DB errors.
+### Queues
+| Queue | Purpose |
+|-------|---------|
+| `campaign_queue` | Expands campaigns into message jobs (quota-capped) |
+| `message_queue` | Sends WhatsApp messages (rate-limited, retries, idempotent) |
+| `dead_letter_queue` | Stores jobs that exhausted all retries |
 
-14. Security Analysis
-Critical:
-Secrets committed in repo.
-Tenant tokens stored in plaintext.
+### Rate Limiting Stack
+| Layer | Mechanism | Scope |
+|-------|-----------|-------|
+| API Heavy | Redis sliding window (10 req/min) | Per-tenant, write actions only |
+| API General | Redis sliding window (300 req/min) | Per-tenant, reads |
+| Worker Global | BullMQ limiter (80 jobs/sec) | All tenants |
+| Worker Tenant | Token bucket (10 msg/sec, burst 20) | Per-tenant |
+| Worker Cooldown | Global pause on repeated 429s | All workers |
 
-Medium:
-Webhook verification optional.
+### Retry Policy
+- Default 3 attempts with exponential backoff (5s → 10s → 20s)
+- Non-retryable errors (template not found) → immediate fail
+- Terminal failure → dead letter queue
 
-Low:
-CSV injection protection and structured logging implemented.
+---
 
-15. Code Quality & Technical Debt
-Architecture diagram outdated.
-Duplicate campaign processing paths.
-Pagination inconsistencies between frontend and backend.
+## 7. Security Architecture
 
-16. Deployment Architecture
-Docker services:
-Redis
-API server
-Worker
+| Layer | Mechanism |
+|-------|-----------|
+| **Authentication** | Firebase Auth ID tokens verified server-side on every request |
+| **Authorization** | Row-level tenant isolation — all DB queries scoped by `tenant_id` |
+| **Webhook integrity** | Per-tenant HMAC-SHA256 verification with encrypted `meta_app_secret` |
+| **Encryption at rest** | Fernet (AES-128-CBC) for sensitive secrets. `"enc:"` prefix for encrypted values |
+| **Token storage** | Stored in Postgres, resolved at runtime. Never returned to frontend or logged |
+| **Rate limiting** | Multi-tier: API + worker + global cooldown |
+| **Input validation** | Pydantic models on all request bodies |
+| **CSV injection** | Export values sanitized against DDE formula injection |
+| **File upload** | 16 MB hard limit enforced server-side |
+| **CORS** | Explicit origin allowlist; `localhost:3000` only in non-production |
+| **API docs** | OpenAPI/Swagger disabled in production |
 
-Database hosted externally on Neon.
+---
 
-17. Observability
-Structured JSON logs.
-Health endpoint checks database connectivity.
+## 8. Background Tasks
 
-18. Future Improvements
-Security hardening.
-Shared caching layer.
-Better monitoring and metrics.
-Queue monitoring dashboards.
-Improved developer tooling.
+| Task | Interval | Purpose |
+|------|----------|---------|
+| `periodical_cleanup` | Every 6 hours | Deletes transient data older than 30 days |
+| `periodical_scheduler` | Every 60 seconds | Processes scheduled campaigns |
+| `periodic_archive_runner` | Every 24 hours | Archive old data + optional purge |
 
+All three run as `asyncio.Task` instances within the FastAPI lifespan and are gracefully cancelled on shutdown.
+
+---
+
+## 9. External Integrations
+
+| Integration | Purpose |
+|-------------|---------|
+| **Meta WhatsApp Cloud API** | Message sending, template management, media uploads |
+| **Firebase Authentication** | Frontend login + backend token validation |
+| **OpenAI** | Optional AI chatbot integration (currently reserved) |
+
+---
+
+## 10. Configuration System
+
+### Required Backend Environment Variables
+| Variable | Purpose |
+|----------|---------|
+| `DATABASE_URL` | Postgres connection string (Neon DB) |
+| `WEBHOOK_VERIFY_TOKEN` | Webhook verification token |
+| `ENCRYPTION_KEY` | Fernet key for secrets at rest |
+| `REDIS_HOST` / `REDIS_PORT` | Redis connection (or use `REDIS_URL`) |
+| Firebase service account JSON | `backend/firebase-service-account.json` |
+
+### Required Frontend Variables
+| Variable | Purpose |
+|----------|---------|
+| `NEXT_PUBLIC_API_URL` | Backend URL |
+| `NEXT_PUBLIC_FIREBASE_API_KEY` | Firebase config |
+| `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN` | Firebase config |
+| `NEXT_PUBLIC_FIREBASE_PROJECT_ID` | Firebase config |
+
+See `backend/.env.example` for the complete 160-line reference with all optional variables and descriptions.
+
+---
+
+## 11. Deployment Architecture
+
+```
+Vercel ──────── Next.js frontend (CDN + SSR)
+  │  HTTPS
+  ▼
+Render ──────── FastAPI (port 5000) + BullMQ Worker
+  ├──→ Neon Postgres (serverless, connection pooling)
+  └──→ Redis (managed, TLS via rediss://)
+```
+
+Docker Compose available for local development (Redis + API + Worker).
+
+---
+
+## 12. Observability
+
+- Structured JSON logging via `observability.log_event()`
+- Log fields: `timestamp`, `level`, `op`, `tenant`, `campaign`, `phone`, `ms`, `detail`
+- No sensitive data logged (tokens, keys, message bodies)
+- Timed operations via `timed_op()` context manager
+- Dedicated retention/purge log events with per-batch metrics
+- Deep health check endpoint with component-level status
+
+---
+
+## 13. Phase History
+
+| Phase | What Was Added |
+|-------|----------------|
+| **1–3** | Core platform: FastAPI, Firebase Auth, BullMQ queues, campaign management, chatbot rules |
+| **4** | Startup checks, environment validation, startup cache pre-warming |
+| **5** | Postgres migration (from Firestore), connection pooling, cursor pagination |
+| **6** | Security hardening: removed token logging, Pydantic validation, CSV injection protection |
+| **7** | Redis rate limiting: API middleware (heavy/general tiers), worker token bucket, global cooldown |
+| **8** | Data retention: archive tables, daily_message_stats, background cron, purge system |
+| **9** | Per-tenant webhooks, HMAC signature verification, Fernet encryption at rest |
+| **10** | Per-tenant monthly bulk message quota with atomic three-layer enforcement |
+| **11** | Comprehensive documentation refresh (README, API docs, architecture docs) |

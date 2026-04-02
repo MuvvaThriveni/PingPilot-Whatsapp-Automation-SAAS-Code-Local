@@ -1,8 +1,10 @@
 # WappFlow — Developer API Documentation
 
-> **Version:** 2.0.0 (Phase 9 — Per-Tenant Webhooks & Encryption at Rest)  
+> **Version:** 2.2.0 (Phase 11 — Comprehensive Documentation Refresh)  
 > **Base URL:** `http://localhost:5000/api` (dev) or `https://<your-deployment>/api` (prod)  
-> **Auth:** Firebase ID Token — `Authorization: Bearer <firebase_id_token>`
+> **Auth:** Firebase ID Token — `Authorization: Bearer <firebase_id_token>`  
+> **Database:** Neon Postgres (serverless) — see [Architecture_Overview.md](Architecture_Overview.md) for full schema  
+> **Last Updated:** 2026-04-01
 
 ---
 
@@ -22,7 +24,10 @@
 12. [Environment Variables](#12-environment-variables)
 13. [Local Development Setup](#13-local-development-setup)
 14. [Data Retention & Archive System](#14-data-retention--archive-system)
-15. [Onboarding Quick-Start Guide](#15-onboarding-quick-start-guide)
+15. [Bulk Message Quota System](#15-bulk-message-quota-system)
+16. [Onboarding Quick-Start Guide](#16-onboarding-quick-start-guide)
+17. [Glossary](#17-glossary)
+18. [Further Reading](#18-further-reading)
 
 ---
 
@@ -184,9 +189,19 @@ Returns message counts for today, this month, and by product type (last 30 days)
     { "product_type": "bulk_message", "total": 800 },
     { "product_type": "chatbot", "total": 350 },
     { "product_type": "file_forward", "total": 50 }
-  ]
+  ],
+  "bulk_quota": {
+    "used": 42,
+    "limit": 100,
+    "remaining": 58,
+    "month_key": "2026-03",
+    "resets_at": "2026-04-01T00:00:00+00:00",
+    "percent_used": 42
+  }
 }
 ```
+
+The `bulk_quota` object is always present and reflects the tenant's current monthly bulk message quota status. See [Section 15](#15-bulk-message-quota-system) for details.
 
 ---
 
@@ -220,7 +235,36 @@ Fetches **approved** WhatsApp message templates from the Business Account.
 
 ---
 
-### 4.2 Parse Contacts File
+### 4.2 Get Quota Status
+
+`GET /api/bulk-message/quota`
+
+Returns the tenant's current monthly bulk message quota usage. The quota resets automatically on the first day of each calendar month (UTC).
+
+**Response `200`:**
+```json
+{
+  "used": 42,
+  "limit": 100,
+  "remaining": 58,
+  "month_key": "2026-03",
+  "resets_at": "2026-04-01T00:00:00+00:00",
+  "percent_used": 42
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `used` | int | Messages consumed this month |
+| `limit` | int | Maximum allowed messages per month (from `tenants.bulk_quota_limit`) |
+| `remaining` | int | `limit - used` (floored at 0) |
+| `month_key` | string | Current month in `YYYY-MM` format |
+| `resets_at` | string (ISO 8601) | First second of the next calendar month (UTC) |
+| `percent_used` | int | `(used / limit) * 100` rounded down |
+
+---
+
+### 4.3 Parse Contacts File
 
 `POST /api/bulk-message/parse`
 
@@ -247,11 +291,11 @@ Parses an Excel/CSV file to extract and validate phone numbers. Used for preview
 
 ---
 
-### 4.3 Start Campaign
+### 4.4 Start Campaign
 
 `POST /api/bulk-message/start`
 
-Creates a new bulk messaging campaign and enqueues it for processing.
+Creates a new bulk messaging campaign and enqueues it for processing. **Enforces monthly quota** — the request is rejected if the number of contacts would exceed the tenant's remaining quota for the month.
 
 **Request:** `multipart/form-data`
 
@@ -276,9 +320,38 @@ Creates a new bulk messaging campaign and enqueues it for processing.
 
 If `scheduledAt` is provided, `status` will be `"scheduled"`.
 
+**Quota Error `429` — Quota Exhausted:**
+```json
+{
+  "detail": {
+    "error": "quota_exceeded",
+    "message": "Monthly bulk message quota exhausted",
+    "used": 100,
+    "limit": 100,
+    "remaining": 0,
+    "resets_at": "2026-04-01T00:00:00+00:00"
+  }
+}
+```
+
+**Quota Error `429` — Would Exceed Quota:**
+```json
+{
+  "detail": {
+    "error": "quota_would_exceed",
+    "message": "Campaign would exceed monthly quota. 150 requested but only 58 remaining.",
+    "requested": 150,
+    "remaining": 58,
+    "limit": 100,
+    "used": 42,
+    "resets_at": "2026-04-01T00:00:00+00:00"
+  }
+}
+```
+
 ---
 
-### 4.4 Get All Campaigns
+### 4.5 Get All Campaigns
 
 `GET /api/bulk-message/campaigns`
 
@@ -313,7 +386,7 @@ Paginated list of all campaigns for the tenant.
 
 ---
 
-### 4.5 Get Campaign Status
+### 4.6 Get Campaign Status
 
 `GET /api/bulk-message/status/{campaign_id}`
 
@@ -338,7 +411,7 @@ Paginated list of all campaigns for the tenant.
 
 ---
 
-### 4.6 Get Campaign Details
+### 4.7 Get Campaign Details
 
 `GET /api/bulk-message/campaigns/{campaign_id}/details`
 
@@ -373,9 +446,13 @@ Returns full campaign info including all recipients (up to 5000).
 }
 ```
 
+**Recipient Statuses:** `pending`, `queued`, `processing`, `submitted`, `sent`, `delivered`, `read`, `failed`, `quota_exceeded`
+
+> Recipients with `quota_exceeded` status were not sent because the tenant's monthly quota was exhausted. This is a terminal status — these recipients will not be retried automatically.
+
 ---
 
-### 4.7 Stop Campaign
+### 4.8 Stop Campaign
 
 `POST /api/bulk-message/stop/{campaign_id}`
 
@@ -391,7 +468,7 @@ Stops a running campaign. Workers check the DB status and discard further jobs.
 
 ---
 
-### 4.8 Delete Campaign
+### 4.9 Delete Campaign
 
 `DELETE /api/bulk-message/campaigns/{campaign_id}`
 
@@ -407,7 +484,7 @@ Deletes the campaign, its recipients, and counters.
 
 ---
 
-### 4.9 Resend Failed Recipients
+### 4.10 Resend Failed Recipients
 
 `POST /api/bulk-message/campaigns/{campaign_id}/resend-failed`
 
@@ -917,7 +994,7 @@ All errors follow a consistent structure:
 | `401` | Authentication failed |
 | `404` | Resource not found (also used to avoid leaking existence) |
 | `413` | File too large (>16 MB) |
-| `429` | Rate limited |
+| `429` | Rate limited — or bulk message quota exceeded (see [Section 15](#15-bulk-message-quota-system)). Quota errors include structured `detail` with `error`, `remaining`, `limit`, `resets_at`. |
 
 ---
 
@@ -1104,18 +1181,19 @@ Or manually run `backend/schema.sql` against your Postgres database.
 
 | Table | Purpose |
 |-------|---------|
-| `tenants` | WhatsApp API credentials per tenant |
-| `chatbot_config` | Chatbot on/off, fallback message |
-| `chatbot_rules` | Keyword → response auto-reply rules |
-| `campaigns` | Bulk message campaign metadata |
-| `campaign_recipients` | Per-recipient delivery status |
-| `campaign_counters` | Sharded sent/failed counters |
-| `messages` | Unified message log (all products) |
-| `chat_messages` | Conversation history (incoming + outgoing) |
-| `webhook_events` | Deduplication for incoming webhooks |
-| `usage_events` | Billable usage tracking |
-| `template_cache` | Persistent WhatsApp template metadata |
-| `user_triggers` | 24-hour rate limit for first-trigger messages |
+| `tenants` | WhatsApp API credentials per tenant + `bulk_quota_limit` (default 100) |
+| `chatbot_config` | Chatbot on/off, fallback message, button→template mappings (JSONB) |
+| `chatbot_rules` | Keyword → response auto-reply rules (priority-ordered) |
+| `campaigns` | Bulk message campaign metadata (composite PK: `tenant_id, campaign_id`) |
+| `campaign_recipients` | Per-recipient delivery status machine (`pending → queued → processing → submitted → sent`) |
+| `campaign_counters` | Sharded sent/failed counters (atomic increment via DB transactions) |
+| `messages` | Unified message log (all products: bulk_message, chatbot, file_forward) |
+| `chat_messages` | Conversation history (incoming + outgoing WhatsApp messages) |
+| `webhook_events` | Deduplication for incoming webhooks (composite PK: `tenant_id, event_id`) |
+| `usage_events` | Billable usage tracking (per event, per month) |
+| `template_cache` | Persistent WhatsApp template metadata (synced from Meta API) |
+| `user_triggers` | 24-hour rate limit for first-trigger chatbot messages |
+| `tenant_quota_usage` | Per-tenant monthly bulk message quota consumption (composite PK: `tenant_id, month_key`) |
 | `messages_archive` | Archived messages (older than RETENTION_DAYS) |
 | `chat_messages_archive` | Archived chat messages |
 | `webhook_events_archive` | Archived webhook events |
@@ -1349,11 +1427,123 @@ SELECT 'webhook_events', COUNT(*) FROM webhook_events;
 
 ---
 
-## 15. Onboarding Quick-Start Guide
+## 15. Bulk Message Quota System
+
+WappFlow enforces a **per-tenant monthly quota** on bulk WhatsApp messages. This section explains how the quota system works end-to-end for developers.
+
+### 15.1 Overview
+
+Each tenant has a configurable `bulk_quota_limit` (default: **100 messages/month**) stored in the `tenants` table. Actual usage is tracked in the `tenant_quota_usage` table, keyed by `(tenant_id, month_key)`. The quota resets automatically each calendar month — no cron job needed, just a new `month_key`.
+
+### 15.2 Data Model
+
+**`tenants` table** — new column:
+
+| Column | Type | Default | Description |
+|--------|------|---------|-------------|
+| `bulk_quota_limit` | INTEGER | `100` | Max bulk messages per calendar month |
+
+**`tenant_quota_usage` table:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `tenant_id` | TEXT (PK) | Foreign key to `tenants` |
+| `month_key` | TEXT (PK) | `YYYY-MM` format (e.g., `2026-03`) |
+| `messages_sent` | INTEGER | Running count of consumed messages |
+| `last_updated_at` | TIMESTAMPTZ | Last increment timestamp |
+
+### 15.3 Enforcement Layers
+
+The quota is enforced at three levels:
+
+**Layer 1 — API Pre-Check** (`POST /api/bulk-message/start`)
+- After parsing the uploaded file, the API reads the tenant's quota status
+- If `contacts > remaining` → returns **HTTP 429** with `quota_would_exceed` or `quota_exceeded`
+- Campaign is never created if quota would be exceeded
+
+**Layer 2 — Campaign Worker** (fan-out capping)
+- When a campaign job is picked up, the worker reads quota remaining
+- Caps fan-out to `min(pending_recipients, quota_remaining)`
+- Excess recipients are immediately marked `quota_exceeded`
+
+**Layer 3 — Message Worker** (atomic per-message consume)
+- Before sending each message, the worker calls `try_consume_quota()`
+- Uses a conditional upsert that atomically increments `messages_sent` only if `< limit`
+- If the upsert returns no row → quota is full → recipient marked `quota_exceeded`, message not sent
+- This is the **final authority** and is race-safe under concurrent workers
+
+### 15.4 API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/bulk-message/quota` | GET | Returns current quota status (used, limit, remaining, resets_at, percent_used) |
+| `/api/bulk-message/start` | POST | Enforces quota pre-check; returns 429 if quota would be exceeded |
+| `/api/settings/usage` | GET | Includes `bulk_quota` object in response |
+
+See [Section 4.2](#42-get-quota-status) and [Section 4.4](#44-start-campaign) for full request/response documentation.
+
+### 15.5 Recipient Status: `quota_exceeded`
+
+When a recipient cannot be sent due to quota exhaustion, their status is set to `quota_exceeded`. This is a **terminal status** — it counts as "done" for campaign finalization, so campaigns complete cleanly even when quota is hit mid-run.
+
+The frontend displays these recipients with an orange "Quota Exceeded" badge and a dedicated filter tab on the campaign detail page.
+
+### 15.6 Frontend Behavior
+
+The bulk message page (`/dashboard/bulk-message`) includes:
+
+- **Quota progress bar** at the top (green → orange → red as usage increases)
+- **Used / Limit / Remaining** text + reset date
+- **"Exhausted" badge** when remaining = 0
+- **Inline warning** when selected contacts exceed remaining quota
+- **Start button disabled** when contacts > remaining or quota = 0
+- **Friendly toast messages** for 429 quota errors
+- **Auto-refresh** of quota every 10 seconds and on campaign completion
+
+### 15.7 Key Files
+
+| File | Role |
+|------|------|
+| `backend/schema.sql` | `tenants.bulk_quota_limit` + `tenant_quota_usage` DDL |
+| `backend/db_layer/quota.py` | `get_quota_status()`, `try_consume_quota()` |
+| `backend/routers/bulk_message.py` | `GET /quota` + pre-check on `POST /start` |
+| `backend/routers/settings.py` | `bulk_quota` in `GET /usage` response |
+| `backend/db_layer/campaign_recipients.py` | `quota_exceeded` status + `mark_excess_recipients_quota_exceeded()` |
+| `backend/worker_main.py` | Capped fan-out + atomic consume |
+| `frontend/src/lib/api.ts` | `bulkMessage.quota()` |
+| `frontend/src/app/dashboard/bulk-message/page.tsx` | Quota bar + button guard |
+| `frontend/src/app/dashboard/bulk-message/[campaignId]/page.tsx` | `quota_exceeded` badge + filter |
+
+### 15.8 Manual Quota Management (SQL)
+
+**Check current quota for a tenant:**
+```sql
+SELECT t.bulk_quota_limit, q.messages_sent, q.month_key
+FROM tenants t
+LEFT JOIN tenant_quota_usage q ON q.tenant_id = t.tenant_id
+  AND q.month_key = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM')
+WHERE t.tenant_id = '<tenant_id>';
+```
+
+**Reset quota for testing:**
+```sql
+DELETE FROM tenant_quota_usage
+WHERE tenant_id = '<tenant_id>'
+  AND month_key = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM');
+```
+
+**Increase a tenant's quota limit:**
+```sql
+UPDATE tenants SET bulk_quota_limit = 500 WHERE tenant_id = '<tenant_id>';
+```
+
+---
+
+## 16. Onboarding Quick-Start Guide
 
 This section is for **new developers joining the team**. It walks you through the entire system so you can understand, run, and contribute to WappFlow within your first day.
 
-### 15.1 What Does WappFlow Do?
+### 16.1 What Does WappFlow Do?
 
 WappFlow is a **multi-tenant WhatsApp automation SaaS**. Each user (tenant) connects their own WhatsApp Business Account and can:
 
@@ -1361,7 +1551,7 @@ WappFlow is a **multi-tenant WhatsApp automation SaaS**. Each user (tenant) conn
 2. **File Forwarding** — Send documents/images to one or many recipients via the WhatsApp Cloud API.
 3. **Auto-Reply Chatbot** — Configure keyword-based rules that automatically reply to incoming WhatsApp messages. Supports interactive button flows and a 24h rate-limited first-trigger fallback.
 
-### 15.2 How the Pieces Fit Together
+### 16.2 How the Pieces Fit Together
 
 ```
 Browser (Next.js)
@@ -1389,20 +1579,21 @@ POST /api/webhook/{tenant_id}
   │  Signature verified → message processed → chatbot reply enqueued
 ```
 
-### 15.3 Key Concepts to Understand
+### 16.3 Key Concepts to Understand
 
 | Concept | Explanation |
 |---------|-------------|
 | **Tenant** | A single user identified by their Firebase Auth UID. All data is isolated per tenant via `tenant_id` columns. |
 | **Campaign** | A bulk message job. Contains a template, a list of recipients, and counters tracking progress. |
-| **Recipient status machine** | `pending → queued → processing → submitted → sent` (via webhook). Failed recipients can be retried. |
+| **Recipient status machine** | `pending → queued → processing → submitted → sent` (via webhook). Failed recipients can be retried. `quota_exceeded` is a terminal status for recipients blocked by quota. |
 | **Template** | A pre-approved WhatsApp message format (created in Meta Business Manager). WappFlow caches template metadata locally. |
 | **BullMQ** | A Redis-backed job queue. `campaign_queue` fans out recipients; `message_queue` sends individual messages with rate limiting. |
 | **Per-tenant webhook** | Each tenant gets their own webhook URL (`/api/webhook/{tenant_id}`) with HMAC signature verification using their encrypted `meta_app_secret`. |
 | **Encryption at rest** | Sensitive values like `meta_app_secret` are Fernet-encrypted before storage. See [Section 11](#11-encryption-at-rest). |
 | **Data retention** | Old rows are archived from live tables → `*_archive` tables, keeping queries fast. See [Section 14](#14-data-retention--archive-system). |
+| **Bulk message quota** | Per-tenant monthly message cap enforced at API, campaign worker, and message worker levels. Atomic consumption prevents overshoot. See [Section 15](#15-bulk-message-quota-system). |
 
-### 15.4 Your First Local Setup
+### 16.4 Your First Local Setup
 
 ```bash
 # 1. Clone the repo
@@ -1437,7 +1628,7 @@ npm run dev
 
 Open `http://localhost:3000` → register/login → configure WhatsApp settings → you're ready to test.
 
-### 15.5 Important Files to Read First
+### 16.5 Important Files to Read First
 
 As a new developer, read these files in order to build a mental model:
 
@@ -1453,8 +1644,9 @@ As a new developer, read these files in order to build a mental model:
 | 8 | `services/queue_manager.py` | How jobs are enqueued (campaign, message, file-forward, dead-letter) |
 | 9 | `rate_limit.py` | API rate limiting (middleware) + worker token bucket (Lua script) |
 | 10 | `retention.py` | Data lifecycle — archiving + purging |
+| 11 | `db_layer/quota.py` | Per-tenant monthly bulk message quota — reads + atomic consumption |
 
-### 15.6 Common Development Tasks
+### 16.6 Common Development Tasks
 
 **Add a new API endpoint:**
 1. Create or edit a file in `routers/`
@@ -1477,3 +1669,49 @@ As a new developer, read these files in order to build a mental model:
 1. Use `ngrok http 5000` to get a public URL
 2. Set the webhook URL in Meta App Dashboard to `https://<ngrok-url>/api/webhook/{tenant_id}`
 3. Send a message to your WhatsApp Business number — watch the logs
+
+---
+
+## 17. Glossary
+
+A quick reference for terminology used throughout this documentation. Essential for new developers joining the team.
+
+| Term | Definition |
+|------|------------|
+| **Tenant** | A single user/business identified by their Firebase Auth UID. All data, keys, and operations are scoped to a `tenant_id`. |
+| **Campaign** | A bulk messaging job containing a template, a list of recipients parsed from CSV/Excel, and counters tracking progress. |
+| **Recipient** | A single contact within a campaign. Each recipient has a status that progresses through a state machine: `pending → queued → processing → submitted → sent/failed/quota_exceeded`. |
+| **Template** | A pre-approved WhatsApp message format created in Meta Business Manager. Must be `APPROVED` status before WappFlow can use it. Templates can have parameters (e.g., `{{1}}` for name). |
+| **BullMQ** | A Redis-backed job queue library (Python port). Used for all asynchronous work: campaign fan-out, message sending, and dead letter handling. |
+| **Campaign Queue** | The lightweight BullMQ queue that receives "process campaign X" jobs. The worker reads pending recipients and fans them out to the message queue. |
+| **Message Queue** | The heavy-lifter BullMQ queue that processes individual WhatsApp API calls with rate limiting, retry logic, and idempotency. |
+| **Dead Letter Queue (DLQ)** | A BullMQ queue where jobs that have exhausted all retry attempts are moved. These are investigated manually. |
+| **Token Bucket** | A rate-limiting algorithm used per-tenant in the worker. Each tenant gets 10 messages/second with a burst of 20, preventing any single tenant from monopolizing the sending capacity. |
+| **Global Cooldown** | When WhatsApp returns repeated `429 Too Many Requests` errors, all workers pause for a configurable duration (default 5s) to avoid API bans. |
+| **Webhook** | An HTTP callback from Meta's servers to our system. Triggered when messages are delivered, read, or when users reply. Each tenant has their own webhook URL for HMAC signature verification. |
+| **HMAC-SHA256** | Hash-based Message Authentication Code used to verify that webhook payloads genuinely originate from Meta, not from attackers. Uses each tenant's `meta_app_secret`. |
+| **Fernet Encryption** | Symmetric encryption (AES-128-CBC) from Python's `cryptography` library. Used to encrypt `meta_app_secret` before storing in Postgres. Values are prefixed with `"enc:"`. |
+| **Idempotency** | The property that performing an operation multiple times produces the same result. In WappFlow, message sends use calculated job IDs to prevent duplicate sends on worker restarts. |
+| **Data Retention** | The automated system that moves old rows from live tables to archive tables, keeping queries fast. Controlled by `RETENTION_ENABLED` and related env vars. |
+| **Purge** | The second stage of data retention that permanently deletes very old rows from archive tables after a configurable period (default 90 days). |
+| **Quota** | A per-tenant monthly cap on bulk messages (default 100/month). Enforced atomically at three levels: API pre-check, campaign worker cap, and per-message consumption. |
+| **`tenant_id`** | The Firebase Auth UID that uniquely identifies each tenant. Every database table and cache key is scoped by this value. |
+| **`wa_message_id`** | The unique identifier returned by WhatsApp's Cloud API after successfully accepting a message. Used for delivery status tracking. |
+| **`month_key`** | A string in `YYYY-MM` format (e.g., `2026-03`) used to partition quota usage and usage events by calendar month. |
+| **First-Trigger Fallback** | A chatbot feature that sends a template reply to new senders who haven't been contacted in the last 24 hours, even if no keyword rule matches. Rate-limited per sender. |
+| **Neon Postgres** | A serverless PostgreSQL provider. WappFlow uses it as the primary database with `psycopg3` async driver and connection pooling. |
+| **IST (Indian Standard Time)** | UTC+05:30. All timestamps in WappFlow are standardized to IST for consistency across logging, database records, and API responses. |
+
+---
+
+## 18. Further Reading
+
+| Document | Description |
+|----------|-------------|
+| **[Architecture_Overview.md](Architecture_Overview.md)** | Deep system architecture: multi-tenancy model, request lifecycle, data flows, security layers, queue architecture, retention system, encryption at rest, and full phase history. Start here for the big picture. |
+| **[Technical_Readme.md](Technical_Readme.md)** | Concise technical summary of every system component. Good for quick reference. |
+| **[README.md](README.md)** | Project overview, getting started guide, deployment instructions, and troubleshooting. |
+| **[backend/.env.example](backend/.env.example)** | Comprehensive environment variable reference with descriptions and defaults. |
+| **[backend/schema.sql](backend/schema.sql)** | Complete DDL for all live database tables. Read this to understand the data model. |
+| **[backend/retention_schema.sql](backend/retention_schema.sql)** | DDL for archive tables and `daily_message_stats`. |
+| **[backend/retention.py](backend/retention.py)** | Data retention engine source. Contains `archive_old_data()` and `purge_old_archives()` with detailed comments. |

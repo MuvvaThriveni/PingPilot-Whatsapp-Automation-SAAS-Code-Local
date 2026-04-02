@@ -57,7 +57,7 @@ export default function CampaignDetailPage() {
   const [recipients, setRecipients] = useState<Recipient[]>([])
   const [loading, setLoading] = useState(true)
   const [resending, setResending] = useState(false)
-  const [filter, setFilter] = useState<'all' | 'sent' | 'failed' | 'pending'>('all')
+  const [filter, setFilter] = useState<'all' | 'sent' | 'failed' | 'pending' | 'quota_exceeded'>('all')
   const [search, setSearch] = useState('')
 
   const fetchDetails = useCallback(async () => {
@@ -128,6 +128,13 @@ export default function CampaignDetailPage() {
             Failed
           </span>
         )
+      case 'quota_exceeded':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-orange-50 text-orange-700 border border-orange-200">
+            <AlertTriangle className="h-3 w-3" />
+            Quota Exceeded
+          </span>
+        )
       case 'pending':
       case 'queued':
         return (
@@ -196,7 +203,8 @@ export default function CampaignDetailPage() {
       filter === 'all' ||
       (filter === 'sent' && ['sent', 'submitted', 'delivered', 'read'].includes(r.status)) ||
       (filter === 'failed' && r.status === 'failed') ||
-      (filter === 'pending' && ['pending', 'queued', 'processing'].includes(r.status))
+      (filter === 'pending' && ['pending', 'queued', 'processing'].includes(r.status)) ||
+      (filter === 'quota_exceeded' && r.status === 'quota_exceeded')
 
     const matchesSearch =
       !search ||
@@ -210,6 +218,7 @@ export default function CampaignDetailPage() {
     ['sent', 'submitted', 'delivered', 'read'].includes(r.status)
   ).length
   const failedCount = recipients.filter((r) => r.status === 'failed').length
+  const quotaExceededCount = recipients.filter((r) => r.status === 'quota_exceeded').length
   const pendingCount = recipients.filter((r) =>
     ['pending', 'queued', 'processing'].includes(r.status)
   ).length
@@ -443,6 +452,7 @@ export default function CampaignDetailPage() {
               { key: 'all' as const, label: 'All', count: recipients.length },
               { key: 'sent' as const, label: 'Sent', count: sentCount },
               { key: 'failed' as const, label: 'Failed', count: failedCount },
+              ...(quotaExceededCount > 0 ? [{ key: 'quota_exceeded' as const, label: 'Quota Exceeded', count: quotaExceededCount }] : []),
               { key: 'pending' as const, label: 'Pending', count: pendingCount },
             ].map((tab) => (
               <button
