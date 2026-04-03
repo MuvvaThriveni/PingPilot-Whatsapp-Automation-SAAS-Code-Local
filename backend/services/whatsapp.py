@@ -176,25 +176,75 @@ class WhatsAppService:
             detail = error_msg
             if error_code:
                 detail += f" (code: {error_code})"
-            return {"success": False, "error": detail}
+            return {"success": False, "error": detail, "error_code": error_code}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     async def upload_media(self, file_content: bytes, mime_type: str):
+        """Upload media to WhatsApp Cloud API via multipart/form-data.
+
+        Uses a proper filename with extension derived from the MIME type
+        to satisfy Graph API file-type detection.
+
+        Meta API spec requires three multipart fields:
+          - file: binary content (via files=)
+          - messaging_product: "whatsapp" (via data=)
+          - type: MIME type string (via data=)
+        """
+        _MIME_EXT = {
+            "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+            "video/mp4": ".mp4", "video/3gpp": ".3gp",
+            "audio/aac": ".aac", "audio/mp4": ".m4a", "audio/mpeg": ".mp3",
+            "audio/ogg": ".ogg", "audio/opus": ".opus",
+            "application/pdf": ".pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+        }
+        clean_mime = mime_type.split(";")[0].strip().lower()
+        ext = _MIME_EXT.get(clean_mime, ".bin")
+        filename = f"upload{ext}"
+
+        if not file_content:
+            return {"success": False, "error": "Empty file content", "error_code": 0}
+
+        log_event("upload_media_start",
+                  detail=f"mime={clean_mime} size={len(file_content)} filename={filename}")
+
         try:
             response = await self._request_with_retry(
                 "POST", f"{self.base_url}/media",
                 headers=self._auth_headers(),
-                files={"file": ("file", file_content, mime_type)},
-                data={"messaging_product": "whatsapp"},
+                files={"file": (filename, file_content, clean_mime)},
+                data={
+                    "messaging_product": "whatsapp",
+                    "type": clean_mime,
+                },
                 label="upload_media",
             )
+
+            resp_body = response.text[:500]
+            log_event("upload_media_response",
+                      detail=f"status={response.status_code} body={resp_body}")
+
             data = response.json()
             if response.status_code == 200:
-                return {"success": True, "mediaId": data.get("id")}
-            return {"success": False, "error": data.get("error", {}).get("message", "Unknown error")}
+                media_id = data.get("id")
+                log_event("upload_media_success", detail=f"mediaId={media_id}")
+                return {"success": True, "mediaId": media_id}
+
+            api_err = data.get("error", {})
+            error_detail = api_err.get("message", "Unknown error")
+            error_code = api_err.get("code", 0)
+            if error_code:
+                error_detail += f" (code: {error_code})"
+            log_event("upload_media_failed",
+                      detail=f"status={response.status_code} err={error_detail}",
+                      level="WARN")
+            return {"success": False, "error": error_detail, "error_code": error_code}
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            log_event("upload_media_exception", detail=str(e)[:200], level="ERROR")
+            return {"success": False, "error": str(e), "error_code": 0}
 
     async def send_image(self, to: str, media_id: str, caption: str = ""):
         try:
