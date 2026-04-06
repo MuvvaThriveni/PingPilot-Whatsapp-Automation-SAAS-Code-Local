@@ -1,10 +1,10 @@
 # WappFlow — Developer API Documentation
 
-> **Version:** 2.2.0 (Phase 11 — Comprehensive Documentation Refresh)  
+> **Version:** 2.3.0 (Phase 12 — Phone Normalization, Image Compression & Template Hardening)  
 > **Base URL:** `http://localhost:5000/api` (dev) or `https://<your-deployment>/api` (prod)  
 > **Auth:** Firebase ID Token — `Authorization: Bearer <firebase_id_token>`  
 > **Database:** Neon Postgres (serverless) — see [Architecture_Overview.md](Architecture_Overview.md) for full schema  
-> **Last Updated:** 2026-04-01
+> **Last Updated:** 2026-04-06
 
 ---
 
@@ -28,6 +28,7 @@
 16. [Onboarding Quick-Start Guide](#16-onboarding-quick-start-guide)
 17. [Glossary](#17-glossary)
 18. [Further Reading](#18-further-reading)
+19. [Utility Modules Reference](#19-utility-modules-reference)
 
 ---
 
@@ -276,6 +277,20 @@ Parses an Excel/CSV file to extract and validate phone numbers. Used for preview
 |-------|------|----------|
 | `file` | File (xlsx/csv) | Yes |
 
+**Phone Number Format:**
+
+Phone numbers are normalized using `utils/phone_utils.normalize_phone()`. The following formats are accepted:
+
+| Input Format | Example | Output |
+|---|---|---|
+| E.164 with `+` | `+14155552671` | `14155552671` |
+| E.164 with `+` (Indian) | `+919876543210` | `919876543210` |
+| 10-digit Indian mobile (no `+`) | `9876543210` | `919876543210` |
+| International without `+` | `447911123456` | `447911123456` |
+| Scientific notation (Excel) | `9.1995E+11` | `919950000000` |
+
+Numbers that fail E.164 length validation (< 10 or > 15 digits after normalization) are **silently skipped** — they do not appear in `contacts` and are not counted in `validContacts`.
+
 **Response `200`:**
 ```json
 {
@@ -283,9 +298,11 @@ Parses an Excel/CSV file to extract and validate phone numbers. Used for preview
     { "index": 0, "phone": "919876543210", "name": "John", "imageUrl": "" }
   ],
   "total": 150,
-  "validContacts": 150
+  "validContacts": 148
 }
 ```
+
+> `total` counts all rows in the file; `validContacts` counts rows that passed phone normalization.
 
 **Error `413`:** File exceeds 16 MB limit.
 
@@ -518,6 +535,8 @@ Parses an Excel/CSV to extract phone numbers for bulk file forwarding.
 | Field | Type | Required |
 |-------|------|----------|
 | `contactsFile` | File (xlsx/csv) | Yes |
+
+Phone numbers are normalized by `utils/phone_utils.normalize_phone()` — see [Section 4.3](#43-parse-contacts-file) for accepted formats. Invalid numbers are skipped.
 
 **Response `200`:**
 ```json
@@ -995,6 +1014,19 @@ All errors follow a consistent structure:
 | `404` | Resource not found (also used to avoid leaking existence) |
 | `413` | File too large (>16 MB) |
 | `429` | Rate limited — or bulk message quota exceeded (see [Section 15](#15-bulk-message-quota-system)). Quota errors include structured `detail` with `error`, `remaining`, `limit`, `resets_at`. |
+
+### 10.1 WhatsApp API Non-Retryable Error Codes
+
+The message worker classifies certain WhatsApp Cloud API error codes as **non-retryable** — these are immediately marked as `failed` without consuming additional retry attempts, since re-sending will never succeed:
+
+| Error Code | Meaning | Action |
+|------------|---------|--------|
+| `#132000` | Template parameter count mismatch | Mark failed immediately; check template variable mapping |
+| `#132001` | Template name does not exist in approved templates | Mark failed immediately; the template must be approved first |
+| `#132012` | Media parameter format mismatch (header media missing/expired) | Mark failed; cached media ID is **invalidated** so next run re-uploads |
+| `#100` | Invalid parameter (e.g. image > 5 MB after compression) | Mark failed immediately |
+
+All other errors (5xx, network failures, `#429`) are retried with exponential backoff up to `QUEUE_RETRY_ATTEMPTS` (default 3).
 
 ---
 
@@ -1715,3 +1747,190 @@ A quick reference for terminology used throughout this documentation. Essential 
 | **[backend/schema.sql](backend/schema.sql)** | Complete DDL for all live database tables. Read this to understand the data model. |
 | **[backend/retention_schema.sql](backend/retention_schema.sql)** | DDL for archive tables and `daily_message_stats`. |
 | **[backend/retention.py](backend/retention.py)** | Data retention engine source. Contains `archive_old_data()` and `purge_old_archives()` with detailed comments. |
+
+---
+
+## 19. Utility Modules Reference
+
+These shared utilities in `backend/utils/` are used across routers, services, and the BullMQ worker. Understanding them is key to correctly handling phone numbers and media uploads.
+
+---
+
+### 19.1 `utils/phone_utils.py` — E.164 Phone Normalization
+
+**Function:** `normalize_phone(phone_str: str) -> Optional[str]`
+
+Normalizes any raw phone string into a **digits-only** international number compatible with the WhatsApp Cloud API. Returns `None` for invalid numbers instead of raising exceptions, so all callers can skip gracefully.
+
+#### Normalization Rules (applied in order)
+
+| Step | Rule |
+|------|------|
+| 1 | Detect if the raw input starts with `+` (international prefix flag) |
+| 2 | Handle scientific notation (e.g. Excel's `9.1995E+11`) — parsed as float, `+` is not treated as a country-code prefix |
+| 3 | Strip all non-digit characters |
+| 4 | Apply `+91` (India) fallback **only if**: original had no `+`, stripped length is exactly 10, and first digit is 6/7/8/9 (Indian mobile range) |
+| 5 | Validate final length: 10–15 digits (E.164 range). Return `None` if outside range |
+
+#### Examples
+
+```python
+normalize_phone("+14155552671")   # US: '14155552671'
+normalize_phone("+44 7911 123456") # UK: '447911123456'
+normalize_phone("+919876543210")  # Indian with code: '919876543210'
+normalize_phone("9876543210")     # Indian local 10-digit: '919876543210'
+normalize_phone("9.1995E+11")     # Excel scientific: '919950000000'
+normalize_phone("022-12345678")   # Indian landline (11 digits, no +91 fallback): '02212345678'
+normalize_phone("12345")          # Too short → None
+normalize_phone("+1234567890123456")  # Too long → None
+```
+
+#### Where It Is Used
+
+| File | Usage |
+|------|-------|
+| `routers/bulk_message.py` | Normalize phones from uploaded CSV/Excel before inserting recipients |
+| `routers/file_forward.py` | Normalize recipient phone before sending single file |
+| `services/queue_manager.py` | Normalize phone in `enqueue_message()` for idempotent job ID generation; skip if `None` |
+| `worker_main.py` | Re-normalize in worker for observability; mark recipient `failed` if `None` |
+
+> **Important for Excel users:** Numbers stored as floats in Excel may be read as scientific notation (e.g. `9.1995E+11`). The normalizer handles this automatically. To be safe, format the phone column as **Text** in Excel before exporting, and include the `+` country code prefix.
+
+---
+
+### 19.2 `utils/image_utils.py` — Automatic Image Compression
+
+**Function:** `compress_image(file_bytes: bytes) -> bytes`
+
+Automatically compresses image bytes to fit within WhatsApp's **5 MB media upload limit**. Called by `services/template_builder.upload_header_media()` before uploading template header images. Non-image files pass through untouched.
+
+WhatsApp Cloud API returns `#100 Invalid parameter` when an image exceeds 5 MB. This module prevents that silently.
+
+#### Compression Strategy
+
+```
+Input image bytes
+      │
+      ├─ Already ≤ 5 MB? → return as-is (no Pillow required)
+      │
+      ├─ Open with Pillow → fix EXIF orientation (handle phone rotations)
+      │
+      ├─ PNG with real transparency?
+      │   ├─ Optimize PNG (lossless)
+      │   │   └─ ≤ 5 MB? → return PNG
+      │   └─ Still > 5 MB → fall through to JPEG
+      │
+      ├─ Iterative JPEG quality reduction (90 → 85 → ... → 40, step 5)
+      │   └─ First quality where output ≤ 5 MB → return JPEG
+      │
+      ├─ Last resort: halve resolution up to 5× (LANCZOS) + JPEG quality 70
+      │   └─ First size where output ≤ 5 MB → return JPEG
+      │
+      └─ Absolute fallback: return original bytes (upload may fail naturally)
+```
+
+#### RGBA / Transparency Handling
+
+JPEG does not support transparency. For RGBA/LA/palette-mode images, the module composites onto a **white background** before converting to RGB. This preserves visual fidelity for logos and PNGs with semi-transparent elements.
+
+#### MIME Type Update After Compression
+
+After compression, `upload_header_media()` inspects the magic bytes of the returned value to set the correct MIME type for the upload:
+
+```python
+if file_bytes[:3] == b'\xff\xd8\xff':  # JPEG magic bytes
+    mime = "image/jpeg"
+elif file_bytes[:8] == b'\x89PNG\r\n\x1a\n':  # PNG magic bytes
+    mime = "image/png"
+```
+
+This ensures the Graph API receives a consistent `Content-Type`.
+
+#### Log Events Emitted
+
+| Event | Meaning |
+|-------|---------|
+| `image_compression_skipped` | Image already ≤ 5 MB, no processing needed |
+| `image_compression_start` | Compression starting (logs format + original size) |
+| `image_compressed` | Compression succeeded (logs original size, final size, format, quality if JPEG) |
+| `image_compression_png_fallback` | Optimized PNG still too large, falling back to JPEG |
+| `image_compression_resize` | Quality reduction insufficient, entering resize phase |
+| `image_compression_resize_error` | Resize step raised an exception |
+| `image_compression_failed` | All strategies exhausted; original bytes returned as fallback |
+| `image_compression_import_error` | Pillow not installed or import error; original bytes used |
+| `image_compression_error` | Pillow could not decode the image (corrupt/unsupported format) |
+
+#### Dependencies
+
+Requires **Pillow** (`pip install Pillow`). Already in `backend/requirements.txt`. If Pillow is unavailable at runtime, the image is uploaded uncompressed with a `WARN` log.
+
+---
+
+### 19.3 Media Upload Internals (`services/whatsapp.py`)
+
+The `WhatsAppService.upload_media()` method sends files to the Graph API using **multipart/form-data** with exactly three fields required by Meta:
+
+| Multipart field | Value | Sent via |
+|-----------------|-------|----------|
+| `file` | Binary content with filename | `files=` (httpx) |
+| `messaging_product` | `"whatsapp"` | `data=` (httpx) |
+| `type` | MIME type string | `data=` (httpx) |
+
+The filename is derived from the MIME type (e.g. `upload.jpg` for `image/jpeg`) so the Graph API can detect the file format. Using a generic name like `upload.bin` or omitting the extension causes `#100` errors.
+
+**MIME → Extension mapping:**
+
+| MIME | Extension |
+|------|-----------|
+| `image/jpeg` | `.jpg` |
+| `image/png` | `.png` |
+| `image/webp` | `.webp` |
+| `video/mp4` | `.mp4` |
+| `audio/mpeg` | `.mp3` |
+| `audio/ogg` | `.ogg` |
+| `application/pdf` | `.pdf` |
+| `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | `.docx` |
+| `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | `.xlsx` |
+| `application/vnd.openxmlformats-officedocument.presentationml.presentation` | `.pptx` |
+
+---
+
+### 19.4 Template Builder — Variable Support & Validation
+
+The `services/template_builder.py` module handles building the `components` payload for `send_template_message()`. As of Phase 12, it supports both variable styles and performs pre-send validation.
+
+#### Variable Types
+
+| Type | Syntax | Example |
+|------|--------|---------|
+| **Positional** | `{{1}}`, `{{2}}` | `Hello {{1}}, your order {{2}} is ready` |
+| **Named** | `{{name}}`, `{{phone}}` | `Hi {{name}}, your code is {{code}}` |
+
+Named variables produce API parameter objects with `"parameter_name"` field; positional variables produce plain `"text"` entries.
+
+#### Parameter Resolution Order
+
+For each template variable, the builder resolves the value in this priority order:
+
+1. Exact key match in contact dict (e.g. `contact["name"]` for `{{name}}`)
+2. Positional fallbacks: slot 0 → `contact["name"]`, slot 1 → `contact["phone"]`
+3. Example text from the template definition (stored in `example.body_text`)
+4. Single space `" "` (preserves parameter count — WhatsApp rejects missing params)
+
+#### Pre-Send Validation (`validate_components`)
+
+Before calling the WhatsApp API, the worker validates built components against cached template metadata:
+
+- **Media headers:** If the template has an `IMAGE`/`VIDEO`/`DOCUMENT` header, a `header` component with a media parameter **must** be present. Missing → immediate `failed` (no retry).
+- **Parameter count match:** Body and header text parameter counts are compared against the template definition. Mismatch → immediate `failed` (no retry, logs `template_validation_failed`).
+
+#### Media ID Caching
+
+Uploaded header media IDs are cached in-memory for the process lifetime under a **tenant-scoped key** (`{tenant_id}:{template_name}|{language}`). This avoids re-uploading the same image on every webhook trigger. The cache is invalidated when a `#132012` error is received, forcing a fresh upload on the next send.
+
+#### CDN URL Validation
+
+Before uploading, `upload_header_media()` validates the downloaded content:
+- Rejects responses with `Content-Type: text/html` or `application/json` (expired CDN URLs return error pages)
+- Rejects downloads < 100 bytes (suspiciously small — likely an error response)
+- Infers MIME from template `format` field when the CDN returns `application/octet-stream`
