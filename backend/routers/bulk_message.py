@@ -12,6 +12,7 @@ Security fixes:
 
 import io
 import re
+import logging
 import time
 import uuid
 import asyncio
@@ -20,6 +21,7 @@ from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import pandas as pd
 from utils.time_utils import get_ist_now_iso, get_ist_now
+from utils.phone_utils import normalize_phone
 
 from store import get_settings
 from services.whatsapp import WhatsAppService
@@ -78,25 +80,18 @@ def _parse_contacts(df):
     name_col = _find_column(df.columns, ["name"])
     image_col = _find_column(df.columns, ["image", "url"])
 
+    _logger = logging.getLogger("bulk_message")
     contacts = []
     seen_phones = set()
     for idx, row in df.iterrows():
         raw = row[phone_col]
-        # Handle numeric values (int, float, or scientific-notation strings like "9.1995E+11")
-        try:
-            numeric = float(raw)
-            phone_str = f"{numeric:.0f}"
-        except (ValueError, TypeError):
-            phone_str = str(raw).strip()
-            if phone_str.endswith('.0'):
-                phone_str = phone_str[:-2]
+        phone = normalize_phone(raw)
 
-        phone = "".join(filter(str.isdigit, phone_str))
-        # Auto-add India country code for exactly 10-digit mobile numbers
-        if len(phone) == 10 and phone[0] in ('6', '7', '8', '9'):
-            phone = '91' + phone
+        if phone is None:
+            _logger.warning("Invalid phone number skipped: raw=%s", raw)
+            continue
 
-        if len(phone) >= 10 and phone not in seen_phones:
+        if phone not in seen_phones:
             seen_phones.add(phone)
             contacts.append({
                 "index": idx,

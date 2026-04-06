@@ -1,8 +1,8 @@
 # WappFlow — Architecture Overview
 
 > **Product:** Multi-tenant WhatsApp Business Automation SaaS  
-> **Version:** 2.2.0 (Phase 11 — Comprehensive Documentation Refresh)  
-> **Last Updated:** 2026-04-01
+> **Version:** 2.3.0 (Phase 12 — Phone Normalization, Image Compression & Template Hardening)  
+> **Last Updated:** 2026-04-06
 
 > **📖 How to Use This Document:** If you are new to the team, start with [Section 21 (Onboarding Guide)](#21-onboarding-guide-for-new-developers) for a structured path. Then dive into specific sections as needed. For API endpoint details, see [API_Developer_Doc.md](API_Developer_Doc.md).
 
@@ -307,8 +307,10 @@ backend/
 │   ├── users.py              # User trigger rate limiting (24h)
 │   └── quota.py              # Per-tenant monthly bulk message quota (read + atomic consume)
 │
-└── utils/
-    └── time_utils.py         # IST timestamp helpers
+├── utils/
+│   ├── phone_utils.py        # E.164 phone normalization (international + India fallback + scientific notation)
+│   ├── image_utils.py        # Automatic image compression to ≤5 MB (Pillow: JPEG quality reduction + resize)
+│   └── time_utils.py         # IST timestamp helpers
 ```
 
 ---
@@ -407,8 +409,8 @@ The API heavy tier matches on **(HTTP method + path)**, not just path prefix. Th
 | Chatbot config | In-memory | 6 hours | Chatbot enabled/disabled state |
 | Chatbot rules | In-memory | 6 hours | Keyword matching rules |
 | Chat users list | In-memory | 15 seconds | Reduce polling load on conversations page |
-| Template components | In-memory + Postgres | Indefinite (memory) / persistent (DB) | Template parameter metadata |
-| Uploaded media IDs | In-memory | Process lifetime | Avoid re-uploading same template header media |
+| Template components | In-memory + Postgres | Indefinite (memory) / persistent (DB) | Template parameter metadata (tenant-scoped key: `{tenant_id}:{name}|{lang}`) |
+| Uploaded media IDs | In-memory | Process lifetime | Avoid re-uploading same template header image on every webhook trigger. Invalidated on `#132012` errors. |
 | Button mappings | In-memory | 1 hour | Per-tenant button→template mappings |
 | Rate limit counters | Redis | Sliding window | API and worker rate limiting |
 | Token buckets | Redis | 60s auto-expire | Per-tenant message sending fairness |
@@ -503,6 +505,10 @@ The retention cron task handles `CancelledError` gracefully — if an archive ba
 - **Log levels:** `INFO` (normal ops), `WARN` (rate limits, missing config), `ERROR` (failures).
 - **Retention observability** — the archive and purge systems emit dedicated log events (`retention_start`, `retention_batch`, `retention_complete`, `purge_started`, `purge_batch`, `purge_completed`, etc.) with per-batch row counts, durations, and error details. See the [API Developer Doc Section 14.8](API_Developer_Doc.md#148-monitoring--log-events) for the full event catalog.
 - **Webhook observability** — per-tenant webhook processing emits `webhook_per_tenant`, `webhook_sig_rejected`, `webhook_verify_tenant`, `button_match`, `button_id_match`, `fallback_trigger` events.
+- **Phone normalization observability** — `worker_main.py` logs every normalization: `raw=<input> normalized=<output>` at `INFO`. Invalid numbers are logged at `WARN` and the recipient is immediately marked `failed`.
+- **Image compression observability** — `utils/image_utils.py` emits structured events for every compression decision: `image_compression_skipped`, `image_compression_start`, `image_compressed` (with original/final size and quality), `image_compression_png_fallback`, `image_compression_resize`, `image_compression_failed`.
+- **Template payload observability** — `template_payload_built` is logged (at `INFO`) with the full `components` array before every WhatsApp template send. `template_validation_failed` is logged (at `ERROR`) when pre-send validation detects parameter mismatches.
+- **Media upload observability** — `upload_media_start`, `upload_media_response`, `upload_media_success`, `upload_media_failed` events are emitted with MIME type, file size, and API response body.
 
 ---
 
@@ -822,7 +828,8 @@ This section provides a structured path for new team members to understand the e
 | **Day 1** | Data model + API structure | `schema.sql`, `retention_schema.sql`, `main.py`, `auth_middleware.py` |
 | **Day 1** | How settings and config work | `store.py`, `cache.py`, `routers/settings.py` |
 | **Day 2** | Campaign lifecycle (most complex flow) | `routers/bulk_message.py`, `worker_main.py`, `db_layer/campaigns.py`, `db_layer/campaign_recipients.py`, `db_layer/quota.py` |
-| **Day 2** | Queue architecture | `services/queue_manager.py`, `rate_limit.py` |
+| **Day 2** | Queue architecture + phone normalization | `services/queue_manager.py`, `rate_limit.py`, `utils/phone_utils.py` |
+| **Day 2** | Template building + media pipeline | `services/template_builder.py`, `services/whatsapp.py`, `utils/image_utils.py` |
 | **Day 3** | Webhook + chatbot | `routers/webhook.py`, `db_layer/encryption.py`, `db_layer/secrets.py` |
 | **Day 3** | Data retention | `retention.py`, `retention_schema.sql` |
 | **Day 4** | Frontend | `frontend/src/lib/api.ts`, `frontend/src/app/dashboard/`, `frontend/src/contexts/` |
@@ -892,6 +899,11 @@ npm run dev             # Terminal 3: Next.js on port 3000
 | **Template not found** | Templates must be approved in Meta Business Manager first. WappFlow caches template metadata — if a new template isn't showing, wait for cache refresh or restart. |
 | **Per-tenant webhook URL** | The `{tenant_id}` in the webhook URL is the Firebase UID, **not** the WhatsApp phone number ID. Find it in browser DevTools → Network → check the `Authorization` token payload. |
 | **Quota not updating** | Quota is read from the `tenant_quota_usage` table using the current `YYYY-MM` month key. If you manually reset quota in the DB, make sure the `month_key` matches the current month. The frontend auto-refreshes quota every 10 seconds and on campaign completion. |
+| **International numbers not delivering** | Ensure phone numbers in the CSV include the `+` prefix and full country code (e.g. `+14155552671` for US). Without `+`, 10-digit numbers are treated as Indian mobile numbers and `91` is prepended. See `utils/phone_utils.normalize_phone()`. |
+| **Excel scientific notation phones** | Excel may store phone numbers as floats (e.g. `9.1995E+11`). The normalizer handles this. For reliability, format the phone column as **Text** in Excel and always include the country code. |
+| **Image upload `#100` errors** | Images > 5 MB are auto-compressed by `utils/image_utils.compress_image()` before upload. If you still see `#100`, Pillow may not be installed or the image cannot be compressed below 5 MB. Check logs for `image_compression_failed`. |
+| **Template `#132012` (media format mismatch)** | The cached media ID for a template header has expired. WappFlow auto-invalidates the cache on this error and re-uploads on the next send. If it persists, restart the worker to clear all in-memory media caches. |
+| **Template `#132000` (parameter count mismatch)** | The number of variables in the template body doesn't match what the builder resolved. Check that your contact CSV has the correct columns (e.g. `name`, `phone`) matching the template's variable names. |
 
 ### 21.7 Architecture Evolution (Phase History)
 
@@ -906,3 +918,153 @@ npm run dev             # Terminal 3: Next.js on port 3000
 | **Phase 9** | Per-tenant webhooks, HMAC signature verification, Fernet encryption at rest, `meta_app_secret` per tenant |
 | **Phase 10** | Per-tenant monthly bulk message quota: schema (`tenant_quota_usage`), atomic consumption (`db_layer/quota.py`), API pre-check, worker enforcement (capped fan-out + per-message consume), frontend quota bar + button guard |
 | **Phase 11** | Comprehensive documentation refresh: README rewrite (Firestore→Postgres alignment), API doc glossary, cross-referencing between docs, fresher onboarding improvements |
+| **Phase 12** | Phone normalization (`utils/phone_utils.py`): E.164-compliant, international support, India (+91) fallback, scientific notation (Excel float) handling, graceful `None` on invalid. Image compression (`utils/image_utils.py`): Pillow-based automatic compression to ≤5 MB before WhatsApp upload (JPEG quality reduction, PNG optimize, progressive resize). Media upload fix (`services/whatsapp.py`): correct multipart/form-data with MIME-derived filename. Template hardening: named + positional variable support, pre-send `validate_components()`, tenant-scoped template + media ID cache, CDN URL expiry detection, non-retryable error code classification (`#132000`, `#132001`, `#132012`, `#100`). |
+
+---
+
+## 22. Phone Normalization Architecture
+
+WappFlow enforces **E.164-compliant phone normalization** at every entry point where phone numbers are accepted. This ensures numbers are never silently corrupted before reaching the WhatsApp Cloud API.
+
+### 22.1 The Problem It Solves
+
+Before Phase 12, phone numbers were processed with hardcoded India-specific logic that blindly stripped non-digits and prepended `91`. This caused:
+- US numbers like `+14155552671` becoming `14155552671914155552671` (double-prepend on retry)
+- UK numbers like `+447911123456` becoming `91447911123456` (invalid)
+- Excel float notation like `9.1995E+11` becoming `91199` (corrupt)
+
+### 22.2 Normalization Flow
+
+```
+Raw phone string from CSV / webhook / API
+          │
+          ├─ Starts with '+'? → set international=True
+          │
+          ├─ Parseable as float? (scientific notation, e.g. 9.1995E+11)
+          │   └─ Convert to integer string; international=False
+          │       (the '+' in '9.1995E+11' is exponent, not country code)
+          │
+          ├─ Strip all non-digit characters
+          │
+          ├─ Apply India (+91) fallback?
+          │   Only when ALL conditions met:
+          │   • international=False (no leading '+')
+          │   • Exactly 10 digits
+          │   • First digit is 6, 7, 8, or 9 (Indian mobile range)
+          │   └─ Prepend '91'
+          │
+          ├─ Validate E.164 length: 10–15 digits
+          │   └─ Outside range? → return None (caller skips)
+          │
+          └─ Return digits-only string (no '+', no spaces)
+               WhatsApp API accepts: "to": "14155552671"
+```
+
+### 22.3 Where Normalization Happens
+
+| Layer | File | Behavior on Invalid |
+|-------|------|---------------------|
+| **File parse (bulk)** | `routers/bulk_message.py` | Skip row silently; not counted in `validContacts` |
+| **File parse (file-forward)** | `routers/file_forward.py` | Skip row silently |
+| **Queue enqueue** | `services/queue_manager.py` | Skip enqueue; `WARNING` log; job never created |
+| **Worker pre-send** | `worker_main.py` | Mark recipient `failed`; increment failed counter; log at `WARN`; finalize campaign if last recipient |
+
+The worker re-normalizes the phone on arrival (not just at enqueue) to provide full observability via structured logging:
+```
+Phone normalization: raw=+14155552671, normalized=14155552671
+```
+
+### 22.4 Key Files
+
+| File | Role |
+|------|------|
+| `utils/phone_utils.py` | Single source of truth for `normalize_phone()` |
+| `routers/bulk_message.py` | Calls normalizer on every parsed CSV row |
+| `routers/file_forward.py` | Calls normalizer on contact list rows |
+| `services/queue_manager.py` | Normalizes in `enqueue_message()`; returns early if `None` |
+| `worker_main.py` | Re-normalizes + logs for observability; graceful failure path |
+
+---
+
+## 23. Image & Media Upload Pipeline
+
+WappFlow's media pipeline ensures images are reliably uploaded to the WhatsApp Cloud API — including automatic size enforcement, format detection, and CDN URL validation.
+
+### 23.1 The Problem It Solves
+
+WhatsApp Cloud API enforces a **5 MB hard limit** on image uploads. Attempts to upload larger images return `#100 Invalid parameter`. Additionally:
+- CDN URLs embedded in WhatsApp template definitions expire over time — downloading them returns HTML error pages, not the actual image.
+- The Graph API requires a specific `multipart/form-data` structure with a filename that has the correct extension — using `upload.bin` or omitting the extension causes silent `#100` failures.
+- JPEG doesn't support transparency — RGBA/palette-mode PNGs must be composited before conversion.
+
+### 23.2 Upload Flow (Template Header Images)
+
+```
+template_builder.upload_header_media(template_key, whatsapp, tenant_id)
+          │
+          ├─ Check in-memory media ID cache
+          │   └─ Hit → return cached media_id (no download/upload)
+          │
+          ├─ Find HEADER component in cached template metadata
+          │   └─ No media header → return "" immediately
+          │
+          ├─ Download image from CDN handle URL (httpx)
+          │   ├─ status != 200 → WARN, abort
+          │   ├─ Content-Type is text/html or application/json → WARN "CDN expired", abort
+          │   ├─ Content length < 100 bytes → WARN "suspiciously small", abort
+          │   └─ Content-Type is application/octet-stream → infer MIME from template format field
+          │
+          ├─ If format == IMAGE: compress_image(file_bytes)     ← utils/image_utils.py
+          │   └─ Re-detect MIME from magic bytes after compression
+          │       (PNG→JPEG conversion changes MIME)
+          │
+          ├─ whatsapp.upload_media(file_bytes, mime)            ← services/whatsapp.py
+          │   ├─ Derive filename from MIME: "upload.jpg", "upload.png", etc.
+          │   ├─ POST multipart/form-data:
+          │   │   • file=(filename, bytes, mime)  [files= field]
+          │   │   • messaging_product="whatsapp"  [data= field]
+          │   │   • type=mime                     [data= field]
+          │   └─ Returns {success: True, mediaId: "..."}
+          │
+          ├─ Cache media_id under tenant-scoped key
+          └─ Return media_id
+```
+
+### 23.3 Image Compression Strategies
+
+The `compress_image()` function in `utils/image_utils.py` applies strategies in order:
+
+| Strategy | Condition | Output |
+|----------|-----------|--------|
+| **No-op** | `len(bytes) <= 5 MB` | Return as-is immediately |
+| **EXIF fix** | Always (when opening with Pillow) | Apply `ImageOps.exif_transpose()` |
+| **PNG optimize** | PNG with real transparency | `save(format=PNG, optimize=True)` |
+| **PNG → JPEG fallback** | PNG optimize still > 5 MB | Fall through to JPEG path |
+| **JPEG quality reduction** | All other cases | Quality 90 → 85 → 80 → ... → 40 (step 5); first ≤ 5 MB wins |
+| **Progressive resize** | JPEG path exhausted | Halve resolution up to 5× + JPEG quality 70 |
+| **Absolute fallback** | All strategies failed | Return original bytes; upload may fail — `image_compression_failed` logged |
+
+### 23.4 Media ID Cache & Invalidation
+
+Once a header image is successfully uploaded, the resulting `media_id` is cached:
+
+```python
+# Cache key format:
+"{tenant_id}:{template_name}|{language_code}"
+
+# Example:
+"uid_abc123:promo_template|en_US"
+```
+
+- **Scope:** In-memory (`_uploaded_media_ids` dict), **per worker process**, for the process lifetime.
+- **Benefit:** Chatbot flows that send the same template to hundreds of users per minute re-use the same `media_id` without re-uploading the image.
+- **Invalidation trigger:** When the WhatsApp API returns `#132012 Parameter format does not match`, the worker calls `invalidate_cached_media(template_key, tenant_id)` so the next send triggers a fresh upload.
+
+### 23.5 Key Files
+
+| File | Role |
+|------|------|
+| `utils/image_utils.py` | `compress_image()` — all compression logic |
+| `services/template_builder.py` | `upload_header_media()` — CDN download, compression, upload, caching; `invalidate_cached_media()` — cache invalidation |
+| `services/whatsapp.py` | `upload_media()` — multipart/form-data upload to Graph API |
+| `worker_main.py` | Calls `upload_header_media()` before every template send; calls `invalidate_cached_media()` on `#132012` |

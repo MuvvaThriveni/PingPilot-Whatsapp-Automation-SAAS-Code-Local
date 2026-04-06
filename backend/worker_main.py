@@ -21,7 +21,10 @@ from services.template_builder import (
     ensure_cached as _ensure_template_cached,
     upload_header_media as _upload_header_media,
     build_components as _build_template_components,
+    validate_components as _validate_template_components,
     get_template_keys_for_tenant as _get_template_keys_for_tenant,
+    has_media_header as _has_media_header,
+    invalidate_cached_media as _invalidate_cached_media,
 )
 from observability import log_event
 from rate_limit import (
@@ -207,7 +210,7 @@ async def process_message_job(job: Job, token: str):
     data = job.data
     campaign_id = data.get("campaign_id")
     tenant_id = data.get("tenant_id")
-    phone = data.get("phone_number")
+    phone_raw = data.get("phone_number")
     template_name = data.get("template_name", "")
     message_text = data.get("message_text", "")
     extra_vars = data.get("template_variables", {})
@@ -221,6 +224,26 @@ async def process_message_job(job: Job, token: str):
         max_attempts = int(job_opts.get("attempts", 5))
     except Exception:
         max_attempts = 5
+
+    # ── Phone normalization & observability ──────────────────────────
+    from utils.phone_utils import normalize_phone
+    phone = normalize_phone(phone_raw) if phone_raw else None
+    logger.info("Phone normalization: raw=%s, normalized=%s", phone_raw, phone)
+
+    if phone is None:
+        logger.warning("Invalid phone number skipped in worker: raw=%s campaign=%s", phone_raw, campaign_id)
+        if campaign_id and campaign_id not in ("webhook", "file_forward"):
+            from db_layer.campaign_recipients import campaign_recipients as _db_recip
+            from db_layer.campaign_counters import campaign_counters as _db_cnt
+            async with transaction() as conn:
+                await _db_recip.mark_failed(
+                    tenant_id, campaign_id, phone_raw or "",
+                    "Invalid phone number (failed E.164 validation)",
+                    conn=conn,
+                )
+                await _db_cnt.increment(tenant_id, campaign_id, "failed", conn=conn)
+            await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+        return "invalid_phone"
 
     logger.info(f"Picked job={job.id} tenant={tenant_id} campaign={campaign_id} phone={phone}")
 
@@ -448,7 +471,43 @@ async def process_message_job(job: Job, token: str):
                 header_media_id=header_media_id,
                 tenant_id=tenant_id
             )
-            
+
+            # ── Validate components before sending ─────────────────────────
+            # Catches parameter count mismatches and missing media headers
+            # locally, preventing WhatsApp errors #132000 and #132012.
+            valid, validation_err = _validate_template_components(
+                template_name, components, tenant_id=tenant_id
+            )
+            if not valid:
+                log_event(
+                    "template_validation_failed",
+                    tenant_id=tenant_id,
+                    campaign_id=campaign_id,
+                    phone=phone,
+                    detail=validation_err,
+                    level="ERROR",
+                )
+                if campaign_id and campaign_id not in ("webhook", "file_forward"):
+                    async with transaction() as conn:
+                        failed_ok = await _db_recipients.transition_processing_to_failed(
+                            tenant_id, campaign_id, phone,
+                            validation_err,
+                            conn=conn,
+                        )
+                        if failed_ok:
+                            await _db_counters.increment(tenant_id, campaign_id, "failed", conn=conn)
+                    await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+                return "validation_failed"
+
+            # ── Log final payload for production debugging ─────────────────
+            log_event(
+                "template_payload_built",
+                tenant_id=tenant_id,
+                campaign_id=campaign_id,
+                phone=phone,
+                detail=f"template={template_name} components={components}",
+            )
+
             result = await whatsapp.send_template_message(
                 phone, template_name, components=components if components else None
             )
@@ -595,10 +654,27 @@ async def process_message_job(job: Job, token: str):
             
         else:
             err = result.get("error", "Unknown error")
-            logger.warning(f"Send failed campaign={campaign_id} phone={phone} err={err}")
+            err_code = str(result.get("error_code", ""))
+            logger.warning(f"Send failed campaign={campaign_id} phone={phone} err={err} code={err_code}")
 
             # Non-retryable error: template missing / translation missing.
-            non_retryable = "132001" in err or "Template name does not exist" in err
+            # Error 132000: parameter count mismatch (validation error).
+            # Error 132001: template name missing.
+            # Error 132012: parameter format mismatch (e.g. missing media header).
+            # Error 100: invalid parameter (e.g. bad media upload).
+            # None of these are transient — retrying will never fix them.
+            _NON_RETRYABLE_CODES = {"132000", "132001", "132012", "100"}
+            non_retryable = (
+                err_code in _NON_RETRYABLE_CODES
+                or "132000" in err
+                or "132001" in err
+                or "132012" in err
+                or "(code: 100)" in err
+                or "Template name does not exist" in err
+            )
+            # If #132012, the cached media_id is likely stale — invalidate it
+            if "132012" in err and template_name:
+                _invalidate_cached_media(template_name, tenant_id=tenant_id)
 
             if campaign_id and campaign_id not in ("webhook", "file_forward"):
                 async with transaction() as conn:

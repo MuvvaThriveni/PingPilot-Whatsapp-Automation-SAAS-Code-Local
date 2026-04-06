@@ -10,9 +10,11 @@ Fixes:
 
 import io
 import uuid
+import logging
 from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from utils.time_utils import get_ist_now_iso
+from utils.phone_utils import normalize_phone
 import pandas as pd
 
 from store import get_settings
@@ -48,25 +50,18 @@ def _parse_contacts_from_df(df):
 
     name_col = _find_column(df.columns, ["name"])
 
+    _logger = logging.getLogger("file_forward")
     contacts = []
     seen_phones = set()  # Deduplication
     for idx, row in df.iterrows():
         raw = row[phone_col]
-        # Handle numeric values (int, float, or scientific-notation strings like "9.1995E+11")
-        try:
-            numeric = float(raw)
-            phone_str = f"{numeric:.0f}"
-        except (ValueError, TypeError):
-            phone_str = str(raw).strip()
-            if phone_str.endswith('.0'):
-                phone_str = phone_str[:-2]
+        phone = normalize_phone(raw)
 
-        phone = "".join(filter(str.isdigit, phone_str))
-        # Auto-add India country code for 10-digit mobile numbers
-        if len(phone) == 10 and phone[0] in ('6', '7', '8', '9'):
-            phone = '91' + phone
+        if phone is None:
+            _logger.warning("Invalid phone number skipped: raw=%s", raw)
+            continue
 
-        if len(phone) >= 10 and phone not in seen_phones:
+        if phone not in seen_phones:
             seen_phones.add(phone)
             contacts.append({
                 "index": idx,

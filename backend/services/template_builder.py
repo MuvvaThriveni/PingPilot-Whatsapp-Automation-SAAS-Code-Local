@@ -14,6 +14,7 @@ Public API
 ``ensure_cached(template_key, whatsapp, settings, tenant_id) -> bool``
 ``get_components(template_key, tenant_id) -> list``
 ``build_components(template_key, contact, header_media_id, tenant_id) -> list``
+``validate_components(template_key, components, tenant_id) -> tuple[bool, str]``
 ``upload_header_media(template_key, whatsapp, tenant_id) -> str``
 ``get_template_keys_for_tenant(tenant_id, template_name) -> list[str]``
 """
@@ -23,6 +24,11 @@ from __future__ import annotations
 import re
 import httpx
 from observability import log_event
+
+# Regex patterns for template variable detection
+_POSITIONAL_VAR_RE = re.compile(r"\{\{(\d+)\}\}")
+_NAMED_VAR_RE = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}")
+_ANY_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 
 # ---------------------------------------------------------------------------
 # Tenant-scoped template metadata cache
@@ -72,6 +78,22 @@ def get_template_keys_for_tenant(tenant_id: str, template_name: str) -> list[str
             # Strip tenant prefix for caller
             result.append(k.split(":", 1)[1] if ":" in k else k)
     return result
+
+
+def has_media_header(template_key: str, tenant_id: str = "") -> bool:
+    """Return True if the cached template has a media (IMAGE/VIDEO/DOCUMENT) header."""
+    full_key = _tenant_key(tenant_id, template_key) if tenant_id else template_key
+    cached = _template_components.get(full_key, [])
+    for comp in cached:
+        if comp.get("type") == "HEADER" and comp.get("format") in ("IMAGE", "VIDEO", "DOCUMENT"):
+            return True
+    return False
+
+
+def invalidate_cached_media(template_key: str, tenant_id: str = ""):
+    """Remove a cached media_id so the next call re-uploads."""
+    full_key = _tenant_key(tenant_id, template_key) if tenant_id else template_key
+    _uploaded_media_ids.pop(full_key, None)
 
 
 async def ensure_cached(template_key: str, whatsapp, settings: dict,
@@ -173,8 +195,47 @@ async def upload_header_media(template_key: str, whatsapp,
                           detail=f"status={dl.status_code}")
                 break
 
-            mime = dl.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-            upload_result = await whatsapp.upload_media(dl.content, mime)
+            mime = dl.headers.get("content-type", "image/jpeg").split(";")[0].strip().lower()
+
+            # Validate: downloaded content must be actual media, not an error page
+            # (expired scontent.whatsapp.net CDN URLs return HTML or JSON errors)
+            if mime.startswith("text/") or mime == "application/json":
+                log_event("template_media_invalid_content", tenant_id=tenant_id, level="WARN",
+                          detail=f"CDN returned content-type '{mime}' — URL likely expired")
+                break
+
+            if len(dl.content) < 100:
+                log_event("template_media_too_small", tenant_id=tenant_id, level="WARN",
+                          detail=f"Downloaded content suspiciously small ({len(dl.content)} bytes)")
+                break
+
+            # Infer proper MIME when CDN returns a generic content-type
+            if mime in ("application/octet-stream", "binary/octet-stream"):
+                fmt = comp.get("format", "").upper()
+                mime = {"IMAGE": "image/jpeg", "VIDEO": "video/mp4", "DOCUMENT": "application/pdf"}.get(fmt, mime)
+
+            file_bytes = dl.content
+
+            # ── Image compression (IMAGE headers only) ─────────────────
+            # WhatsApp rejects images > 5 MB with (#100) Invalid parameter.
+            # Compress before uploading; non-image formats pass through.
+            if comp.get("format", "").upper() == "IMAGE":
+                try:
+                    from utils.image_utils import compress_image
+                    file_bytes = compress_image(file_bytes)
+                    # Update MIME if compression converted PNG → JPEG
+                    if file_bytes[:3] == b'\xff\xd8\xff':
+                        mime = "image/jpeg"
+                    elif file_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+                        mime = "image/png"
+                except Exception as exc:
+                    log_event("image_compression_import_error",
+                              tenant_id=tenant_id, level="WARN",
+                              detail=f"Compression skipped: {str(exc)[:100]}")
+                    # Fallback: upload original uncompressed bytes
+                    file_bytes = dl.content
+
+            upload_result = await whatsapp.upload_media(file_bytes, mime)
             if upload_result["success"]:
                 media_id: str = upload_result["mediaId"]
                 # Cache the media ID for reuse
@@ -193,6 +254,54 @@ async def upload_header_media(template_key: str, whatsapp,
     return ""
 
 
+def _resolve_param_value(var_name: str, index: int, contact: dict,
+                         example_texts: list, section: str = "body") -> str:
+    """Resolve a single template parameter value from contact data or examples.
+
+    Lookup order:
+    1. Exact key match in contact (e.g. contact["name"] for {{name}})
+    2. Positional fallback: contact["name"] for index 0, contact["phone"] for index 1
+    3. Example text from the template definition
+    4. Single space as last resort (keeps param count correct)
+    """
+    # 1. Named match — try exact key in contact
+    if not var_name.isdigit() and contact.get(var_name):
+        return str(contact[var_name])
+
+    # 2. Positional fallback for well-known slots
+    if section == "header":
+        if index == 0 and contact.get("name"):
+            return contact["name"]
+    else:  # body
+        if index == 0 and contact.get("name"):
+            return contact["name"]
+        if index == 1 and contact.get("phone"):
+            return contact["phone"]
+
+    # 3. Example text
+    if index < len(example_texts):
+        return example_texts[index]
+
+    # 4. Last resort
+    return " "
+
+
+def _is_named_var(var_name: str) -> bool:
+    """Return True if the variable name is alphabetic (named), not numeric (positional)."""
+    return not var_name.isdigit()
+
+
+def _build_param_entry(var_name: str, value: str) -> dict:
+    """Build a single parameter dict for the WhatsApp API.
+
+    Named variables ({{name}}) → include parameter_name field.
+    Positional variables ({{1}}) → text only.
+    """
+    if _is_named_var(var_name):
+        return {"type": "text", "parameter_name": var_name, "text": value}
+    return {"type": "text", "text": value}
+
+
 def build_components(
     template_key: str,
     contact: dict | None = None,
@@ -200,6 +309,13 @@ def build_components(
     tenant_id: str = "",
 ) -> list:
     """Build the runtime *components* payload for ``send_template_message()``.
+
+    Handles:
+    - Positional variables: ``{{1}}``, ``{{2}}``
+    - Named variables: ``{{name}}``, ``{{phone}}``
+    - IMAGE / VIDEO / DOCUMENT headers (media id or link)
+    - TEXT headers with variables
+    - BODY with variables
 
     Uses tenant-scoped cached template metadata.
     """
@@ -221,17 +337,16 @@ def build_components(
 
             if header_format == "TEXT":
                 text = comp.get("text", "")
-                params = re.findall(r"\{\{\d+\}\}", text)
-                if params:
+                # Detect both positional {{1}} and named {{name}} variables
+                var_matches = _ANY_VAR_RE.findall(text)
+                if var_matches:
                     example_texts = example.get("header_text", [])
                     parameters = []
-                    for i, _ in enumerate(params):
-                        if i == 0 and contact.get("name"):
-                            parameters.append({"type": "text", "text": contact["name"]})
-                        elif i < len(example_texts):
-                            parameters.append({"type": "text", "text": example_texts[i]})
-                        else:
-                            parameters.append({"type": "text", "text": " "})
+                    for i, var_name in enumerate(var_matches):
+                        value = _resolve_param_value(
+                            var_name, i, contact, example_texts, section="header"
+                        )
+                        parameters.append(_build_param_entry(var_name, value))
                     components.append({"type": "header", "parameters": parameters})
 
             elif header_format == "IMAGE":
@@ -279,23 +394,84 @@ def build_components(
         # ── BODY ───────────────────────────────────────────────────────────
         elif comp_type == "BODY":
             text = comp.get("text", "")
-            params = re.findall(r"\{\{\d+\}\}", text)
-            if params:
+            # Detect both positional {{1}} and named {{name}} variables
+            var_matches = _ANY_VAR_RE.findall(text)
+            if var_matches:
                 example_texts = (
                     example.get("body_text", [[]])[0]
                     if example.get("body_text")
                     else []
                 )
                 parameters = []
-                for i, _ in enumerate(params):
-                    if i == 0 and contact.get("name"):
-                        parameters.append({"type": "text", "text": contact["name"]})
-                    elif i == 1 and contact.get("phone"):
-                        parameters.append({"type": "text", "text": contact["phone"]})
-                    elif i < len(example_texts):
-                        parameters.append({"type": "text", "text": example_texts[i]})
-                    else:
-                        parameters.append({"type": "text", "text": " "})
+                for i, var_name in enumerate(var_matches):
+                    value = _resolve_param_value(
+                        var_name, i, contact, example_texts, section="body"
+                    )
+                    parameters.append(_build_param_entry(var_name, value))
                 components.append({"type": "body", "parameters": parameters})
 
     return components
+
+
+def validate_components(
+    template_key: str,
+    components: list,
+    tenant_id: str = "",
+) -> tuple[bool, str]:
+    """Validate that *components* match the cached template expectations.
+
+    Returns ``(True, "")`` if valid, or ``(False, error_message)`` on mismatch.
+    Checks:
+    - Media headers have a corresponding header component
+    - Body parameter count matches template variable count
+    - Header text parameter count matches
+    """
+    full_key = _tenant_key(tenant_id, template_key) if tenant_id else template_key
+    cached = _template_components.get(full_key, [])
+    if not cached:
+        return True, ""  # nothing to validate against
+
+    built_by_type: dict[str, dict] = {}
+    for c in (components or []):
+        built_by_type[c.get("type", "")] = c
+
+    for comp in cached:
+        comp_type = comp.get("type", "")
+
+        if comp_type == "HEADER":
+            header_format = comp.get("format", "TEXT")
+
+            # Media headers MUST have a header component
+            if header_format in ("IMAGE", "VIDEO", "DOCUMENT"):
+                if "header" not in built_by_type:
+                    return False, (
+                        f"Template '{template_key}' requires a {header_format} header "
+                        f"but no header component was built (missing media_id or URL)"
+                    )
+
+            # Text headers with variables must match count
+            if header_format == "TEXT":
+                text = comp.get("text", "")
+                expected_count = len(_ANY_VAR_RE.findall(text))
+                if expected_count > 0:
+                    header_comp = built_by_type.get("header")
+                    actual_count = len((header_comp or {}).get("parameters", []))
+                    if actual_count != expected_count:
+                        return False, (
+                            f"Header parameter count mismatch: template expects "
+                            f"{expected_count} but built {actual_count}"
+                        )
+
+        elif comp_type == "BODY":
+            text = comp.get("text", "")
+            expected_count = len(_ANY_VAR_RE.findall(text))
+            if expected_count > 0:
+                body_comp = built_by_type.get("body")
+                actual_count = len((body_comp or {}).get("parameters", []))
+                if actual_count != expected_count:
+                    return False, (
+                        f"Body parameter count mismatch: template expects "
+                        f"{expected_count} but built {actual_count}"
+                    )
+
+    return True, ""

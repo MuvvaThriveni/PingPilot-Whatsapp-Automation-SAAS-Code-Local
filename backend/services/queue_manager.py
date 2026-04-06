@@ -1,7 +1,11 @@
 import os
 import re
+import logging
 from bullmq import Queue
 from rate_limit import get_redis_opts_for_bullmq
+from utils.phone_utils import normalize_phone
+
+logger = logging.getLogger("queue_manager")
 
 redis_opts = get_redis_opts_for_bullmq()
 
@@ -48,13 +52,13 @@ async def enqueue_message(
     
     # Override jobId for campaign-based message jobs to ensure idempotent deduplication
     if campaign_id not in ("webhook", "file_forward"):
-        # Normalize phone number: remove all non-digit characters
-        normalized_phone = "".join(filter(str.isdigit, phone_number))
-        
-        # Ensure consistent format: prepend default country code (91) for 10-digit numbers
-        # This prevents duplicates from "9876543210" vs "919876543210"
-        if len(normalized_phone) == 10 and normalized_phone[0] in ('6', '7', '8', '9'):
-            normalized_phone = '91' + normalized_phone
+        # Normalize phone number using shared utility
+        # Correctly preserves international numbers while applying +91 fallback for Indian locals
+        normalized_phone = normalize_phone(phone_number)
+
+        if normalized_phone is None:
+            logger.warning("Invalid phone number skipped: raw=%s campaign=%s", phone_number, campaign_id)
+            return
         
         # Sanitize template_name for safe jobId generation
         # - Default to "text" if empty
