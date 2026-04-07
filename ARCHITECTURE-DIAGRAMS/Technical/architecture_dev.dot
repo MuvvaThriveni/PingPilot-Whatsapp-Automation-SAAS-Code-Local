@@ -1,0 +1,456 @@
+digraph WappFlow {
+    // ── Global Settings ──────────────────────────────────────────────
+    rankdir=TB;
+    fontname="Inter, Helvetica, Arial, sans-serif";
+    fontsize=11;
+    compound=true;
+    nodesep=0.6;
+    ranksep=0.9;
+    splines=ortho;
+    bgcolor="#0d1117";
+    pad=0.5;
+    label=<<B><FONT POINT-SIZE="20" COLOR="#e6edf3">PingPilot (WappFlow) — Developer Architecture Diagram</FONT></B><BR/><FONT POINT-SIZE="11" COLOR="#7d8590">Multi-Tenant WhatsApp Business Automation SaaS  •  Final Build</FONT>>;
+    labelloc=t;
+    labeljust=c;
+
+    // ── Default Styles ───────────────────────────────────────────────
+    node [
+        fontname="Inter, Helvetica, Arial, sans-serif",
+        fontsize=10,
+        style="filled,rounded",
+        shape=record,
+        fillcolor="#161b22",
+        color="#30363d",
+        fontcolor="#e6edf3",
+        penwidth=1.2
+    ];
+    edge [
+        fontname="Inter, Helvetica, Arial, sans-serif",
+        fontsize=8,
+        color="#58a6ff",
+        fontcolor="#8b949e",
+        arrowsize=0.7,
+        penwidth=1.0
+    ];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EXTERNAL USERS & SERVICES
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_external {
+        label=<<B><FONT COLOR="#e6edf3">External Services</FONT></B>>;
+        style="dashed,rounded";
+        color="#30363d";
+        bgcolor="#0d1117";
+
+        user [label="Browser\n(Tenant User)" shape=house fillcolor="#1f2937" color="#58a6ff"];
+        meta_whatsapp [label="WhatsApp Cloud API\n(Meta Graph v18)" shape=component fillcolor="#1a4d2e" color="#3fb950" fontcolor="#e6edf3"];
+        firebase_ext [label="Firebase Auth\n(Google Cloud)" shape=component fillcolor="#3b2f1a" color="#d29922" fontcolor="#e6edf3"];
+        openai_ext [label="OpenAI API\n(GPT-4 Turbo)" shape=component fillcolor="#1a2744" color="#58a6ff" fontcolor="#e6edf3"];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  FRONTEND — Next.js (Vercel)
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_frontend {
+        label=<<B><FONT COLOR="#e6edf3">Frontend — Next.js 14 / React / TypeScript  (Vercel)</FONT></B>>;
+        style="filled,rounded";
+        color="#1f6feb";
+        fillcolor="#0d1117";
+        bgcolor="#0d1117";
+
+        subgraph cluster_fe_app {
+            label=<<FONT COLOR="#8b949e">src/app/</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            fe_layout   [label="layout.tsx\n(Root Layout + AuthProvider)"];
+            fe_login    [label="login/page.tsx\nregister/page.tsx"];
+            fe_home     [label="page.tsx\n(Landing / Redirect)"];
+
+            subgraph cluster_dashboard {
+                label=<<FONT COLOR="#8b949e">dashboard/</FONT>>;
+                style="dashed,rounded";
+                color="#30363d";
+                bgcolor="#1c2128";
+
+                fe_dash_layout [label="layout.tsx\n(Sidebar Shell)"];
+                fe_dash_home   [label="page.tsx\n(Product Cards + Usage Stats)"];
+                fe_settings    [label="settings/\n(WhatsApp API Config)"];
+                fe_bulk        [label="bulk-message/\n(Campaign UI)"];
+                fe_filefwd     [label="file-forward/\n(File Sending UI)"];
+                fe_chatbot     [label="chatbot/\n(Rules + AI Config + Conversations)"];
+                fe_logs        [label="logs/\n(Message Logs + Export)"];
+            }
+        }
+
+        subgraph cluster_fe_lib {
+            label=<<FONT COLOR="#8b949e">src/lib/ + src/contexts/ + src/hooks/</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            fe_api      [label="api.ts\n(Axios + Firebase Auth Interceptor\n+ URL normalizer)"];
+            fe_firebase [label="firebase.ts\n(Firebase Client SDK Init)"];
+            fe_utils    [label="utils.ts\n(cn: clsx + tw-merge)"];
+            fe_contexts [label="contexts/\n(AuthContext)"];
+            fe_hooks    [label="hooks/\n(use-toast)"];
+        }
+
+        subgraph cluster_fe_components {
+            label=<<FONT COLOR="#8b949e">src/components/</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            fe_dash_comp [label="DashboardLayout.tsx\n(Sidebar + Navigation)"];
+
+            subgraph cluster_fe_ui {
+                label=<<FONT COLOR="#8b949e">ui/ (shadcn/ui)</FONT>>;
+                style="dashed,rounded";
+                color="#30363d";
+                bgcolor="#1c2128";
+
+                fe_ui_parts [label="button • card • input\nlabel • select • skeleton\nswitch • textarea\ntoast • toaster"];
+            }
+        }
+
+        fe_tailwind   [label="tailwind.config.ts\npostcss.config.js" shape=note fillcolor="#1c2128" fontcolor="#8b949e"];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  BACKEND — FastAPI (Render)
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_backend {
+        label=<<B><FONT COLOR="#e6edf3">Backend — FastAPI / Python 3.11+  (Render)</FONT></B>>;
+        style="filled,rounded";
+        color="#da3633";
+        fillcolor="#0d1117";
+        bgcolor="#0d1117";
+
+        // ── Entrypoints ──
+        subgraph cluster_entry {
+            label=<<FONT COLOR="#8b949e">Entrypoints</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            main_py      [label="main.py\n(FastAPI app, lifespan,\nmiddleware, router mount,\n/api/health deep check)" fillcolor="#1a3a2a" color="#3fb950"];
+            run_server   [label="run_server.py\n(Uvicorn launcher)"];
+            worker_main  [label="worker_main.py\n(BullMQ Workers:\ncampaign_worker +\nmessage_worker +\nDLQ handler)" fillcolor="#3b1a1a" color="#f85149"];
+            apply_schema [label="apply_schema.py\n(DB Schema Bootstrapper)" shape=note fillcolor="#161b22" fontcolor="#8b949e"];
+        }
+
+        // ── Middleware Chain ──
+        subgraph cluster_middleware {
+            label=<<FONT COLOR="#8b949e">Middleware Chain (request order →)</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            mw_cors     [label="CORSMiddleware\n(Origin Allowlist\n+ env CORS_ORIGINS)"];
+            mw_auth     [label="auth_middleware.py\n(Firebase Token Verify →\nrequest.state.tenant_id)"];
+            mw_rate     [label="RateLimitMiddleware\n(Redis Sliding Window:\nHeavy 10/min • General 300/min\n+ IP-based + tenant-based deps)"];
+        }
+
+        // ── Routers ──
+        subgraph cluster_routers {
+            label=<<FONT COLOR="#8b949e">routers/</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            rt_settings [label="/api/settings\nsettings.py\n(WhatsApp creds CRUD\n+ usage stats + test)"];
+            rt_bulk     [label="/api/bulk-message\nbulk_message.py\n(start/stop/status/delete\n/resend-failed/parse)"];
+            rt_filefwd  [label="/api/file-forward\nfile_forward.py\n(single + bulk send\n+ parse-contacts)"];
+            rt_chatbot  [label="/api/chatbot\nchatbot.py\n(rules/settings/convos\n/users + AI config)"];
+            rt_logs     [label="/api/logs\nlogs.py\n(retrieval + CSV export\n+ stats)"];
+            rt_webhook  [label="/api/webhook/[tenant_id]\\nwebhook.py\\n(HMAC-SHA256 verify,\\nincoming msgs, delivery status\\n+ campaign reconciliation)" fillcolor="#2d1a00" color="#d29922"];
+        }
+
+        // ── Services ──
+        subgraph cluster_services {
+            label=<<FONT COLOR="#8b949e">services/</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            svc_whatsapp  [label="whatsapp.py\n(Cloud API Client:\nretry + jitter + conn pooling\n+ adaptive 429 cooldown)"];
+            svc_queue     [label="queue_manager.py\n(BullMQ Job Helpers:\ncampaign/msg/file/DLQ)"];
+            svc_template  [label="template_builder.py\n(Component Cache +\nParameter Builder\n+ header media upload)"];
+            svc_chatgpt   [label="chatgpt.py\n(GPT-4 Turbo integration:\nstateless context from DB,\nconfigurable system prompt)" fillcolor="#1a2744" color="#58a6ff"];
+        }
+
+        // ── DB Layer ──
+        subgraph cluster_dblayer {
+            label=<<FONT COLOR="#8b949e">db_layer/</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            db_tenants     [label="tenants.py\n(Tenant CRUD,\nlookup by phone_number_id\n+ webhook_verify_token)"];
+            db_campaigns   [label="campaigns.py\n(Campaign CRUD +\nstatus transitions\n+ list_running_global)"];
+            db_recipients  [label="campaign_recipients.py\n(Status machine:\npending→queued→processing\n→submitted→sent/failed\n+ count_done)"];
+            db_counters    [label="campaign_counters.py\n(Sharded sent/failed\n+ transfer_sent_to_failed\n+ decrement_sent)"];
+            db_messages    [label="messages.py\n(Unified log + archive\nfallback + idempotent add)"];
+            db_chat        [label="chat_messages.py\n(Conversation history\n+ build_ai_context)"];
+            db_chatbot     [label="chatbot.py\n(Config + rules +\nbutton mappings)"];
+            db_webhook_evt [label="webhook_events.py\n(Deduplication)"];
+            db_usage       [label="usage_events.py\n(Billable tracking)"];
+            db_tmpl_cache  [label="template_cache.py\n(Persistent template meta)"];
+            db_secrets     [label="secrets.py\n(Runtime token resolution:\nDB → env fallback)"];
+            db_encryption  [label="encryption.py\n(Fernet AES-128-CBC:\nencrypt/decrypt at rest)" fillcolor="#2d1a00" color="#d29922"];
+            db_users       [label="users.py\n(Trigger rate limit 24h)"];
+        }
+
+        // ── Cross-cutting ──
+        subgraph cluster_crosscutting {
+            label=<<FONT COLOR="#8b949e">Cross-Cutting Concerns</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            database_py  [label="database.py\n(Async Postgres Pool:\npsycopg3, txn helper,\nping + init/close)"];
+            cache_py     [label="cache.py\n(In-Memory TTL: 6h default\n+ chat_users_key helper)"];
+            store_py     [label="store.py\n(Cached R/W layer:\nsettings + chatbot config\n+ active_campaigns)"];
+            observ_py    [label="observability.py\n(Structured JSON logging,\ntimed_op(), log_event())"];
+            startup_chk  [label="startup_checks.py\n(Env validation on boot\nstrict=False mode)"];
+            startup_cch  [label="startup_cache.py\n(Pre-warm caches)"];
+            firebase_cfg [label="firebase_config.py\n(Admin SDK init)"];
+        }
+
+        // ── Background Tasks ──
+        subgraph cluster_background {
+            label=<<FONT COLOR="#8b949e">Background asyncio Tasks (in main.py lifespan)</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            bg_cleanup    [label="periodical_cleanup\\n(every 6h: TTL delete\\nchat/msg/webhook/usage over 30d)"];
+            bg_scheduler  [label="periodical_scheduler\n(every 60s: enqueue\nscheduled campaigns)"];
+            bg_retention  [label="periodic_archive_runner\n(every 24h: archive →\npurge → daily_message_stats\n+ asyncio.Lock safety)"];
+        }
+
+        // ── Retention ──
+        subgraph cluster_retention {
+            label=<<FONT COLOR="#8b949e">Data Retention Engine</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            retention_py  [label="retention.py\n(archive_old_data +\npurge_old_archives +\nbatch SKIP LOCKED + CLI)"];
+            ret_schema    [label="retention_schema.sql\n(Archive tables DDL +\ndaily_message_stats)" shape=note fontcolor="#8b949e"];
+            schema_sql    [label="schema.sql\n(All live tables DDL\n+ pgcrypto extension)" shape=note fontcolor="#8b949e"];
+        }
+
+        // ── Tests ──
+        subgraph cluster_tests {
+            label=<<FONT COLOR="#8b949e">tests/</FONT>>;
+            style="dashed,rounded";
+            color="#30363d";
+            bgcolor="#161b22";
+
+            tests_dir [label="Unit & Integration Tests" shape=note fillcolor="#161b22" fontcolor="#8b949e"];
+        }
+
+        utils_time [label="utils/time_utils.py\n(IST timestamp helpers)" shape=note fillcolor="#161b22" fontcolor="#8b949e"];
+        sitecust   [label="sitecustomize.py\n(Python startup hook)" shape=note fillcolor="#161b22" fontcolor="#8b949e"];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  DATA STORES
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_datastores {
+        label=<<B><FONT COLOR="#e6edf3">Data Stores</FONT></B>>;
+        style="filled,rounded";
+        color="#8957e5";
+        fillcolor="#0d1117";
+        bgcolor="#0d1117";
+
+        subgraph cluster_postgres {
+            label=<<FONT COLOR="#e6edf3">Neon Postgres (Serverless)</FONT>>;
+            style="filled,rounded";
+            color="#8957e5";
+            fillcolor="#161b22";
+
+            pg_live [label="{Live Tables|tenants • campaigns\ncampaign_recipients • campaign_counters\nmessages • chat_messages\nchatbot_config • chatbot_rules\nwebhook_events • usage_events\ntemplate_cache • user_triggers}" shape=Mrecord fillcolor="#1c1437" color="#8957e5"];
+            pg_archive [label="{Archive Tables|messages_archive\nchat_messages_archive\nwebhook_events_archive\nusage_events_archive\ndaily_message_stats}" shape=Mrecord fillcolor="#1c1437" color="#8957e5"];
+            pg_encrypted [label="{Encrypted Columns|meta_app_secret\naccess_token (token_ref)\n(Fernet → \"enc:...\" prefix)}" shape=Mrecord fillcolor="#2d1a00" color="#d29922"];
+        }
+
+        subgraph cluster_redis {
+            label=<<FONT COLOR="#e6edf3">Redis (TLS in prod)</FONT>>;
+            style="filled,rounded";
+            color="#f85149";
+            fillcolor="#161b22";
+
+            redis_queues   [label="{BullMQ Queues|campaign_queue\nmessage_queue\ndead_letter_queue}" shape=Mrecord fillcolor="#3b1a1a" color="#f85149"];
+            redis_ratelimit [label="{Rate Limit State|sliding-window keys (sorted sets)\ntoken buckets (60s TTL)\nglobal cooldown flag\nLua-scripted atomic ops}" shape=Mrecord fillcolor="#3b1a1a" color="#f85149"];
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  DEPLOYMENT
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_deploy {
+        label=<<B><FONT COLOR="#e6edf3">Deployment</FONT></B>>;
+        style="dashed,rounded";
+        color="#30363d";
+        bgcolor="#0d1117";
+
+        deploy_vercel [label="Vercel\n(CDN + SSR)" shape=cds fillcolor="#161b22" color="#1f6feb"];
+        deploy_render [label="Render\n(API + Worker)" shape=cds fillcolor="#161b22" color="#da3633"];
+        deploy_docker [label="docker-compose.yml\n(Local Dev:\nredis + api + worker\n+ redis_data volume)" shape=note fillcolor="#161b22" color="#30363d" fontcolor="#8b949e"];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — User & External
+    // ══════════════════════════════════════════════════════════════════
+    user -> fe_login        [label="Login/Register" lhead=cluster_frontend];
+    user -> fe_dash_home    [label="Dashboard\ninteraction" lhead=cluster_dashboard];
+    fe_api -> main_py       [label="HTTPS\nBearer token" lhead=cluster_backend color="#1f6feb"];
+    fe_firebase -> firebase_ext [label="Client Auth\n(ID token)"];
+    firebase_ext -> mw_auth [label="Token\nverify" style=dashed color="#d29922"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Middleware Chain
+    // ══════════════════════════════════════════════════════════════════
+    mw_cors -> mw_auth [label="next"];
+    mw_auth -> mw_rate [label="next\n(tenant_id set)"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Routes to Services
+    // ══════════════════════════════════════════════════════════════════
+    rt_settings -> store_py    [label="read/write\nsettings"];
+    rt_settings -> db_tenants  [label="tenant\nlookup"];
+    rt_bulk     -> svc_queue   [label="enqueue\ncampaign"];
+    rt_bulk     -> db_campaigns [label="CRUD"];
+    rt_bulk     -> db_recipients [label="insert\nrecipients"];
+    rt_bulk     -> db_counters [label="init\ncounters"];
+    rt_filefwd  -> svc_whatsapp [label="send\nfile"];
+    rt_filefwd  -> svc_queue   [label="enqueue\nfile job"];
+    rt_chatbot  -> db_chatbot  [label="CRUD\nrules"];
+    rt_chatbot  -> store_py    [label="chatbot\nconfig"];
+    rt_chatbot  -> db_chat     [label="conversation\nhistory"];
+    rt_logs     -> db_messages [label="query\nlogs"];
+    rt_webhook  -> db_encryption [label="decrypt\nmeta_app_secret" color="#d29922"];
+    rt_webhook  -> db_webhook_evt [label="deduplicate"];
+    rt_webhook  -> db_messages [label="update\nstatus"];
+    rt_webhook  -> db_chatbot  [label="button\nmappings"];
+    rt_webhook  -> db_users    [label="first_trigger\nrate limit"];
+    rt_webhook  -> svc_queue   [label="enqueue\nchatbot reply"];
+    rt_webhook  -> db_campaigns [label="reconcile\ndelivery status"];
+    rt_webhook  -> db_recipients [label="mark sent/\nfailed/retry"];
+    rt_webhook  -> db_counters [label="transfer\nsent→failed"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Worker
+    // ══════════════════════════════════════════════════════════════════
+    worker_main -> redis_queues [label="consume\njobs" color="#f85149"];
+    worker_main -> svc_whatsapp [label="send\nmessage"];
+    worker_main -> svc_template [label="build\ncomponents"];
+    worker_main -> db_recipients [label="transition\nstatus"];
+    worker_main -> db_counters  [label="increment\nsent/failed"];
+    worker_main -> db_campaigns [label="finalize\ncampaign"];
+    worker_main -> db_messages  [label="record\nmessage"];
+    worker_main -> redis_ratelimit [label="token bucket\n+ cooldown" color="#f85149"];
+    worker_main -> db_chat [label="save chatbot\nconversation"];
+    worker_main -> db_usage [label="record\nusage events"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Services to External
+    // ══════════════════════════════════════════════════════════════════
+    svc_whatsapp  -> meta_whatsapp [label="Graph API\nv18 calls" color="#3fb950"];
+    svc_queue     -> redis_queues  [label="enqueue\njobs" color="#f85149"];
+    svc_template  -> db_tmpl_cache [label="read/write\ncache"];
+    svc_chatgpt   -> openai_ext   [label="Chat Completions\nAPI (httpx)" color="#58a6ff"];
+    svc_chatgpt   -> db_chat      [label="load AI\ncontext"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Webhook (incoming from Meta)
+    // ══════════════════════════════════════════════════════════════════
+    meta_whatsapp -> rt_webhook [label="POST /api/webhook/{tenant_id}\n+ X-Hub-Signature-256" color="#3fb950"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — DB Layer to Postgres
+    // ══════════════════════════════════════════════════════════════════
+    db_tenants    -> database_py [color="#8957e5" style=dashed];
+    db_campaigns  -> database_py [color="#8957e5" style=dashed];
+    db_recipients -> database_py [color="#8957e5" style=dashed];
+    db_counters   -> database_py [color="#8957e5" style=dashed];
+    db_messages   -> database_py [color="#8957e5" style=dashed];
+    db_chat       -> database_py [color="#8957e5" style=dashed];
+    db_chatbot    -> database_py [color="#8957e5" style=dashed];
+    db_webhook_evt-> database_py [color="#8957e5" style=dashed];
+    db_usage      -> database_py [color="#8957e5" style=dashed];
+    db_tmpl_cache -> database_py [color="#8957e5" style=dashed];
+    db_secrets    -> database_py [color="#8957e5" style=dashed];
+    db_users      -> database_py [color="#8957e5" style=dashed];
+
+    database_py   -> pg_live     [label="psycopg3\nconn pool" color="#8957e5"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Cross-cutting
+    // ══════════════════════════════════════════════════════════════════
+    store_py      -> cache_py    [label="get/invalidate"];
+    store_py      -> db_encryption [label="encrypt\non save" color="#d29922"];
+    db_secrets    -> db_encryption [label="decrypt\ntokens" color="#d29922"];
+    observ_py     -> main_py     [style=dashed label="structured\nJSON logs"];
+    startup_chk   -> main_py     [style=dashed label="boot\nvalidation"];
+    startup_cch   -> cache_py    [style=dashed label="pre-warm"];
+    firebase_cfg  -> mw_auth     [style=dashed label="Admin SDK"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Rate Limiting
+    // ══════════════════════════════════════════════════════════════════
+    mw_rate -> redis_ratelimit [label="API tier check\n(sliding window\n+ Lua token bucket)" color="#f85149"];
+    svc_whatsapp -> redis_ratelimit [label="set_global_cooldown\non 429" color="#f85149" style=dashed];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Background Tasks
+    // ══════════════════════════════════════════════════════════════════
+    bg_cleanup   -> database_py  [label="DELETE\n>30d rows" style=dashed color="#8957e5"];
+    bg_scheduler -> svc_queue    [label="enqueue\ndue campaigns" style=dashed];
+    bg_scheduler -> db_campaigns [label="query\nscheduled" style=dashed];
+    bg_retention -> retention_py [label="invoke" style=dashed];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Retention
+    // ══════════════════════════════════════════════════════════════════
+    retention_py -> pg_live    [label="SELECT + DELETE\n(batch, SKIP LOCKED)" color="#8957e5"];
+    retention_py -> pg_archive [label="INSERT\n(ON CONFLICT DO NOTHING)" color="#8957e5"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Deployment
+    // ══════════════════════════════════════════════════════════════════
+    deploy_vercel -> fe_layout  [style=dotted color="#30363d"];
+    deploy_render -> main_py    [style=dotted color="#30363d"];
+    deploy_render -> worker_main [style=dotted color="#30363d"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDGES — Health Check
+    // ══════════════════════════════════════════════════════════════════
+    main_py -> database_py  [label="/api/health\nping" style=dashed color="#3fb950"];
+    main_py -> redis_ratelimit [label="/api/health\nredis ping" style=dashed color="#3fb950"];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  LEGEND
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_legend {
+        label=<<B><FONT COLOR="#e6edf3">Legend</FONT></B>>;
+        style="dashed,rounded";
+        color="#30363d";
+        bgcolor="#0d1117";
+        rankdir=LR;
+
+        leg_blue   [label="Blue border = Frontend" shape=rect fillcolor="#161b22" color="#1f6feb" fontcolor="#1f6feb"];
+        leg_red    [label="Red border = API / Worker" shape=rect fillcolor="#161b22" color="#da3633" fontcolor="#da3633"];
+        leg_purple [label="Purple = Postgres" shape=rect fillcolor="#161b22" color="#8957e5" fontcolor="#8957e5"];
+        leg_redq   [label="Red fill = Redis / Queues" shape=rect fillcolor="#3b1a1a" color="#f85149" fontcolor="#f85149"];
+        leg_gold   [label="Gold = Encryption / Security" shape=rect fillcolor="#2d1a00" color="#d29922" fontcolor="#d29922"];
+        leg_green  [label="Green = WhatsApp API" shape=rect fillcolor="#1a4d2e" color="#3fb950" fontcolor="#3fb950"];
+        leg_ai     [label="Blue fill = AI (OpenAI)" shape=rect fillcolor="#1a2744" color="#58a6ff" fontcolor="#58a6ff"];
+
+        leg_blue -> leg_red -> leg_purple -> leg_redq -> leg_gold -> leg_green -> leg_ai [style=invis];
+    }
+}

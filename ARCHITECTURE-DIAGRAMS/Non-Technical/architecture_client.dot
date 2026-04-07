@@ -1,0 +1,86 @@
+digraph ClientArchitecture {
+    // ── Global Settings ──────────────────────────────────────────────
+    rankdir=LR;
+    fontname="Inter, Helvetica, Arial, sans-serif";
+    fontsize=12;
+    compound=true;
+    nodesep=0.8;
+    ranksep=1.2;
+    splines=line; // Changed to line or spline
+    bgcolor="#0d1117";
+    pad=0.8;
+    label=<<B><FONT POINT-SIZE="26" COLOR="#e6edf3">PingPilot — High-Level Architecture</FONT></B><BR/><FONT POINT-SIZE="14" COLOR="#7d8590">WhatsApp Business Automation Platform (Client Overview)</FONT>>;
+    labelloc=t;
+    labeljust=c;
+
+    // ── Default Styles ───────────────────────────────────────────────
+    node [
+        fontname="Inter, Helvetica, Arial, sans-serif",
+        fontsize=12,
+        style="filled,rounded",
+        shape=box,
+        fillcolor="#161b22",
+        color="#30363d",
+        fontcolor="#e6edf3",
+        penwidth=1.5,
+        margin="0.4,0.3"
+    ];
+    edge [
+        fontname="Inter, Helvetica, Arial, sans-serif",
+        fontsize=11,
+        color="#58a6ff",
+        fontcolor="#8b949e",
+        arrowsize=0.9,
+        penwidth=1.5
+    ];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  ACTORS
+    // ══════════════════════════════════════════════════════════════════
+    tenant [label="🧑‍💼\nYou\n(Business Owner)" shape=circle fillcolor="#1f2937" color="#58a6ff" width=1.3];
+    customer [label="📱\nYour Customer\n(WhatsApp User)" shape=circle fillcolor="#1a4d2e" color="#3fb950" width=1.3];
+
+    // ══════════════════════════════════════════════════════════════════
+    //  CORE PLATFORM
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_platform {
+        label=<<B><FONT COLOR="#e6edf3" POINT-SIZE="18">PingPilot Cloud Platform</FONT></B>>;
+        style="dashed,rounded";
+        color="#30363d";
+        bgcolor="#0d1117";
+        margin=30;
+
+        dashboard [label="🖥️ Web Dashboard\n\n• Manage Campaigns\n• Configure Chatbots\n• View Analytics" fillcolor="#0d1117" color="#1f6feb"];
+        
+        core_engine [label="⚙️ Core Engine\n\n• Message Routing\n• Background Scheduling\n• Rate Limiting & Safety" fillcolor="#161b22" color="#da3633"];
+        
+        secure_db [label="🔒 Secure Database\n\n• Encrypted Credentials\n• Customer Contacts\n• Message History" shape=cylinder fillcolor="#1c1437" color="#8957e5"];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EXTERNAL INTEGRATIONS
+    // ══════════════════════════════════════════════════════════════════
+    subgraph cluster_integrations {
+        label=<<B><FONT COLOR="#e6edf3" POINT-SIZE="18">Official Integrations</FONT></B>>;
+        style="dashed,rounded";
+        color="#30363d";
+        bgcolor="#0d1117";
+        margin=30;
+
+        whatsapp_api [label="💬 Meta Cloud API\n\nOfficial WhatsApp Network" fillcolor="#1a4d2e" color="#3fb950" shape=component];
+        openai_api [label="🧠 OpenAI / ChatGPT\n\nIntelligent Auto-Replies" fillcolor="#1a2744" color="#58a6ff" shape=component];
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  FLOW / INTERACTIONS
+    // ══════════════════════════════════════════════════════════════════
+    
+    tenant -> dashboard [label=" 1. Log in & Configure"];
+    dashboard -> core_engine [label=" 2. Send Instructions\n& Create Campaigns"];
+    
+    core_engine -> secure_db [label=" 3. Store/Retrieve Secure Data" dir=both];
+    core_engine -> openai_api [label=" 4. Request Smart AI Replies" dir=both color="#58a6ff"];
+    core_engine -> whatsapp_api [label=" 5. Send/Receive WhatsApp Msgs" dir=both color="#3fb950"];
+    
+    whatsapp_api -> customer [label=" 6. Chat with Customers" dir=both color="#3fb950"];
+}
