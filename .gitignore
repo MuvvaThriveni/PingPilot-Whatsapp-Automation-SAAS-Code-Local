@@ -3,5 +3,5 @@ frontend/node_modules/
 .next/
 .env
 frontend/.env.local
-
+.venv/
 backend/firebase-service-account.json
