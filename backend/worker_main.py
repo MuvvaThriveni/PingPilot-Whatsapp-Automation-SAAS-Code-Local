@@ -352,19 +352,27 @@ async def process_message_job(job: Job, token: str):
             return "skipped"
 
         # ── Atomic quota consume before sending ─────────────────────
-        tenant = await _db_tenants.get(tenant_id)
-        bulk_quota_limit = int((tenant or {}).get("bulk_quota_limit", 100))
-        consumed = await try_consume_quota(tenant_id, bulk_quota_limit)
-        if not consumed:
-            log_event("quota_exceeded_worker", tenant_id=tenant_id, campaign_id=campaign_id,
-                      phone=phone, detail="atomic quota consume failed")
-            await _db_recipients.mark_failed(
-                tenant_id, campaign_id, phone,
-                "Monthly bulk message quota exhausted",
-            )
-            await _db_counters.increment(tenant_id, campaign_id, "failed")
-            await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
-            return "quota_exceeded"
+        # Only consume quota on the FIRST attempt for this recipient.
+        # Retries (attempt_count > 0) already had quota consumed on their
+        # initial attempt — counting them again would inflate usage.
+        current_attempts = int(r.get("attempt_count") or 0)
+        if current_attempts == 0:
+            tenant = await _db_tenants.get(tenant_id)
+            bulk_quota_limit = int((tenant or {}).get("bulk_quota_limit", 100))
+            consumed = await try_consume_quota(tenant_id, bulk_quota_limit)
+            if not consumed:
+                log_event("quota_exceeded_worker", tenant_id=tenant_id, campaign_id=campaign_id,
+                          phone=phone, detail="atomic quota consume failed")
+                await _db_recipients.mark_failed(
+                    tenant_id, campaign_id, phone,
+                    "Monthly bulk message quota exhausted",
+                )
+                await _db_counters.increment(tenant_id, campaign_id, "failed")
+                await _maybe_finalize_campaign(tenant_id, campaign_id, max_attempts=max_attempts)
+                return "quota_exceeded"
+        else:
+            log_event("quota_skip_retry", tenant_id=tenant_id, campaign_id=campaign_id,
+                      phone=phone, detail=f"attempt={current_attempts}, quota already consumed")
 
         ok = await _db_recipients.transition_to_processing(tenant_id, campaign_id, phone)
         if not ok:
