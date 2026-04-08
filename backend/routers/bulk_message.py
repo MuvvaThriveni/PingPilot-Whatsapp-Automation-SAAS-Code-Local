@@ -11,6 +11,8 @@ Security fixes:
 """
 
 import io
+import json
+import os
 import re
 import logging
 import time
@@ -39,6 +41,8 @@ router = APIRouter(prefix="/api/bulk-message", tags=["bulk-message"])
 
 # ── Constants ────────────────────────────────────────────────────────
 MAX_UPLOAD_SIZE_BYTES = 16 * 1024 * 1024  # 16MB
+MAX_VALID_CONTACTS = int(os.environ.get("MAX_VALID_CONTACTS", "500"))  # Configurable via env
+PARSED_CONTACTS_TTL = 600  # 10 minutes TTL for cached parsed contacts
 
 # Process-local lock for scheduler
 _scheduler_running: bool = False
@@ -71,14 +75,24 @@ def _find_column(df_columns, keywords):
     return None
 
 
-def _parse_contacts(df):
-    """Extract and normalize contacts from a DataFrame."""
+def _parse_contacts(df, *, max_contacts: int | None = None):
+    """Extract and normalize contacts from a DataFrame.
+
+    Args:
+        df: Source DataFrame.
+        max_contacts: If set, stop parsing once this many valid contacts
+                      have been collected *plus one* (to detect overflow).
+                      Callers can then check ``len(result) > max_contacts``.
+    """
     phone_col = _find_column(df.columns, ["phone", "mobile", "number"])
     if not phone_col:
         phone_col = df.columns[0]
 
     name_col = _find_column(df.columns, ["name"])
     image_col = _find_column(df.columns, ["image", "url"])
+
+    # Early-stop threshold: collect one extra so the caller can detect overflow
+    stop_at = (max_contacts + 1) if max_contacts is not None else None
 
     _logger = logging.getLogger("bulk_message")
     contacts = []
@@ -99,6 +113,9 @@ def _parse_contacts(df):
                 "name": str(row[name_col]).strip() if name_col and pd.notna(row.get(name_col)) else "",
                 "imageUrl": str(row[image_col]).strip() if image_col and pd.notna(row.get(image_col)) else "",
             })
+            # Early exit: we already know the file exceeds the limit
+            if stop_at is not None and len(contacts) >= stop_at:
+                break
     return contacts
 
 
@@ -218,8 +235,44 @@ async def parse_contacts_file(file: UploadFile = File(...)):
         return JSONResponse(status_code=413, content={"error": str(e)})
     try:
         df = _read_spreadsheet(content, file.filename or "")
-        contacts = _parse_contacts(df)
-        return {"contacts": contacts, "total": len(contacts), "validContacts": len(contacts)}
+        contacts = _parse_contacts(df, max_contacts=MAX_VALID_CONTACTS)
+        if len(contacts) > MAX_VALID_CONTACTS:
+            log_event(
+                "campaign_contact_limit_exceeded",
+                detail=f"valid_contacts={len(contacts)} max_allowed={MAX_VALID_CONTACTS}",
+                level="WARNING",
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"File contains {len(contacts)} valid contacts, which exceeds the maximum of {MAX_VALID_CONTACTS} per campaign. Please reduce the number of contacts and try again.",
+                    "valid_contacts": len(contacts),
+                    "max_allowed": MAX_VALID_CONTACTS,
+                },
+            )
+
+        # Cache parsed contacts in Redis for /start to reuse (skip redundant parsing)
+        upload_id = str(uuid.uuid4())
+        try:
+            from rate_limit import get_redis
+            r = await get_redis()
+            cache_key = f"parsed_contacts:{upload_id}"
+            # Store only essential fields to minimise memory footprint
+            cache_payload = json.dumps({
+                "contacts": contacts,
+                "count": len(contacts),
+            })
+            await r.set(cache_key, cache_payload, ex=PARSED_CONTACTS_TTL)
+            log_event("parse_cache_stored", detail=f"upload_id={upload_id} contacts={len(contacts)}")
+        except Exception as cache_err:
+            # Cache is optional — log and continue without blocking the response
+            log_event("parse_cache_error", detail=str(cache_err)[:120], level="WARNING")
+            upload_id = None  # Signal to frontend that caching was unavailable
+
+        result = {"contacts": contacts, "total": len(contacts), "validContacts": len(contacts)}
+        if upload_id:
+            result["upload_id"] = upload_id
+        return result
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": f"Failed to parse file: {str(e)}"})
 
@@ -233,25 +286,67 @@ async def start_bulk_campaign(
     delayMs: int = Form(1000),
     headerImageUrl: str = Form(""),
     scheduledAt: str = Form(None),
+    upload_id: str = Form(None),
 ):
     tenant_id = request.state.tenant_id
     settings = await get_settings(tenant_id)
     if not settings["is_configured"]:
         return JSONResponse(status_code=400, content={"error": "WhatsApp not configured. Please configure in Settings."})
 
-    try:
-        content = await _read_upload_safe(file)
-    except ValueError as e:
-        return JSONResponse(status_code=413, content={"error": str(e)})
+    # ── Try cached contacts from /parse (skip redundant parsing) ──
+    contacts = None
+    if upload_id:
+        try:
+            from rate_limit import get_redis
+            r = await get_redis()
+            cache_key = f"parsed_contacts:{upload_id}"
+            cached = await r.get(cache_key)
+            if cached:
+                data = json.loads(cached)
+                contacts = data.get("contacts")
+                # Invalidate cache after use (single-use token)
+                await r.delete(cache_key)
+                log_event("parse_cache_hit", tenant_id=tenant_id,
+                          detail=f"upload_id={upload_id} contacts={len(contacts) if contacts else 0}")
+            else:
+                log_event("parse_cache_miss", tenant_id=tenant_id,
+                          detail=f"upload_id={upload_id} (expired or missing)", level="WARNING")
+        except Exception as cache_err:
+            log_event("parse_cache_error", tenant_id=tenant_id,
+                      detail=str(cache_err)[:120], level="WARNING")
+            contacts = None  # Fallback to file parsing
 
-    try:
-        df = _read_spreadsheet(content, file.filename or "")
-        contacts = _parse_contacts(df)
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": f"Failed to parse file: {str(e)}"})
+    # ── Fallback: parse the uploaded file (mandatory if cache miss) ──
+    if contacts is None:
+        try:
+            content = await _read_upload_safe(file)
+        except ValueError as e:
+            return JSONResponse(status_code=413, content={"error": str(e)})
+
+        try:
+            df = _read_spreadsheet(content, file.filename or "")
+            contacts = _parse_contacts(df, max_contacts=MAX_VALID_CONTACTS)
+        except Exception as e:
+            return JSONResponse(status_code=400, content={"error": f"Failed to parse file: {str(e)}"})
 
     if not contacts:
         return JSONResponse(status_code=400, content={"error": "No valid contacts found"})
+
+    if len(contacts) > MAX_VALID_CONTACTS:
+        log_event(
+            "campaign_contact_limit_rejected",
+            tenant_id=tenant_id,
+            detail=f"valid_contacts={len(contacts)} max_allowed={MAX_VALID_CONTACTS}",
+            level="WARNING",
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"File contains {len(contacts)} valid contacts, which exceeds the maximum of {MAX_VALID_CONTACTS} per campaign.",
+                "valid_contacts": len(contacts),
+                "max_allowed": MAX_VALID_CONTACTS,
+            },
+        )
 
     # ── Quota enforcement ─────────────────────────────────────────────
     tenant = await _db_tenants.get(tenant_id)
@@ -351,6 +446,14 @@ async def periodical_scheduler():
         _scheduler_running = False
 
 
+# ── Configuration endpoint (frontend sync) ───────────────────────
+
+@router.get("/limits")
+async def get_bulk_limits():
+    """Return backend-configured limits so the frontend stays in sync."""
+    return {"max_valid_contacts": MAX_VALID_CONTACTS}
+
+
 # ── Campaign management endpoints (with tenant ownership checks) ──
 
 @router.post("/stop/{campaign_id}")
@@ -380,15 +483,17 @@ async def get_campaign_status(request: Request, campaign_id: str):
     if error:
         return error
 
-    counters = await _db_counters.get(tenant_id, campaign_id)
+    counts = await _db_recipients.count_by_status(tenant_id, campaign_id)
     return {
         "campaign": {
             "campaign_id": campaign_id,
             "name": campaign.get("name", ""),
             "template_name": campaign.get("template_name", ""),
             "total_contacts": campaign.get("total_contacts", 0),
-            "sent_count": counters.get("sent", 0),
-            "failed_count": counters.get("failed", 0),
+            "sent_count": counts["sent"],
+            "failed_count": counts["failed"],
+            "pending_count": counts["pending"],
+            "quota_exceeded_count": counts["quota_exceeded"],
             "status": campaign.get("status", ""),
             "created_at": campaign.get("created_at", ""),
             "scheduled_at": campaign.get("scheduled_at"),
@@ -422,14 +527,16 @@ async def get_all_campaigns(request: Request, limit: int = 25, cursor: str = Non
     result = []
     for c in campaigns_list:
         cid = str(c.get("campaign_id", ""))
-        counters = await _db_counters.get(tenant_id, cid)
+        counts = await _db_recipients.count_by_status(tenant_id, cid)
         result.append({
             "campaign_id": cid,
             "name": c.get("name", ""),
             "template_name": c.get("template_name", ""),
             "total_contacts": c.get("total_contacts", 0),
-            "sent_count": counters.get("sent", 0),
-            "failed_count": counters.get("failed", 0),
+            "sent_count": counts["sent"],
+            "failed_count": counts["failed"],
+            "pending_count": counts["pending"],
+            "quota_exceeded_count": counts["quota_exceeded"],
             "status": c.get("status", ""),
             "created_at": c.get("created_at", ""),
             "scheduled_at": c.get("scheduled_at"),
@@ -450,7 +557,7 @@ async def get_campaign_details(request: Request, campaign_id: str):
     if error:
         return error
 
-    counters = await _db_counters.get(tenant_id, campaign_id)
+    counts = await _db_recipients.count_by_status(tenant_id, campaign_id)
     recipients = await _db_recipients.list_by_campaign(tenant_id, campaign_id, limit=5000)
 
     recipient_list = []
@@ -471,8 +578,10 @@ async def get_campaign_details(request: Request, campaign_id: str):
             "template_name": campaign.get("template_name", ""),
             "header_image_url": campaign.get("header_image_url", ""),
             "total_contacts": campaign.get("total_contacts", 0),
-            "sent_count": counters.get("sent", 0),
-            "failed_count": counters.get("failed", 0),
+            "sent_count": counts["sent"],
+            "failed_count": counts["failed"],
+            "pending_count": counts["pending"],
+            "quota_exceeded_count": counts["quota_exceeded"],
             "status": campaign.get("status", ""),
             "delay_ms": campaign.get("delay_ms", 1000),
             "created_at": str(campaign.get("created_at", "")),

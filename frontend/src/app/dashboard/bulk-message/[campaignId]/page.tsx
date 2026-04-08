@@ -41,6 +41,8 @@ interface CampaignDetail {
   total_contacts: number
   sent_count: number
   failed_count: number
+  pending_count: number
+  quota_exceeded_count: number
   status: string
   delay_ms: number
   created_at: string
@@ -315,7 +317,9 @@ export default function CampaignDetailPage() {
           <div>
             <h1 className="text-2xl font-bold text-gray-900">{campaign.name}</h1>
             <p className="text-sm text-gray-500 mt-0.5">
-              Template: {campaign.template_name} &bull; Created: {new Date(campaign.created_at).toLocaleString()}
+              Template: {campaign.template_name.includes('|')
+                ? `${campaign.template_name.split('|')[0]} (${campaign.template_name.split('|')[1]})`
+                : campaign.template_name} &bull; Created: {new Date(campaign.created_at).toLocaleString()}
             </p>
           </div>
         </div>

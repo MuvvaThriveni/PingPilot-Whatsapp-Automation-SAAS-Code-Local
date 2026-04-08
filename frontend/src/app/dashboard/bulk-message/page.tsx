@@ -47,10 +47,14 @@ interface Campaign {
   total_contacts: number
   sent_count: number
   failed_count: number
+  pending_count: number
+  quota_exceeded_count: number
   status: string
   created_at: string
   scheduled_at?: string
 }
+
+const DEFAULT_MAX_VALID_CONTACTS = 500
 
 export default function BulkMessagePage() {
   const { toast } = useToast()
@@ -71,6 +75,8 @@ export default function BulkMessagePage() {
   const [templates, setTemplates] = useState<Template[]>([])
   const [loadingTemplates, setLoadingTemplates] = useState(false)
   const [quota, setQuota] = useState<QuotaInfo | null>(null)
+  const [maxValidContacts, setMaxValidContacts] = useState(DEFAULT_MAX_VALID_CONTACTS)
+  const [uploadId, setUploadId] = useState<string | null>(null)
   const selectedTemplate = templates.find(t => t.display === templateName)
   const templateHasParams = selectedTemplate && selectedTemplate.param_count > 0
 
@@ -83,10 +89,23 @@ export default function BulkMessagePage() {
     }
   }
 
+  const fetchLimits = async () => {
+    try {
+      const res = await bulkMessage.limits()
+      if (res.data?.max_valid_contacts) {
+        setMaxValidContacts(res.data.max_valid_contacts)
+      }
+    } catch (error) {
+      // Fallback: keep DEFAULT_MAX_VALID_CONTACTS (500)
+      console.error('Failed to fetch limits, using default:', error)
+    }
+  }
+
   useEffect(() => {
     fetchCampaigns()
     fetchTemplates()
     fetchQuota()
+    fetchLimits()
     // Periodic fallback to refresh the whole list (e.g., for status changes not caught by active poller)
     const interval = setInterval(() => { fetchCampaigns(); fetchQuota() }, 10000)
     return () => clearInterval(interval)
@@ -151,6 +170,8 @@ export default function BulkMessagePage() {
         const res = await bulkMessage.parse(formData)
         setContacts(res.data.contacts)
         setTotalContacts(res.data.validContacts)
+        // Store upload_id for cache-based /start (skip redundant parsing)
+        setUploadId(res.data.upload_id || null)
         toast({ title: 'File parsed', description: `Found ${res.data.validContacts} valid contacts` })
       } catch (error: unknown) {
         toast({
@@ -159,6 +180,7 @@ export default function BulkMessagePage() {
           variant: 'destructive'
         })
         setFile(null)
+        setUploadId(null)
       } finally {
         setParsing(false)
       }
@@ -190,6 +212,11 @@ export default function BulkMessagePage() {
       formData.append('campaignName', campaignName || `Campaign ${new Date().toLocaleDateString()}`)
       formData.append('delayMs', delayMs)
 
+      // Pass upload_id so backend can skip redundant parsing
+      if (uploadId) {
+        formData.append('upload_id', uploadId)
+      }
+
       if (isScheduled && scheduledAt) {
         // Convert to ISO string for backend
         formData.append('scheduledAt', new Date(scheduledAt).toISOString())
@@ -204,6 +231,7 @@ export default function BulkMessagePage() {
       setFile(null)
       setContacts([])
       setTotalContacts(0)
+      setUploadId(null)
       setTemplateName('')
       setCampaignName('')
       setIsScheduled(false)
@@ -335,20 +363,30 @@ export default function BulkMessagePage() {
                   </p>
                 </div>
               ) : (
-                <div className="flex items-center justify-between p-3 border rounded-lg bg-gray-50">
-                  <div className="flex items-center space-x-3">
-                    <FileSpreadsheet className="h-6 w-6 text-green-600" />
-                    <div>
-                      <p className="font-medium text-sm">{file.name}</p>
-                      <p className="text-xs text-gray-500">
-                        {parsing ? 'Parsing...' : `${totalContacts} valid contacts`}
+                <>
+                  <div className="flex items-center justify-between p-3 border rounded-lg bg-gray-50">
+                    <div className="flex items-center space-x-3">
+                      <FileSpreadsheet className="h-6 w-6 text-green-600" />
+                      <div>
+                        <p className="font-medium text-sm">{file.name}</p>
+                        <p className="text-xs text-gray-500">
+                          {parsing ? 'Parsing...' : `${totalContacts} valid contacts`}
+                        </p>
+                      </div>
+                    </div>
+                    <Button variant="ghost" size="icon" onClick={() => { setFile(null); setContacts([]); setTotalContacts(0); setUploadId(null); }}>
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  {totalContacts > maxValidContacts && (
+                    <div className="flex items-start gap-2 p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-800">
+                      <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+                      <p>
+                        File contains {totalContacts} valid contacts, exceeding the limit of {maxValidContacts} per campaign. Please upload a smaller file.
                       </p>
                     </div>
-                  </div>
-                  <Button variant="ghost" size="icon" onClick={() => { setFile(null); setContacts([]); setTotalContacts(0); }}>
-                    <X className="h-4 w-4" />
-                  </Button>
-                </div>
+                  )}
+                </>
               )}
             </div>
 
@@ -472,7 +510,7 @@ export default function BulkMessagePage() {
             <Button
               className="w-full"
               onClick={handleStartCampaign}
-              disabled={loading || !file || !templateName || (quota !== null && quota.remaining <= 0) || (quota !== null && totalContacts > quota.remaining)}
+              disabled={loading || !file || !templateName || totalContacts > maxValidContacts || (quota !== null && quota.remaining <= 0) || (quota !== null && totalContacts > quota.remaining)}
             >
               {loading ? (
                 <>
@@ -494,7 +532,7 @@ export default function BulkMessagePage() {
           <CardHeader>
             <CardTitle>Contact Preview</CardTitle>
             <CardDescription>
-              {contacts.length > 0 ? `Showing first ${Math.min(contacts.length, 10)} of ${totalContacts} contacts` : 'Upload a file to preview contacts'}
+              {contacts.length > 0 ? `Showing first ${Math.min(contacts.length, 10)} of ${totalContacts} contacts (max ${maxValidContacts})` : 'Upload a file to preview contacts'}
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -569,7 +607,9 @@ export default function BulkMessagePage() {
                             Scheduled: {new Date(campaign.scheduled_at).toLocaleString()}
                           </span>
                         ) : (
-                          <>Template: {campaign.template_name} • {new Date(campaign.created_at).toLocaleDateString()}</>
+                          <>Template: {campaign.template_name.includes('|')
+                            ? `${campaign.template_name.split('|')[0]} (${campaign.template_name.split('|')[1]})`
+                            : campaign.template_name} • {new Date(campaign.created_at).toLocaleDateString()}</>
                         )}
                       </p>
                     </div>
@@ -577,10 +617,12 @@ export default function BulkMessagePage() {
                   <div className="flex items-center space-x-4">
                     <div className="text-right text-sm">
                       <p className="text-green-600">{campaign.sent_count} sent</p>
-                      <p className="text-red-600">{campaign.failed_count} failed</p>
+                      {campaign.failed_count > 0 && <p className="text-red-600">{campaign.failed_count} failed</p>}
+                      {campaign.quota_exceeded_count > 0 && <p className="text-orange-500">{campaign.quota_exceeded_count} quota</p>}
+                      {campaign.pending_count > 0 && campaign.status === 'running' && <p className="text-blue-500">{campaign.pending_count} pending</p>}
                     </div>
                     <div className="text-right text-sm text-gray-500">
-                      {campaign.sent_count + campaign.failed_count} / {campaign.total_contacts}
+                      {campaign.sent_count + campaign.failed_count + campaign.quota_exceeded_count + campaign.pending_count} / {campaign.total_contacts}
                     </div>
                     {campaign.status === 'running' && (
                       <Button
