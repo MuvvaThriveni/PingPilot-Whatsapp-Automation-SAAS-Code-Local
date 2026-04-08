@@ -521,6 +521,47 @@ class _CampaignRecipients:
             return []
 
     @staticmethod
+    async def count_by_status(tenant_id: str, campaign_id: str, conn=None) -> dict:
+        """Return authoritative recipient counts grouped by display category.
+
+        Groups:
+          - sent: submitted, sent, delivered, read  (all success states)
+          - failed: failed  (terminal failures)
+          - pending: pending, queued, processing  (in-progress / waiting)
+          - quota_exceeded: quota_exceeded
+
+        These counts are derived directly from the recipient table and
+        never drift, unlike the incremental sent_count/failed_count on
+        the campaigns row.
+        """
+        try:
+            q = """
+                SELECT
+                    COUNT(*) FILTER (WHERE status IN ('submitted', 'sent', 'delivered', 'read')) AS sent,
+                    COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                    COUNT(*) FILTER (WHERE status IN ('pending', 'queued', 'processing')) AS pending,
+                    COUNT(*) FILTER (WHERE status = 'quota_exceeded') AS quota_exceeded
+                FROM campaign_recipients
+                WHERE tenant_id = %s AND campaign_id = %s::uuid
+                """
+            args = (tenant_id, campaign_id)
+            if conn is not None:
+                row = await fetchrow_conn(conn, q, *args)
+            else:
+                row = await fetchrow(q, *args)
+            if not row:
+                return {"sent": 0, "failed": 0, "pending": 0, "quota_exceeded": 0}
+            return {
+                "sent": int(row.get("sent") or 0),
+                "failed": int(row.get("failed") or 0),
+                "pending": int(row.get("pending") or 0),
+                "quota_exceeded": int(row.get("quota_exceeded") or 0),
+            }
+        except Exception as e:
+            log_event("db_error", detail=f"campaign_recipients.count_by_status failed: {e}", level="ERROR")
+            return {"sent": 0, "failed": 0, "pending": 0, "quota_exceeded": 0}
+
+    @staticmethod
     async def count_done(tenant_id: str, campaign_id: str, max_attempts: int = 5, conn=None) -> int:
         try:
             q = """

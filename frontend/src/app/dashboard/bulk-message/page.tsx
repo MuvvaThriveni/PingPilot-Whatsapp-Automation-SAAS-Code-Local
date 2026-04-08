@@ -47,6 +47,8 @@ interface Campaign {
   total_contacts: number
   sent_count: number
   failed_count: number
+  pending_count: number
+  quota_exceeded_count: number
   status: string
   created_at: string
   scheduled_at?: string
@@ -569,7 +571,9 @@ export default function BulkMessagePage() {
                             Scheduled: {new Date(campaign.scheduled_at).toLocaleString()}
                           </span>
                         ) : (
-                          <>Template: {campaign.template_name} • {new Date(campaign.created_at).toLocaleDateString()}</>
+                          <>Template: {campaign.template_name.includes('|')
+                            ? `${campaign.template_name.split('|')[0]} (${campaign.template_name.split('|')[1]})`
+                            : campaign.template_name} • {new Date(campaign.created_at).toLocaleDateString()}</>
                         )}
                       </p>
                     </div>
@@ -577,10 +581,12 @@ export default function BulkMessagePage() {
                   <div className="flex items-center space-x-4">
                     <div className="text-right text-sm">
                       <p className="text-green-600">{campaign.sent_count} sent</p>
-                      <p className="text-red-600">{campaign.failed_count} failed</p>
+                      {campaign.failed_count > 0 && <p className="text-red-600">{campaign.failed_count} failed</p>}
+                      {campaign.quota_exceeded_count > 0 && <p className="text-orange-500">{campaign.quota_exceeded_count} quota</p>}
+                      {campaign.pending_count > 0 && campaign.status === 'running' && <p className="text-blue-500">{campaign.pending_count} pending</p>}
                     </div>
                     <div className="text-right text-sm text-gray-500">
-                      {campaign.sent_count + campaign.failed_count} / {campaign.total_contacts}
+                      {campaign.sent_count + campaign.failed_count + campaign.quota_exceeded_count + campaign.pending_count} / {campaign.total_contacts}
                     </div>
                     {campaign.status === 'running' && (
                       <Button

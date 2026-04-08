@@ -380,15 +380,17 @@ async def get_campaign_status(request: Request, campaign_id: str):
     if error:
         return error
 
-    counters = await _db_counters.get(tenant_id, campaign_id)
+    counts = await _db_recipients.count_by_status(tenant_id, campaign_id)
     return {
         "campaign": {
             "campaign_id": campaign_id,
             "name": campaign.get("name", ""),
             "template_name": campaign.get("template_name", ""),
             "total_contacts": campaign.get("total_contacts", 0),
-            "sent_count": counters.get("sent", 0),
-            "failed_count": counters.get("failed", 0),
+            "sent_count": counts["sent"],
+            "failed_count": counts["failed"],
+            "pending_count": counts["pending"],
+            "quota_exceeded_count": counts["quota_exceeded"],
             "status": campaign.get("status", ""),
             "created_at": campaign.get("created_at", ""),
             "scheduled_at": campaign.get("scheduled_at"),
@@ -422,14 +424,16 @@ async def get_all_campaigns(request: Request, limit: int = 25, cursor: str = Non
     result = []
     for c in campaigns_list:
         cid = str(c.get("campaign_id", ""))
-        counters = await _db_counters.get(tenant_id, cid)
+        counts = await _db_recipients.count_by_status(tenant_id, cid)
         result.append({
             "campaign_id": cid,
             "name": c.get("name", ""),
             "template_name": c.get("template_name", ""),
             "total_contacts": c.get("total_contacts", 0),
-            "sent_count": counters.get("sent", 0),
-            "failed_count": counters.get("failed", 0),
+            "sent_count": counts["sent"],
+            "failed_count": counts["failed"],
+            "pending_count": counts["pending"],
+            "quota_exceeded_count": counts["quota_exceeded"],
             "status": c.get("status", ""),
             "created_at": c.get("created_at", ""),
             "scheduled_at": c.get("scheduled_at"),
@@ -450,7 +454,7 @@ async def get_campaign_details(request: Request, campaign_id: str):
     if error:
         return error
 
-    counters = await _db_counters.get(tenant_id, campaign_id)
+    counts = await _db_recipients.count_by_status(tenant_id, campaign_id)
     recipients = await _db_recipients.list_by_campaign(tenant_id, campaign_id, limit=5000)
 
     recipient_list = []
@@ -471,8 +475,10 @@ async def get_campaign_details(request: Request, campaign_id: str):
             "template_name": campaign.get("template_name", ""),
             "header_image_url": campaign.get("header_image_url", ""),
             "total_contacts": campaign.get("total_contacts", 0),
-            "sent_count": counters.get("sent", 0),
-            "failed_count": counters.get("failed", 0),
+            "sent_count": counts["sent"],
+            "failed_count": counts["failed"],
+            "pending_count": counts["pending"],
+            "quota_exceeded_count": counts["quota_exceeded"],
             "status": campaign.get("status", ""),
             "delay_ms": campaign.get("delay_ms", 1000),
             "created_at": str(campaign.get("created_at", "")),
