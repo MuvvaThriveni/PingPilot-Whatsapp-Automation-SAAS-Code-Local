@@ -1,5 +1,6 @@
 import os
 import asyncio
+import time as _time
 import logging
 import uuid
 import datetime
@@ -43,6 +44,12 @@ logger = logging.getLogger("worker")
 
 
 DELIVERY_CONFIRM_TIMEOUT_SECONDS = int(os.environ.get("DELIVERY_CONFIRM_TIMEOUT_SECONDS", "900"))
+
+# ── In-worker rate throttling (replaces BullMQ limiter) ─────────────
+# Instead of using BullMQ's Redis-heavy limiter scripts, we throttle
+# between jobs with a simple asyncio.sleep.  This is safe because the
+# worker processes jobs sequentially (concurrency=1).
+_RATE_DELAY_SECONDS = float(os.environ.get("WORKER_RATE_DELAY", "0.2"))  # 200ms default = ~5 msg/sec
 
 
 def _is_uuid(s: str) -> bool:
@@ -207,6 +214,12 @@ async def process_campaign_job(job: Job, token: str):
 
 async def process_message_job(job: Job, token: str):
     """Worker logic for message_queue: sends to WhatsApp API."""
+    # ── In-worker throttle (replaces BullMQ limiter) ────────────────
+    # Avoids Redis-heavy limiter Lua scripts; simple sleep is sufficient
+    # for sequential (concurrency=1) processing.
+    if _RATE_DELAY_SECONDS > 0:
+        await asyncio.sleep(_RATE_DELAY_SECONDS)
+
     data = job.data
     campaign_id = data.get("campaign_id")
     tenant_id = data.get("tenant_id")
@@ -768,39 +781,45 @@ async def main():
 
     await init_db_pool()
     
-    # Limiter setup: max 80 requests per second (1000ms)
-    rate_limit = int(os.environ.get("QUEUE_RATE_LIMIT", "80"))
-    
-    # Worker settings to reduce Redis polling (Fix #2: Redis command optimization)
-    # - stalledInterval: 5 minutes (default: 30s) — check for stalled jobs less frequently
-    # - lockDuration: 5 minutes (default: 30s) — matches stalledInterval, prevents premature stall detection
-    # - drainDelay: 5 seconds — wait before polling again when queue is empty
-    # - maxStalledCount: 1 — minimize stalled job check iterations
-    # Lock duration safety: worst-case job execution with 5 retries = ~125s, well within 300s lock
-    worker_settings = {
-        "stalledInterval": 300000,      # 5 minutes (300,000ms)
-        "maxStalledCount": 1,            # Minimize stalled checks
-        "lockDuration": 300000,          # 5 minutes (300,000ms) — matches stalledInterval
-        "drainDelay": 5,                 # Wait 5s before next poll when idle
-    }
-    
-    worker_options = {
-        "limiter": {
-            "max": rate_limit, 
-            "duration": 1000 
-        },
+    # ── Worker options ───────────────────────────────────────────────
+    # CRITICAL: drainDelay, stalledInterval, lockDuration, maxStalledCount
+    # MUST be top-level keys in the opts dict.  Nesting them inside a
+    # "settings" sub-dict is silently ignored by bullmq-python.
+    #
+    # drainDelay:       Max 10s (capped by BullMQ's maximum_block_timeout).
+    #                   The worker uses BZPOPMIN with this timeout when idle.
+    # stalledInterval:  5 min — checks for stalled jobs much less often
+    #                   (default 30s → ~17 Redis calls/min; 300s → ~0.2/min).
+    # lockDuration:     5 min — matches stalledInterval, prevents premature
+    #                   stall detection.  Worst-case job = ~125s, well within.
+    # maxStalledCount:  1 — minimal stalled-check iterations.
+    #
+    # BullMQ limiter is intentionally REMOVED.  It injects Redis Lua scripts
+    # into every moveToActive call (~6 extra Redis commands per job).
+    # Rate control is now handled by a simple asyncio.sleep() inside the
+    # message processor (see _RATE_DELAY_SECONDS above).
+
+    campaign_worker_opts = {
         "connection": redis_opts,
-        "settings": worker_settings,
+        "drainDelay": 10,            # 10s idle poll (max allowed by BullMQ)
+        "stalledInterval": 300000,   # 5 minutes
+        "lockDuration": 300000,      # 5 minutes
+        "maxStalledCount": 1,
+    }
+
+    message_worker_opts = {
+        "connection": redis_opts,
+        "drainDelay": 10,            # 10s idle poll (max allowed by BullMQ)
+        "stalledInterval": 300000,   # 5 minutes
+        "lockDuration": 300000,      # 5 minutes
+        "maxStalledCount": 1,
     }
 
     # Worker for Campaign splits
-    campaign_worker = Worker("campaign_queue", process_campaign_job, {
-        "connection": redis_opts,
-        "settings": worker_settings,
-    })
+    campaign_worker = Worker("campaign_queue", process_campaign_job, campaign_worker_opts)
     
-    # Worker for concurrent messages
-    message_worker = Worker("message_queue", process_message_job, worker_options)
+    # Worker for concurrent messages (rate limiting via asyncio.sleep, NOT BullMQ limiter)
+    message_worker = Worker("message_queue", process_message_job, message_worker_opts)
     
     # The current python bullmq API might attach event listeners slightly differently, but natively you can use the built-in events.
     def _on_failed(job: Job, error: Exception):
