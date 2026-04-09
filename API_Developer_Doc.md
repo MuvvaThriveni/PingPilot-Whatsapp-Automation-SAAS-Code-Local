@@ -1,10 +1,10 @@
 # WappFlow — Developer API Documentation
 
-> **Version:** 2.3.0 (Phase 12 — Phone Normalization, Image Compression & Template Hardening)  
+> **Version:** 3.0.0 (Phase 16 — Contact Limits, Redis Optimization, Counter Accuracy & Quota Fix)  
 > **Base URL:** `http://localhost:5000/api` (dev) or `https://<your-deployment>/api` (prod)  
 > **Auth:** Firebase ID Token — `Authorization: Bearer <firebase_id_token>`  
 > **Database:** Neon Postgres (serverless) — see [Architecture_Overview.md](Architecture_Overview.md) for full schema  
-> **Last Updated:** 2026-04-06
+> **Last Updated:** 2026-04-09
 
 ---
 
@@ -29,6 +29,8 @@
 17. [Glossary](#17-glossary)
 18. [Further Reading](#18-further-reading)
 19. [Utility Modules Reference](#19-utility-modules-reference)
+20. [Contact Limit Enforcement](#20-contact-limit-enforcement)
+21. [Redis Command Optimization](#21-redis-command-optimization)
 
 ---
 
@@ -298,11 +300,23 @@ Numbers that fail E.164 length validation (< 10 or > 15 digits after normalizati
     { "index": 0, "phone": "919876543210", "name": "John", "imageUrl": "" }
   ],
   "total": 150,
-  "validContacts": 148
+  "validContacts": 148,
+  "upload_id": "a1b2c3d4-e5f6-..."
 }
 ```
 
-> `total` counts all rows in the file; `validContacts` counts rows that passed phone normalization.
+> `total` counts all rows in the file; `validContacts` counts rows that passed phone normalization. `upload_id` is a one-time token for the `/start` endpoint to reuse parsed contacts without re-parsing (cached in Redis for 10 minutes). If Redis is unavailable, `upload_id` is omitted.
+
+**Error `400` — Contact Limit Exceeded:**
+```json
+{
+  "error": "File contains 600 valid contacts, which exceeds the maximum of 500 per campaign. Please reduce the number of contacts and try again.",
+  "valid_contacts": 600,
+  "max_allowed": 500
+}
+```
+
+> The limit defaults to **500** and is configurable via the `MAX_VALID_CONTACTS` env var. See [Section 20](#20-contact-limit-enforcement) for details.
 
 **Error `413`:** File exceeds 16 MB limit.
 
@@ -324,6 +338,7 @@ Creates a new bulk messaging campaign and enqueues it for processing. **Enforces
 | `delayMs` | int | No | `1000` | Delay between messages (ms) |
 | `headerImageUrl` | string | No | `""` | Override image URL for header |
 | `scheduledAt` | string (ISO 8601) | No | `null` | Schedule for later; omit for immediate |
+| `upload_id` | string | No | `null` | One-time token from `/parse` response to reuse cached contacts (avoids re-parsing). If missing or expired, the uploaded file is parsed normally |
 
 **Response `200`:**
 ```json
@@ -426,6 +441,8 @@ Paginated list of all campaigns for the tenant.
 
 **Campaign Statuses:** `scheduled`, `queued`, `running`, `completed`, `stopped`, `interrupted`, `deleted`
 
+> **Note:** The `sent_count` and `failed_count` on campaign status/list/details responses are now sourced from **authoritative recipient table counts** (via `campaign_recipients.count_by_status()`) rather than incremental counter shards. This eliminates counter drift and ensures the frontend always shows accurate numbers. Additional fields `pending_count` and `quota_exceeded_count` are also returned.
+
 ---
 
 ### 4.7 Get Campaign Details
@@ -517,6 +534,25 @@ Re-queues all failed recipients in a completed/stopped campaign.
 ```
 
 **Error `400`:** Campaign is still running, or no failed recipients exist.
+
+---
+
+### 4.11 Get Campaign Limits
+
+`GET /api/bulk-message/limits`
+
+Returns backend-configured limits so the frontend can stay in sync without hardcoding values.
+
+**Response `200`:**
+```json
+{
+  "max_valid_contacts": 500
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `max_valid_contacts` | int | Maximum number of valid contacts allowed per bulk campaign. Configurable via `MAX_VALID_CONTACTS` env var (default 500) |
 
 ---
 
@@ -1128,9 +1164,17 @@ Set the output as `ENCRYPTION_KEY` in your `.env` file. **Keep this key safe** �
 | `TENANT_RATE_LIMIT` | `10` | Worker messages per second per tenant |
 | `TENANT_BURST` | `20` | Worker max burst capacity |
 | `WA_COOLDOWN_TTL` | `5` | Global 429 cooldown duration (seconds) |
-| `QUEUE_RATE_LIMIT` | `80` | BullMQ message worker rate limit |
+| `QUEUE_RATE_LIMIT` | `80` | **Deprecated (Phase 14).** BullMQ's built-in limiter has been removed to reduce Redis command overhead. Rate control is now handled by `WORKER_RATE_DELAY`. This variable is retained for backward compatibility but has no effect. |
+| `WORKER_RATE_DELAY` | `0.2` | Seconds to sleep between message jobs in the worker (in-worker throttle). `0.2` = ~5 msg/sec. Set to `0` to disable throttling. Replaces the former BullMQ limiter. See [Section 21](#21-redis-command-optimization). |
+| `USE_TOKEN_BUCKET` | `true` | Feature flag for API rate limiting strategy. `true` = Lua-based token bucket (1 Redis call per request). `false` = sliding window (fallback, ~5 Redis calls per request). |
 | `QUEUE_RETRY_ATTEMPTS` | `3` | Max retry attempts for message jobs |
 | `DELIVERY_CONFIRM_TIMEOUT_SECONDS` | `900` | Requeue if no delivery confirmation |
+
+### Optional — Bulk Campaign Limits
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_VALID_CONTACTS` | `500` | Maximum valid contacts allowed per bulk campaign. Enforced at both `/parse` and `/start` endpoints. See [Section 20](#20-contact-limit-enforcement). |
 
 ### Optional — Data Retention (Archive)
 
@@ -1670,13 +1714,16 @@ As a new developer, read these files in order to build a mental model:
 | 2 | `main.py` | See how the app starts, middleware stack, background tasks, health check |
 | 3 | `auth_middleware.py` | Understand how every request gets a `tenant_id` |
 | 4 | `store.py` | The cached read/write layer — how settings and chatbot config are loaded |
-| 5 | `routers/bulk_message.py` | The most complex product — campaign lifecycle from start to completion |
-| 6 | `worker_main.py` | How jobs are picked up, rate-limited, and sent via WhatsApp API |
+| 5 | `routers/bulk_message.py` | The most complex product — campaign lifecycle, contact limits, parsed contacts caching |
+| 6 | `worker_main.py` | How jobs are picked up, throttled (in-worker sleep), and sent via WhatsApp API. Retry-aware quota logic. |
 | 7 | `routers/webhook.py` | How incoming WhatsApp messages flow through the system |
 | 8 | `services/queue_manager.py` | How jobs are enqueued (campaign, message, file-forward, dead-letter) |
-| 9 | `rate_limit.py` | API rate limiting (middleware) + worker token bucket (Lua script) |
+| 9 | `rate_limit.py` | API rate limiting (Lua token bucket), worker token bucket, in-memory caches, global cooldown |
 | 10 | `retention.py` | Data lifecycle — archiving + purging |
 | 11 | `db_layer/quota.py` | Per-tenant monthly bulk message quota — reads + atomic consumption |
+| 12 | `utils/phone_utils.py` | E.164 phone normalization — used everywhere contacts are parsed or sent |
+| 13 | `utils/image_utils.py` | Image compression (≤5 MB) for WhatsApp media uploads |
+| 14 | `db_layer/campaign_recipients.py` | Recipient status transitions + `count_by_status()` authoritative counts |
 
 ### 16.6 Common Development Tasks
 
@@ -1934,3 +1981,140 @@ Before uploading, `upload_header_media()` validates the downloaded content:
 - Rejects responses with `Content-Type: text/html` or `application/json` (expired CDN URLs return error pages)
 - Rejects downloads < 100 bytes (suspiciously small — likely an error response)
 - Infers MIME from template `format` field when the CDN returns `application/octet-stream`
+
+---
+
+## 20. Contact Limit Enforcement
+
+WappFlow enforces a **per-campaign contact limit** to prevent excessively large campaigns from overwhelming the system or hitting WhatsApp rate limits.
+
+### 20.1 How It Works
+
+The limit is configured via the `MAX_VALID_CONTACTS` env var (default: **500**). It is enforced at two points:
+
+1. **`POST /api/bulk-message/parse`** — The parser uses early-stop optimization: once `MAX_VALID_CONTACTS + 1` valid contacts are collected, parsing stops immediately. If the count exceeds the limit, the endpoint returns HTTP `400` with details.
+2. **`POST /api/bulk-message/start`** — A second enforcement check runs on the contacts (whether from cache or freshly parsed). If the count exceeds the limit, the request is rejected before the campaign is created.
+
+### 20.2 Early-Stop Optimization
+
+The `_parse_contacts()` function accepts a `max_contacts` parameter. When set, parsing stops after collecting `max_contacts + 1` rows. This means a 100,000-row file rejects in milliseconds instead of parsing every row:
+
+```
+File has 100,000 rows, limit = 500
+  → Parser collects 501 valid contacts → stops immediately
+  → Returns 400: "exceeds the maximum of 500 per campaign"
+  → 99,499 rows never read
+```
+
+### 20.3 Parsed Contacts Redis Caching
+
+To avoid parsing the same file twice (once on `/parse`, again on `/start`), the system caches parsed contacts in Redis:
+
+1. `/parse` returns an `upload_id` token (UUID)
+2. Contacts are stored in Redis under `parsed_contacts:{upload_id}` with a 10-minute TTL
+3. `/start` accepts `upload_id` as a form field — if the cache hit succeeds, parsing is skipped
+4. The cache entry is deleted after use (single-use token)
+5. If Redis is unavailable or the cache expires, the system falls back to file parsing
+
+### 20.4 Frontend Integration
+
+The frontend calls `GET /api/bulk-message/limits` on page load to fetch the current `max_valid_contacts` value, ensuring the UI stays in sync with the backend configuration without hardcoding limits.
+
+### 20.5 Key Files
+
+| File | Role |
+|------|------|
+| `routers/bulk_message.py` | `MAX_VALID_CONTACTS` constant, enforcement on `/parse` and `/start`, Redis caching logic |
+| `frontend/src/lib/api.ts` | `bulkMessage.limits()` API method |
+| `.env.example` | `MAX_VALID_CONTACTS` configuration reference |
+
+---
+
+## 21. Redis Command Optimization
+
+Phase 14 introduced a comprehensive Redis command reduction strategy to minimize costs on managed Redis providers (e.g., Upstash) while maintaining system reliability.
+
+### 21.1 Problem
+
+The original BullMQ worker configuration caused aggressive Redis polling and Lua script execution:
+- BullMQ's built-in `limiter` injected ~6 extra Redis Lua commands per job (`moveToActive` path)
+- Default `stalledInterval` (30s) caused frequent stalled-job checks (~17 Redis calls/min per worker)
+- Default `drainDelay` (5s) caused rapid idle polling
+- Redis-backed rate limiters for every worker message check added significant overhead
+
+### 21.2 Changes Made
+
+#### BullMQ Limiter Removal
+The BullMQ `limiter` configuration has been **completely removed** from worker options. Rate control is now handled by a simple `asyncio.sleep(_RATE_DELAY_SECONDS)` at the start of each message job. This is safe because the worker processes jobs sequentially (`concurrency=1`).
+
+```python
+# Before (Phase 12): BullMQ limiter — ~6 extra Redis Lua calls per job
+worker_opts = {
+    "limiter": {"max": 80, "duration": 1000},
+    ...
+}
+
+# After (Phase 14): In-worker sleep — 0 extra Redis calls
+_RATE_DELAY_SECONDS = 0.2  # ~5 msg/sec, configurable via WORKER_RATE_DELAY
+if _RATE_DELAY_SECONDS > 0:
+    await asyncio.sleep(_RATE_DELAY_SECONDS)
+```
+
+#### Worker Polling Optimization
+
+| Setting | Before | After | Impact |
+|---------|--------|-------|--------|
+| `drainDelay` | 5s (default) | 10s (max) | 50% fewer idle polls |
+| `stalledInterval` | 30s (default) | 300s (5 min) | ~98% fewer stall checks |
+| `lockDuration` | 30s (default) | 300s (5 min) | Matches stalledInterval |
+| `maxStalledCount` | 2 (default) | 1 | Minimal stall iterations |
+
+#### In-Memory Caching for Rate Limiters
+
+Two high-frequency Redis checks now use short-lived in-memory caches:
+
+| Check | Cache TTL | Before | After |
+|-------|-----------|--------|-------|
+| `tenant_token_bucket_consume()` | 5s (allowed) / 1s (denied) | 1 Redis EVAL per message | ~1 per 5 seconds |
+| `is_global_cooldown_active()` | 2s | 1 Redis GET per message | ~1 per 2 seconds |
+
+#### Lua-Based Token Bucket for API Rate Limiting
+
+API rate limiting now uses a Lua-based token bucket that executes in a single `EVALSHA` call (with `EVAL` fallback), reducing the per-request Redis overhead from ~5 commands (sorted-set sliding window) to 1 command. Controlled by `USE_TOKEN_BUCKET=true` (default).
+
+### 21.3 Quota Counting Fix (Phase 16)
+
+The quota system now correctly handles retries. Only the **first attempt** for each recipient consumes quota. Retry attempts (`attempt_count > 0`) skip quota consumption entirely, preventing inflated usage counts:
+
+```python
+# Worker logic (simplified):
+if current_attempts == 0:
+    consumed = await try_consume_quota(tenant_id, bulk_quota_limit)
+    if not consumed:
+        # Mark recipient as quota_exceeded
+else:
+    # Skip — quota already consumed on first attempt
+    log_event("quota_skip_retry", ...)
+```
+
+### 21.4 Campaign Counter Accuracy (Phase 15)
+
+Campaign `sent_count` and `failed_count` are now derived from **authoritative recipient table counts** rather than incremental counter shards. The `count_by_status()` method groups recipients into display categories:
+
+| Category | Recipient Statuses |
+|----------|--------------------|
+| `sent` | submitted, sent, delivered, read |
+| `failed` | failed |
+| `pending` | pending, queued, processing |
+| `quota_exceeded` | quota_exceeded |
+
+This eliminates counter drift issues where incremental counters could fall out of sync with actual recipient statuses.
+
+### 21.5 Key Files
+
+| File | Role |
+|------|------|
+| `worker_main.py` | `_RATE_DELAY_SECONDS`, removed BullMQ limiter, tuned worker opts, retry-aware quota consume |
+| `rate_limit.py` | Lua token bucket, in-memory caches for cooldown and tenant bucket |
+| `db_layer/campaign_recipients.py` | `count_by_status()` authoritative counter method |
+| `routers/bulk_message.py` | Uses `count_by_status()` for all campaign response payloads |

@@ -17,14 +17,16 @@ Whether you are dispatching a 10,000-contact campaign or instantly responding to
 ### ✨ Key Features
 
 - **Multi-Tenant Isolation**: Complete data separation at the API layer via Firebase Auth tokens, ensuring cross-tenant data leaks are impossible.
-- **Robust Queuing Architecture**: Uses Redis + BullMQ for true asynchronous message processing, preventing WhatsApp rate-limit bans (max 80 req/sec configuration).
+- **Robust Queuing Architecture**: Uses Redis + BullMQ for true asynchronous message processing with in-worker throttling (~5 msg/sec default, configurable via `WORKER_RATE_DELAY`).
 - **Campaign State Management**: Chunk-based campaign processing with instant "Stop/Cancel" capabilities, per-tenant monthly bulk message quotas, and resend-failed workflows.
 - **Resilient Webhook Handlers**: Per-tenant webhook URLs with `X-Hub-Signature-256` HMAC verification, deduplication, and priority chatbot response routing.
 - **Intelligent Template Caching**: Tenant-scoped caching for approved WhatsApp templates to reduce round trips to Meta.
 - **Time Standardization**: Enforces IST (Indian Standard Time) consistently across logging, database timestamps, and telemetry.
 - **Encryption at Rest**: Sensitive secrets (e.g., `meta_app_secret`) are Fernet-encrypted before storage in Postgres.
 - **Data Retention**: Automated archive + purge system keeps live tables fast while preserving historical data.
-- **Per-Tenant Bulk Quotas**: Monthly message caps with atomic three-layer enforcement (API → worker fan-out → per-message).
+- **Per-Tenant Bulk Quotas**: Monthly message caps with atomic three-layer enforcement (API → worker fan-out → per-message). Retry-aware: only first attempts consume quota.
+- **Contact Limit Enforcement**: Configurable per-campaign limit (default 500) with early-stop parsing and dual `/parse` + `/start` enforcement.
+- **Redis Optimization**: Minimal Redis command footprint via in-worker throttling, Lua token buckets, in-memory caching, and tuned BullMQ polling intervals.
 
 ---
 
@@ -90,10 +92,10 @@ Worker (campaign_queue)
  │ 8. Marks excess recipients as 'quota_exceeded'
  ▼
 Worker (message_queue)
- │ 9.  Atomic quota consume (per-message)
- │ 10. Rate-limited execution (80 req/sec)
+ │ 9.  Atomic quota consume (first attempt only; retries skip)
+ │ 10. In-worker throttle (~5 msg/sec via asyncio.sleep)
  │ 11. Calls Meta WhatsApp Cloud API
- │ 12. On success: Updates Postgres counters
+ │ 12. On success: Updates recipient status in Postgres
  │ 13. On failure: Auto-retries with exponential backoff
  ▼
 WhatsApp Cloud API
@@ -130,11 +132,12 @@ We use **3 primary queues**:
 
 1. **`campaign_queue`**: A lightweight queue. A job here represents "Launch Campaign X". The worker picks this up, reads quota remaining, caps fan-out, and floods the message queue. 
 2. **`message_queue`**: The heavy-lifter. Processes individual API calls to Meta. Features:
-   - **Rate Limiting**: Strictly capped at 80 messages per second to avoid Meta API bans.
+   - **In-Worker Throttle**: `asyncio.sleep(WORKER_RATE_DELAY)` between jobs (~5 msg/sec default). Replaces the former BullMQ limiter for minimal Redis overhead.
    - **Retry & Backoff**: Configured for 3 attempts (default) with `exponential` delay starting at 5 seconds.
    - **Idempotency**: Utilizes calculated unique IDs to prevent duplicate sends if a worker crashes during execution.
    - **Priority Routing**: Chatbot webhook replies are queued as priority `0` (highest), ensuring customer support isn't delayed by a marketing blast.
-   - **Per-Tenant Token Bucket**: 10 msg/sec per tenant (burst 20) for fair resource sharing.
+   - **Per-Tenant Token Bucket**: 10 msg/sec per tenant (burst 20) for fair resource sharing. Uses in-memory cache (5s TTL) to reduce Redis calls.
+   - **Retry-Aware Quota**: Only the first attempt for each recipient consumes quota. Retries skip quota consumption to prevent inflated usage.
 3. **`dead_letter_queue`**: Messages that exhaust all retries are gracefully moved here with the `permanently_failed` event, ensuring the main queue isn't clogged by continuously failing payloads.
 
 ---
@@ -284,7 +287,7 @@ The backend is best deployed via **Docker** on a VPS (AWS EC2, DigitalOcean) or 
 │   ├── routers/              # Controllers (settings, bulk_message, file_forward, chatbot, logs, webhook)
 │   ├── services/             # Abstractions (queue_manager, whatsapp, template_builder, chatgpt)
 │   ├── db_layer/             # Postgres repository adapters (15 modules)
-│   ├── utils/                # Time utilities (IST helpers)
+│   ├── utils/                # Shared utilities (phone_utils, image_utils, time_utils)
 │   └── requirements.txt      
 ├── frontend/                 # Next.js 14 Web Application
 │   ├── src/app/              # App Router pages (dashboard, login, register)
@@ -317,7 +320,8 @@ The backend is best deployed via **Docker** on a VPS (AWS EC2, DigitalOcean) or 
 - **Row-level tenant isolation** on all DB tables
 - **Per-tenant HMAC webhook verification** (X-Hub-Signature-256)
 - **Fernet encryption at rest** for sensitive secrets
-- **Redis sliding-window rate limiting** (API + worker tiers)
+- **Redis token-bucket rate limiting** (Lua-based, 1 command per request) + in-worker throttle
 - **Input validation** via Pydantic models
+- **Contact limit enforcement** (configurable max per campaign)
 - **CSV injection protection** on exports
 - **OpenAPI/Swagger disabled** in production
