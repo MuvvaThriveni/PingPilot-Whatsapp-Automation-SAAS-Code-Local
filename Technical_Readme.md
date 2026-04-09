@@ -1,6 +1,6 @@
 # WappFlow — Technical Architecture & System Summary
 
-> **Version:** 2.2.0 | **Last Updated:** 2026-04-01  
+> **Version:** 3.0.0 | **Last Updated:** 2026-04-09  
 > **Full Details:** [Architecture_Overview.md](Architecture_Overview.md) | **API Reference:** [API_Developer_Doc.md](API_Developer_Doc.md)
 
 ---
@@ -53,7 +53,7 @@
 | `db_layer/` | 15 Postgres repository adapter modules |
 | `services/` | Business logic (queue_manager, whatsapp, template_builder, chatgpt) |
 | `routers/` | 6 API endpoint modules (settings, bulk_message, file_forward, chatbot, logs, webhook) |
-| `utils/` | IST time utilities |
+| `utils/` | Shared utilities: phone normalization (E.164), image compression (≤5 MB), IST time helpers |
 
 ### Frontend Components
 | File/Dir | Purpose |
@@ -85,9 +85,12 @@
 ### Bulk Campaign System
 - Uploads Excel/CSV contact lists and sends WhatsApp templates
 - Worker processes recipients asynchronously with rate limiting
-- **Monthly quota enforcement** at three levels (API → campaign worker → per-message)
+- **Monthly quota enforcement** at three levels (API → campaign worker → per-message). Retry-aware: only first attempts consume quota.
 - Supports scheduling, pause/resume, resend-failed workflows
+- **Contact limit enforcement** (default 500, configurable via `MAX_VALID_CONTACTS`) with early-stop parsing
+- **Parsed contacts Redis caching** (avoids re-parsing same file between `/parse` and `/start`)
 - Recipient status machine: `pending → queued → processing → submitted → sent/failed/quota_exceeded`
+- **Authoritative counter accuracy**: API responses derive counts from `count_by_status()` instead of incremental counters
 
 ### File Forwarding
 - Send documents, images, and PDFs to individual or bulk recipients
@@ -140,6 +143,7 @@
 | GET | `/api/bulk-message/campaigns/{id}/details` | Get campaign + recipients |
 | POST | `/api/bulk-message/campaigns/{id}/resend-failed` | Resend failed recipients |
 | DELETE | `/api/bulk-message/campaigns/{id}` | Delete campaign |
+| GET | `/api/bulk-message/limits` | Get backend-configured limits (max contacts) |
 
 ### File Forward Endpoints
 | Method | Path | Purpose |
@@ -203,11 +207,13 @@
 ### Rate Limiting Stack
 | Layer | Mechanism | Scope |
 |-------|-----------|-------|
-| API Heavy | Redis sliding window (10 req/min) | Per-tenant, write actions only |
-| API General | Redis sliding window (300 req/min) | Per-tenant, reads |
-| Worker Global | BullMQ limiter (80 jobs/sec) | All tenants |
-| Worker Tenant | Token bucket (10 msg/sec, burst 20) | Per-tenant |
-| Worker Cooldown | Global pause on repeated 429s | All workers |
+| API Heavy | Redis Lua token bucket (10 req/min) | Per-tenant, write actions only |
+| API General | Redis Lua token bucket (300 req/min) | Per-tenant, reads |
+| Worker In-Process | `asyncio.sleep(WORKER_RATE_DELAY)` (default 200ms = ~5 msg/sec) | Per-worker. Replaces former BullMQ limiter (removed in Phase 14). |
+| Worker Tenant | Token bucket (10 msg/sec, burst 20) + in-memory cache (5s TTL) | Per-tenant |
+| Worker Cooldown | Global pause on repeated 429s + in-memory cache (2s TTL) | All workers |
+
+> **Note:** The BullMQ `limiter` has been intentionally removed (Phase 14). It injected ~6 extra Redis Lua commands per job, causing excessive Redis command consumption on cloud providers. The in-worker `asyncio.sleep` achieves the same rate control with zero Redis overhead.
 
 ### Retry Policy
 - Default 3 attempts with exponential backoff (5s → 10s → 20s)
@@ -225,8 +231,9 @@
 | **Webhook integrity** | Per-tenant HMAC-SHA256 verification with encrypted `meta_app_secret` |
 | **Encryption at rest** | Fernet (AES-128-CBC) for sensitive secrets. `"enc:"` prefix for encrypted values |
 | **Token storage** | Stored in Postgres, resolved at runtime. Never returned to frontend or logged |
-| **Rate limiting** | Multi-tier: API + worker + global cooldown |
+| **Rate limiting** | Multi-tier: API (Lua token bucket) + worker (in-process throttle) + global cooldown. In-memory caches reduce Redis overhead. |
 | **Input validation** | Pydantic models on all request bodies |
+| **Contact limits** | Configurable per-campaign max (default 500) enforced at `/parse` and `/start` |
 | **CSV injection** | Export values sanitized against DDE formula injection |
 | **File upload** | 16 MB hard limit enforced server-side |
 | **CORS** | Explicit origin allowlist; `localhost:3000` only in non-production |
@@ -318,3 +325,8 @@ Docker Compose available for local development (Redis + API + Worker).
 | **9** | Per-tenant webhooks, HMAC signature verification, Fernet encryption at rest |
 | **10** | Per-tenant monthly bulk message quota with atomic three-layer enforcement |
 | **11** | Comprehensive documentation refresh (README, API docs, architecture docs) |
+| **12** | Phone normalization (E.164), image compression (≤5 MB), template hardening (validation + CDN checks), media upload pipeline |
+| **13** | Contact limit enforcement (500 max/campaign), early-stop parsing, parsed contacts Redis caching, `GET /limits` endpoint |
+| **14** | Redis command optimization: BullMQ limiter removal, in-worker sleep throttle, Lua token bucket for API, in-memory caching for rate limiters, BullMQ polling tuning |
+| **15** | Campaign counter accuracy: `count_by_status()` replaces incremental counters, new `pending_count` + `quota_exceeded_count` API fields |
+| **16** | Quota counting fix: only first attempt consumes quota (retries skip), eliminates inflated usage counts |

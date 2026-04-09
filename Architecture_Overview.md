@@ -1,8 +1,8 @@
 # WappFlow — Architecture Overview
 
 > **Product:** Multi-tenant WhatsApp Business Automation SaaS  
-> **Version:** 2.3.0 (Phase 12 — Phone Normalization, Image Compression & Template Hardening)  
-> **Last Updated:** 2026-04-06
+> **Version:** 3.0.0 (Phase 16 — Contact Limits, Redis Optimization, Counter Accuracy & Quota Fix)  
+> **Last Updated:** 2026-04-09
 
 > **📖 How to Use This Document:** If you are new to the team, start with [Section 21 (Onboarding Guide)](#21-onboarding-guide-for-new-developers) for a structured path. Then dive into specific sections as needed. For API endpoint details, see [API_Developer_Doc.md](API_Developer_Doc.md).
 
@@ -80,11 +80,12 @@ Every tenant is fully isolated: separate WhatsApp credentials, separate webhook 
 │                      Atomically consumes quota before each send          │
 │                                                                          │
 │  Rate Controls:                                                          │
-│    • BullMQ limiter (80 msg/sec global)                                  │
+│    • In-worker asyncio.sleep throttle (WORKER_RATE_DELAY, default 200ms) │
 │    • Tenant token bucket (10 msg/sec per tenant, burst 20)               │
 │    • Global cooldown on repeated 429s from WhatsApp                      │
 │    • Exponential backoff + jitter on retries                             │
 │    • Monthly quota enforcement (atomic per-message consumption)           │
+│    • Retry-aware quota: only first attempt consumes quota                │
 └──────────────────────────────┬──────────────────────────────────────────┘
                                │
                                ▼
@@ -135,24 +136,28 @@ Every tenant is fully isolated: separate WhatsApp credentials, separate webhook 
 4. RateLimitMiddleware → checks Redis sliding window (10 req/min for heavy endpoints)
 5. Route handler:
    a. Reads tenant settings from cache/DB
-   b. Parses uploaded file → extracts contacts
-   c. Quota pre-check: if contacts > remaining monthly quota → 429 rejected
-   d. Creates campaign + recipients + counters in DB (single transaction)
-   e. Enqueues campaign job to BullMQ campaign_queue
-   f. Returns { campaignId, totalContacts, status }
+   b. Contact limit check: rejects if > MAX_VALID_CONTACTS (default 500)
+   c. Attempts to reuse cached contacts from /parse via upload_id (Redis)
+   d. If cache miss: parses uploaded file → extracts contacts
+   e. Quota pre-check: if contacts > remaining monthly quota → 429 rejected
+   f. Creates campaign + recipients + counters in DB (single transaction)
+   g. Enqueues campaign job to BullMQ campaign_queue
+   h. Returns { campaignId, totalContacts, status }
 6. Worker picks up campaign job:
    a. Reads remaining monthly quota for tenant
    b. Caps fan-out to min(pending_recipients, quota_remaining)
    c. Marks excess recipients as "quota_exceeded"
    d. Fans out capped message jobs to message_queue
 7. Message worker processes each job:
-   a. Atomically consumes 1 from monthly quota (try_consume_quota)
+   a. Atomically consumes 1 from monthly quota (first attempt only)
+      └─ Retries (attempt_count > 0) skip quota — already consumed
       └─ If quota exhausted → mark recipient "quota_exceeded", skip send
    b. Checks global cooldown & tenant token bucket
-   c. Resolves template, builds components
+   c. Resolves template, builds components, validates params
    d. Calls WhatsApp Cloud API
-   e. Updates recipient status + counters in DB (transaction)
-   f. On final recipient, marks campaign as "completed"
+   e. Updates recipient status in DB (transaction)
+   f. Status/list/details endpoints use count_by_status() for accurate counts
+   g. On final recipient, marks campaign as "completed"
 ```
 
 ### Webhook (Incoming WhatsApp Message — Per-Tenant Route)
@@ -1068,3 +1073,184 @@ Once a header image is successfully uploaded, the resulting `media_id` is cached
 | `services/template_builder.py` | `upload_header_media()` — CDN download, compression, upload, caching; `invalidate_cached_media()` — cache invalidation |
 | `services/whatsapp.py` | `upload_media()` — multipart/form-data upload to Graph API |
 | `worker_main.py` | Calls `upload_header_media()` before every template send; calls `invalidate_cached_media()` on `#132012` |
+
+---
+
+## 24. Contact Limit Enforcement (Phase 13)
+
+WappFlow enforces a **per-campaign contact limit** (default: 500) to prevent overly large campaigns from overwhelming the sending pipeline or hitting WhatsApp rate limits aggressively.
+
+### 24.1 Architecture
+
+```
+User uploads CSV/Excel with 800 contacts
+            │
+            ▼
+  POST /api/bulk-message/parse
+            │
+  _parse_contacts(df, max_contacts=500)
+            │
+  ┌─────────┴──────────┐
+  │ Collect contacts   │
+  │ Early-stop at 501  │ ← stops immediately, 299 rows never read
+  └─────────┬──────────┘
+            │ len(contacts) > 500
+            ▼
+  HTTP 400: "exceeds maximum of 500 per campaign"
+```
+
+### 24.2 Dual Enforcement
+
+| Enforcement Point | Stage | Behavior |
+|-------------------|-------|----------|
+| `POST /parse` | File upload preview | Rejects with `400` + details. Uses early-stop optimization. |
+| `POST /start` | Campaign creation | Second check (whether from cache or re-parsed). Rejects before DB writes. |
+
+### 24.3 Parsed Contacts Redis Cache
+
+To avoid parsing the same file twice, `/parse` caches results in Redis:
+
+```
+/parse flow:
+  parse file → cache in Redis (key: parsed_contacts:{upload_id}, TTL: 10min)
+              → return contacts[] + upload_id
+
+/start flow:
+  if upload_id present → try Redis GET parsed_contacts:{upload_id}
+    → hit: use cached contacts, DELETE key (single-use token)
+    → miss: fall back to file parsing
+```
+
+### 24.4 Frontend Sync
+
+`GET /api/bulk-message/limits` returns `{ max_valid_contacts: 500 }` so the frontend can display the correct limit without hardcoding.
+
+### 24.5 Configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MAX_VALID_CONTACTS` | `500` | Maximum valid contacts per campaign |
+
+---
+
+## 25. Redis Command Optimization (Phase 14)
+
+This phase dramatically reduced Redis command consumption to minimize costs on managed Redis providers (e.g., Upstash).
+
+### 25.1 BullMQ Limiter Removal
+
+```
+Before (Phase 12):                          After (Phase 14):
+┌─────────────────────────────┐            ┌──────────────────────────────┐
+│ BullMQ Worker               │            │ BullMQ Worker                │
+│                             │            │                              │
+│ limiter: {max:80, dur:1000} │            │ (no limiter)                 │
+│   └─ 6 extra Redis Lua     │            │   └─ 0 extra Redis calls     │
+│      calls per job          │            │                              │
+│                             │            │ asyncio.sleep(0.2)           │
+│                             │            │   └─ ~5 msg/sec, in-process  │
+└─────────────────────────────┘            └──────────────────────────────┘
+```
+
+### 25.2 Worker Polling Tuning
+
+| Setting | Before (Default) | After | Redis Impact |
+|---------|-------------------|-------|--------------|
+| `drainDelay` | 5s | 10s (max) | 50% fewer idle polls |
+| `stalledInterval` | 30s (30,000ms) | 300s (300,000ms) | ~98% fewer stall checks |
+| `lockDuration` | 30s | 300s | Matches stalledInterval |
+| `maxStalledCount` | 2 | 1 | Minimal iterations |
+
+### 25.3 In-Memory Caching
+
+Two high-frequency Redis checks now use short-lived in-memory caches to avoid redundant calls during high-throughput campaign processing:
+
+| Function | Cache TTL | Before | After |
+|----------|-----------|--------|-------|
+| `tenant_token_bucket_consume()` | 5s (allowed) / 1s (denied) | 1 Redis EVAL per message | ~1 per 5 seconds |
+| `is_global_cooldown_active()` | 2s | 1 Redis GET per message | ~1 per 2 seconds |
+
+### 25.4 Lua Token Bucket for API Rate Limiting
+
+API rate limiting uses a single `EVALSHA` Lua script (with `EVAL` fallback) instead of the former sorted-set sliding window. This reduces per-request Redis overhead from ~5 commands to 1. Feature flag: `USE_TOKEN_BUCKET=true` (default).
+
+### 25.5 Configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `WORKER_RATE_DELAY` | `0.2` | Seconds between message jobs (in-worker throttle). Replaces BullMQ limiter. |
+| `USE_TOKEN_BUCKET` | `true` | API rate limiter strategy. `true` = Lua token bucket; `false` = sorted-set sliding window |
+| `QUEUE_RATE_LIMIT` | `80` | **Deprecated.** Has no effect. Retained for backward compatibility. |
+
+---
+
+## 26. Campaign Counter Accuracy (Phase 15)
+
+### 26.1 Problem
+
+Incremental counter shards (`sent_count`, `failed_count` on the `campaigns` row) could drift out of sync with actual recipient statuses when:
+- Transactions partially committed
+- Workers restarted mid-batch
+- Retry logic updated recipient status without adjusting counters
+
+### 26.2 Solution: Authoritative Recipient Counts
+
+All campaign status/list/details API responses now derive counts from `campaign_recipients.count_by_status()` — a single SQL query that groups recipients by their current status:
+
+```sql
+SELECT
+  COUNT(*) FILTER (WHERE status IN ('submitted','sent','delivered','read')) AS sent,
+  COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+  COUNT(*) FILTER (WHERE status IN ('pending','queued','processing')) AS pending,
+  COUNT(*) FILTER (WHERE status = 'quota_exceeded') AS quota_exceeded
+FROM campaign_recipients
+WHERE tenant_id = %s AND campaign_id = %s::uuid
+```
+
+### 26.3 Display Category Mapping
+
+| API Field | Recipient Statuses Counted |
+|-----------|---------------------------|
+| `sent_count` | submitted, sent, delivered, read |
+| `failed_count` | failed |
+| `pending_count` | pending, queued, processing |
+| `quota_exceeded_count` | quota_exceeded |
+
+> **Note:** The `campaign_counters` shards still exist and are incremented for backward compatibility, but they are no longer the source of truth for API responses.
+
+---
+
+## 27. Quota Counting Fix (Phase 16)
+
+### 27.1 Problem
+
+The original quota system consumed 1 quota unit on every message send attempt, including retries. A message that failed and was retried 3 times consumed 3 units of quota, inflating the tenant's usage count.
+
+### 27.2 Solution: First-Attempt-Only Consumption
+
+The worker now checks `attempt_count` before consuming quota:
+
+```
+Message Worker receives job for phone=919876543210
+  │
+  ├─ attempt_count == 0 (first attempt)
+  │   └─ try_consume_quota(tenant_id) → consumed? continue : mark quota_exceeded
+  │
+  ├─ attempt_count > 0 (retry)
+  │   └─ skip quota consumption → log "quota_skip_retry" → proceed to send
+  │
+  └─ Send via WhatsApp API
+```
+
+This ensures each unique recipient consumes exactly **1 quota unit**, regardless of how many retries are needed.
+
+### 27.3 Key Files
+
+| File | Role |
+|------|------|
+| `worker_main.py` | `process_message_job()` — conditional quota consumption based on `attempt_count` |
+| `db_layer/quota.py` | `try_consume_quota()` — atomic quota consumption logic |
+| `db_layer/campaign_recipients.py` | `count_by_status()` — authoritative status counts |
+| `routers/bulk_message.py` | `MAX_VALID_CONTACTS`, `/limits` endpoint, Redis contact caching |
+| `rate_limit.py` | Lua token bucket, in-memory caches, `WORKER_RATE_DELAY` |
+
