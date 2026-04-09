@@ -293,7 +293,7 @@ _HEAVY_ROUTES: tuple[tuple[str, str], ...] = (
 
 # Paths that are never rate-limited
 # /api/webhook is called by WhatsApp servers — rate limiting risks webhook deregistration
-_SKIP_PATHS = ("/api/health", "/docs", "/openapi.json", "/api/webhook", "/webhook")
+_SKIP_PATHS = ("/", "/api/health", "/docs", "/openapi.json", "/api/webhook", "/webhook")
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -457,12 +457,25 @@ end
 TENANT_RATE_LIMIT = int(os.environ.get("TENANT_RATE_LIMIT", "10"))  # msgs/sec
 TENANT_BURST = int(os.environ.get("TENANT_BURST", "20"))  # max burst
 
+# In-memory cache for tenant token bucket results (Fix #5: Redis command optimization)
+# Maps tenant_id → {"allowed": bool, "expires_at": float}
+# When the bucket was checked recently and had tokens, skip the Redis EVAL.
+_TENANT_BUCKET_CACHE: dict[str, dict] = {}
+_TENANT_BUCKET_CACHE_TTL = 5.0  # seconds — safe because we already throttle via asyncio.sleep in workers
+
 
 async def tenant_token_bucket_consume(tenant_id: str) -> bool:
     """Try to consume one token from the tenant's bucket.
 
     Returns True if allowed, False if the tenant should be throttled.
+    Uses a short in-memory cache (5s) to reduce Redis EVAL calls during
+    high-throughput campaign bursts.
     """
+    now = time.time()
+    cached = _TENANT_BUCKET_CACHE.get(tenant_id)
+    if cached and now < cached["expires_at"]:
+        return cached["allowed"]
+
     r = await get_redis()
     key = f"tb:tenant:{tenant_id}"
     result = await r.eval(
@@ -471,9 +484,16 @@ async def tenant_token_bucket_consume(tenant_id: str) -> bool:
         key,
         TENANT_BURST,          # max_tokens (burst capacity)
         TENANT_RATE_LIMIT,     # refill_rate (tokens per second)
-        time.time(),
+        now,
     )
-    return bool(result)
+    allowed = bool(result)
+
+    # Cache the result.  If denied, use a shorter TTL so we re-check sooner.
+    _TENANT_BUCKET_CACHE[tenant_id] = {
+        "allowed": allowed,
+        "expires_at": now + (_TENANT_BUCKET_CACHE_TTL if allowed else 1.0),
+    }
+    return allowed
 
 
 # ── Global cooldown for adaptive 429 handling ───────────────────────
