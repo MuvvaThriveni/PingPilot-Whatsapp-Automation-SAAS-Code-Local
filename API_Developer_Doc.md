@@ -1,10 +1,10 @@
 # WappFlow â€” Developer API Documentation
 
-> **Version:** 3.0.0 (Phase 16 â€” Contact Limits, Redis Optimization, Counter Accuracy & Quota Fix)  
+> **Version:** 4.0.0 (Phase 17 â€” Dynamic Chatbot System, Button Mappings, Fallback Templates)  
 > **Base URL:** `http://localhost:5000/api` (dev) or `https://<your-deployment>/api` (prod)  
 > **Auth:** Firebase ID Token â€” `Authorization: Bearer <firebase_id_token>`  
 > **Database:** Neon Postgres (serverless) â€” see [Architecture_Overview.md](Architecture_Overview.md) for full schema  
-> **Last Updated:** 2026-04-09
+> **Last Updated:** 2026-04-10
 
 ---
 
@@ -31,6 +31,7 @@
 19. [Utility Modules Reference](#19-utility-modules-reference)
 20. [Contact Limit Enforcement](#20-contact-limit-enforcement)
 21. [Redis Command Optimization](#21-redis-command-optimization)
+22. [Chatbot System Redesign (Phase 17)](#22-chatbot-system-redesign-phase-17)
 
 ---
 
@@ -643,6 +644,22 @@ Delivery is **asynchronous** â€” returns immediately after enqueuing.
 
 Prefix: `/api/chatbot`
 
+The chatbot system is **fully dynamic and DB-driven** as of Phase 17. All behavior â€” settings, keyword rules, and buttonâ†’template mappings â€” is stored in Postgres and cached in-memory. There are **no hardcoded defaults**.
+
+### Chatbot Automation Priority Order
+
+When an incoming WhatsApp message arrives and the chatbot is enabled, the system checks in this order:
+
+| Priority | Layer | What it does |
+|----------|-------|--------------|
+| **1 (Highest)** | Buttonâ†’Template Mappings | Exact text match against `chatbot_button_mappings` table (cached 1h) |
+| **2** | Keyword Rules | Matches `chatbot_rules` by `match_type` (exact/contains/starts_with), ordered by `priority DESC` |
+| **3 (Lowest)** | Fallback Template | Sends `fallback_template_name` if no rule matched and sender hasn't been triggered in `fallback_cooldown_hours` |
+
+First match wins. Once a layer matches, lower layers are skipped entirely.
+
+---
+
 ### 6.1 Get Chatbot Settings
 
 `GET /api/chatbot/settings`
@@ -653,10 +670,20 @@ Prefix: `/api/chatbot`
   "settings": {
     "is_enabled": true,
     "fallback_message": "Thank you for your message. Our team will get back to you soon.",
+    "fallback_template_name": "first_trigger",
+    "fallback_cooldown_hours": 24,
     "use_ai": false
   }
 }
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `is_enabled` | bool | Master switch â€” no auto-replies fire when `false` |
+| `fallback_message` | string | Text reply sent when no rule matches (if `fallback_template_name` is empty) |
+| `fallback_template_name` | string | WhatsApp template to send as fallback when no rule matches. Empty string = no fallback. |
+| `fallback_cooldown_hours` | int | Hours between fallback sends to the same contact (default 24). Prevents spam. |
+| `use_ai` | bool | Always `false` â€” AI mode is reserved for a future release. |
 
 ---
 
@@ -668,9 +695,20 @@ Prefix: `/api/chatbot`
 ```json
 {
   "is_enabled": true,
-  "fallback_message": "We'll get back to you shortly."
+  "fallback_message": "We'll get back to you shortly.",
+  "fallback_template_name": "welcome_template",
+  "fallback_cooldown_hours": 48
 }
 ```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `is_enabled` | bool | Yes | Enable/disable all chatbot auto-replies |
+| `fallback_message` | string | Yes | Fallback text (used if no template is configured) |
+| `fallback_template_name` | string | No | Template name for fallback trigger. Set to `""` or `null` to disable. |
+| `fallback_cooldown_hours` | int | No | Default 24. Min recommended: 1. |
+
+> **Note:** Saving settings invalidates both the chatbot config cache and the button mappings cache for the tenant.
 
 **Response `200`:**
 ```json
@@ -686,6 +724,8 @@ Prefix: `/api/chatbot`
 
 `GET /api/chatbot/rules`
 
+Returns all keyword rules for the tenant, ordered by `priority DESC`. Cached for 6 hours; invalidated on any create/update/delete.
+
 **Response `200`:**
 ```json
 {
@@ -694,13 +734,26 @@ Prefix: `/api/chatbot`
       "id": 1,
       "keyword": "hello",
       "response": "Hi there! How can I help?",
+      "response_type": "text",
+      "match_type": "contains",
       "priority": 0,
       "is_active": true,
-      "created_at": "..."
+      "created_at": "2026-04-01T10:00:00+05:30",
+      "updated_at": null
     }
   ]
 }
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | int | Auto-increment database ID |
+| `keyword` | string | Keyword/phrase to match (always stored lowercase) |
+| `response` | string | The reply â€” either a text string or a WhatsApp template name |
+| `response_type` | string | `"text"` or `"template"` |
+| `match_type` | string | `"exact"`, `"contains"`, or `"starts_with"` |
+| `priority` | int | Higher = checked first. Rules with the same priority are ordered by `id DESC` |
+| `is_active` | bool | Inactive rules are stored but never matched |
 
 ---
 
@@ -713,15 +766,29 @@ Prefix: `/api/chatbot`
 {
   "keyword": "pricing",
   "response": "Check out our pricing at https://example.com/pricing",
+  "response_type": "text",
+  "match_type": "contains",
   "priority": 1
 }
 ```
 
-| Field | Type | Required |
-|-------|------|----------|
-| `keyword` | string | Yes |
-| `response` | string | Yes |
-| `priority` | int | No (default `0`) |
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `keyword` | string | Yes | â€” | Stored as lowercase |
+| `response` | string | Yes | â€” | Text reply or template name |
+| `response_type` | string | No | `"text"` | `"text"` or `"template"` |
+| `match_type` | string | No | `"contains"` | `"exact"`, `"contains"`, `"starts_with"` |
+| `priority` | int | No | `0` | |
+
+**Match Type Behavior:**
+
+| `match_type` | Example keyword | Matches |
+|---|---|---|
+| `exact` | `"hello"` | Only the exact message `"hello"` |
+| `contains` | `"price"` | Any message containing the word `"price"` |
+| `starts_with` | `"hi"` | Messages starting with `"hi"` (e.g. `"Hi there"`) |
+
+**Template Response:** When `response_type` is `"template"`, the `response` field must contain the exact approved WhatsApp template name (e.g. `"welcome_message"`). The webhook engine will send this template via the message queue.
 
 **Response `200`:**
 ```json
@@ -730,9 +797,10 @@ Prefix: `/api/chatbot`
     "id": 2,
     "keyword": "pricing",
     "response": "Check out our pricing at ...",
+    "response_type": "text",
+    "match_type": "contains",
     "priority": 1,
-    "is_active": 1,
-    "created_at": "..."
+    "is_active": true
   }
 }
 ```
@@ -747,11 +815,17 @@ Prefix: `/api/chatbot`
 ```json
 {
   "keyword": "pricing",
-  "response": "Updated response text",
+  "response": "promo_template",
+  "response_type": "template",
+  "match_type": "exact",
   "priority": 2,
   "is_active": true
 }
 ```
+
+**Response `200`:** Returns the updated rule object.
+
+**Error `404`:** `{ "error": "Rule not found" }`
 
 ---
 
@@ -769,7 +843,131 @@ Prefix: `/api/chatbot`
 
 ---
 
-### 6.7 Get Chat Users
+### 6.7 Get Button Mappings
+
+`GET /api/chatbot/button-mappings`
+
+Lists all buttonâ†’template mappings for the tenant. Unlike keyword rules, button mappings only support **exact text match** (used for WhatsApp interactive button replies). Cached in-memory for 1 hour; invalidated on any write.
+
+**Response `200`:**
+```json
+{
+  "mappings": [
+    {
+      "id": 1,
+      "tenant_id": "firebase_uid",
+      "button_text": "Book Session",
+      "template_name": "session_booking_template",
+      "is_active": true,
+      "priority": 0,
+      "created_at": "2026-04-10T10:00:00+05:30",
+      "updated_at": "2026-04-10T10:00:00+05:30"
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | int | Auto-increment database ID |
+| `button_text` | string | Exact button text to match (case-sensitive, stripped of whitespace) |
+| `template_name` | string | WhatsApp template name to send when the button is pressed |
+| `is_active` | bool | Only active mappings are used during webhook processing |
+| `priority` | int | Higher-priority mappings are checked first |
+
+> **How matching works:** When a user taps a WhatsApp interactive button, the `button.text` field from the webhook payload is compared against all active `button_text` values for the tenant. First exact match (by priority) triggers the corresponding template send.
+
+---
+
+### 6.8 Create Button Mapping
+
+`POST /api/chatbot/button-mappings`
+
+**Request Body (JSON):**
+```json
+{
+  "button_text": "Book Session",
+  "template_name": "session_booking_template",
+  "is_active": true,
+  "priority": 0
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `button_text` | string | **Yes** | The exact text of the WhatsApp button. Must be non-empty. Whitespace stripped. |
+| `template_name` | string | **Yes** | Approved WhatsApp template name to send as response. |
+| `is_active` | bool | No | Default `true` |
+| `priority` | int | No | Default `0`. Higher = checked first when multiple mappings exist. |
+
+**Uniqueness:** Only one mapping per `button_text` per tenant is allowed. Attempting to create a duplicate returns a `500` database error.
+
+**Error `400` â€” Missing button_text:**
+```json
+{
+  "error": "button_text is required"
+}
+```
+
+**Response `200`:**
+```json
+{
+  "mapping": {
+    "id": 2,
+    "button_text": "Book Session",
+    "template_name": "session_booking_template",
+    "is_active": true,
+    "priority": 0,
+    "created_at": "2026-04-10T10:05:00+05:30",
+    "updated_at": "2026-04-10T10:05:00+05:30"
+  }
+}
+```
+
+---
+
+### 6.9 Update Button Mapping
+
+`PUT /api/chatbot/button-mappings/{mapping_id}`
+
+**Request Body (JSON):** Same fields as create. All fields are optional for partial update.
+
+```json
+{
+  "template_name": "updated_template",
+  "is_active": false
+}
+```
+
+**Response `200`:**
+```json
+{
+  "success": true,
+  "message": "Mapping updated"
+}
+```
+
+**Error `500`:** `{ "error": "Failed to update mapping" }`
+
+---
+
+### 6.10 Delete Button Mapping
+
+`DELETE /api/chatbot/button-mappings/{mapping_id}`
+
+**Response `200`:**
+```json
+{
+  "success": true,
+  "message": "Mapping deleted"
+}
+```
+
+**Error `500`:** `{ "error": "Failed to delete mapping" }`
+
+---
+
+### 6.11 Get Chat Users
 
 `GET /api/chatbot/users`
 
@@ -792,7 +990,7 @@ Returns unique contacts with their latest message. Cached for 15 seconds.
 
 ---
 
-### 6.8 Get Conversations (All)
+### 6.12 Get Conversations (All)
 
 `GET /api/chatbot/conversations`
 
@@ -816,13 +1014,13 @@ Returns unique contacts with their latest message. Cached for 15 seconds.
 
 ---
 
-### 6.9 Get User Conversations
+### 6.13 Get User Conversations
 
 `GET /api/chatbot/conversations/{phone}`
 
 **Query Params:** `limit` (default 50), `cursor`
 
-Returns conversation history for a specific phone number. Same response shape as 6.8.
+Returns conversation history for a specific phone number. Same response shape as 6.12.
 
 ---
 
@@ -934,10 +1132,10 @@ Receives incoming messages and delivery status updates from WhatsApp. This is th
 
 **Processing pipeline:**
 - **Deduplication:** Uses `webhook_events` table to prevent duplicate processing
-- **Message routing:** Incoming text/button/interactive messages matched against:
-  1. Per-tenant buttonâ†’template mappings (configurable in DB, cached 1h)
-  2. Keyword-based chatbot rules (DB-backed)
-  3. First-trigger fallback (24h rate-limited per sender)
+- **Message routing:** Incoming text/button/interactive messages matched against three layers in order:
+  1. **Buttonâ†’Template Mappings** â€” exact match against `chatbot_button_mappings` table (per-tenant, cached 1h). Handles WhatsApp interactive button replies (`button.text`) and plain message text.
+  2. **Keyword Rules** â€” DB-backed `chatbot_rules` with configurable `match_type` (`exact`/`contains`/`starts_with`) and `response_type` (`text`/`template`). Ordered by `priority DESC`.
+  3. **Fallback Template** â€” if no rule matched and the sender hasn't been triggered within `fallback_cooldown_hours` (default 24h), the `fallback_template_name` template is sent. Controlled by per-tenant cooldown in `user_triggers` table.
 - **Delivery status handling:** Updates message status in `messages` table, triggers campaign finalization, handles retries for failed deliveries with automatic re-enqueue
 - **Archive fallback:** If a message was recently archived, the webhook handler looks up `messages_archive` so delivery callbacks still work
 
@@ -1258,8 +1456,10 @@ Or manually run `backend/schema.sql` against your Postgres database.
 | Table | Purpose |
 |-------|---------|
 | `tenants` | WhatsApp API credentials per tenant + `bulk_quota_limit` (default 100) |
-| `chatbot_config` | Chatbot on/off, fallback message, buttonâ†’template mappings (JSONB) |
-| `chatbot_rules` | Keyword â†’ response auto-reply rules (priority-ordered) |
+| `chatbot_config` | Chatbot on/off, `fallback_message`, `fallback_template_name`, `fallback_cooldown_hours` |
+| `chatbot_rules` | Keyword â†’ response rules with `response_type` (`text`/`template`) and `match_type` (`exact`/`contains`/`starts_with`) |
+| `chatbot_button_mappings` | **NEW (Phase 17)** â€” Per-tenant button text â†’ template mappings. Replaces JSONB columns on `chatbot_config`. Each row: `button_text`, `template_name`, `is_active`, `priority` |
+| `chatbot_flows` | **NEW (Phase 17, future)** â€” Visual flow builder storage. `flow_data` JSONB with nodes/edges/variables. Not yet exposed via API. |
 | `campaigns` | Bulk message campaign metadata (composite PK: `tenant_id, campaign_id`) |
 | `campaign_recipients` | Per-recipient delivery status machine (`pending â†’ queued â†’ processing â†’ submitted â†’ sent`) |
 | `campaign_counters` | Sharded sent/failed counters (atomic increment via DB transactions) |
@@ -1268,13 +1468,33 @@ Or manually run `backend/schema.sql` against your Postgres database.
 | `webhook_events` | Deduplication for incoming webhooks (composite PK: `tenant_id, event_id`) |
 | `usage_events` | Billable usage tracking (per event, per month) |
 | `template_cache` | Persistent WhatsApp template metadata (synced from Meta API) |
-| `user_triggers` | 24-hour rate limit for first-trigger chatbot messages |
+| `user_triggers` | Configurable-cooldown rate limit for fallback chatbot messages (default 24h) |
 | `tenant_quota_usage` | Per-tenant monthly bulk message quota consumption (composite PK: `tenant_id, month_key`) |
 | `messages_archive` | Archived messages (older than RETENTION_DAYS) |
 | `chat_messages_archive` | Archived chat messages |
 | `webhook_events_archive` | Archived webhook events |
 | `usage_events_archive` | Archived usage events |
 | `daily_message_stats` | Pre-aggregated daily message counts (preserves dashboard accuracy after archival) |
+
+### Applying Migrations
+
+When adding new features that require schema changes, use the migration script pattern:
+
+```bash
+# Apply the base schema (idempotent â€” safe to re-run)
+python backend/apply_schema.py
+
+# Apply Phase 17 chatbot redesign migration
+python backend/run_migration.py
+```
+
+`run_migration.py` applies `migration_chatbot_redesign.sql` which:
+1. Adds `fallback_template_name` + `fallback_cooldown_hours` to `chatbot_config`
+2. Adds `response_type` + `match_type` to `chatbot_rules`
+3. Creates `chatbot_button_mappings` table
+4. Creates `chatbot_flows` table (future)
+5. Migrates existing JSONB button mappings to the new table
+6. Sets default `fallback_template_name = 'first_trigger'` for tenants with chatbot enabled
 
 ---
 
@@ -1777,7 +1997,12 @@ A quick reference for terminology used throughout this documentation. Essential 
 | **`tenant_id`** | The Firebase Auth UID that uniquely identifies each tenant. Every database table and cache key is scoped by this value. |
 | **`wa_message_id`** | The unique identifier returned by WhatsApp's Cloud API after successfully accepting a message. Used for delivery status tracking. |
 | **`month_key`** | A string in `YYYY-MM` format (e.g., `2026-03`) used to partition quota usage and usage events by calendar month. |
-| **First-Trigger Fallback** | A chatbot feature that sends a template reply to new senders who haven't been contacted in the last 24 hours, even if no keyword rule matches. Rate-limited per sender. |
+| **Button Mapping** | A tenant-configured rule stored in `chatbot_button_mappings` that maps an exact WhatsApp button text (e.g. `"Book Session"`) to a WhatsApp template name. Checked at highest priority by the chatbot engine. |
+| **Match Type** | Per-rule setting on `chatbot_rules` controlling how keyword matching works: `exact` (full message match), `contains` (substring), or `starts_with` (prefix). Added in Phase 17. |
+| **Response Type** | Per-rule setting on `chatbot_rules` controlling what is sent on a match: `text` (plain text) or `template` (WhatsApp template by name). Added in Phase 17. |
+| **Fallback Template** | A tenant-configurable WhatsApp template (`fallback_template_name`) sent when no button or keyword rule matches an incoming message. Rate-limited by `fallback_cooldown_hours` (default 24h) per sender. Replaced the hardcoded `first_trigger` approach in Phase 17. |
+| **Fallback Cooldown** | The number of hours (`fallback_cooldown_hours`) between fallback template sends to the same contact. Tracked in the `user_triggers` table per `(tenant_id, phone)`. |
+| **First-Trigger Fallback** | Legacy term for the Fallback Template system (pre-Phase 17). Now configurable per tenant as `fallback_template_name` + `fallback_cooldown_hours`. |
 | **Neon Postgres** | A serverless PostgreSQL provider. WappFlow uses it as the primary database with `psycopg3` async driver and connection pooling. |
 | **IST (Indian Standard Time)** | UTC+05:30. All timestamps in WappFlow are standardized to IST for consistency across logging, database records, and API responses. |
 
@@ -2118,3 +2343,154 @@ This eliminates counter drift issues where incremental counters could fall out o
 | `rate_limit.py` | Lua token bucket, in-memory caches for cooldown and tenant bucket |
 | `db_layer/campaign_recipients.py` | `count_by_status()` authoritative counter method |
 | `routers/bulk_message.py` | Uses `count_by_status()` for all campaign response payloads |
+
+---
+
+## 22. Chatbot System Redesign (Phase 17)
+
+Phase 17 is a complete redesign of the chatbot automation system, replacing hardcoded static mappings and JSONB columns with a fully dynamic, DB-driven, multi-tenant architecture.
+
+### 22.1 What Changed
+
+| Feature | Before (Pre-Phase 17) | After (Phase 17) |
+|---------|----------------------|------------------|
+| Button?template mappings | Hardcoded in `webhook.py` Python dicts | DB table `chatbot_button_mappings`, fully per-tenant CRUD |
+| Button ID matching | Supported via `button_id_mappings` JSONB | **Removed** — matching is by button text only |
+| Keyword rule response type | Text only | `text` or `template` (configurable per rule) |
+| Keyword rule match type | Contains only | `exact`, `contains`, or `starts_with` (configurable per rule) |
+| Fallback trigger template | Hardcoded `"first_trigger"` string | Configurable `fallback_template_name` per tenant |
+| Fallback cooldown | Fixed 24h | Configurable `fallback_cooldown_hours` per tenant (default 24) |
+| AI mode | Partially scaffolded | Fully disabled (`use_ai` always `false`); reserved for future |
+
+### 22.2 New Database Tables
+
+#### `chatbot_button_mappings`
+
+Replaces the legacy `button_text_mappings` JSONB column on `chatbot_config`. Each row maps one button text to one template, scoped to a tenant:
+
+```sql
+CREATE TABLE chatbot_button_mappings (
+  id            BIGSERIAL PRIMARY KEY,
+  tenant_id     TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+  button_text   TEXT NOT NULL DEFAULT '',
+  template_name TEXT NOT NULL,
+  is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+  priority      INTEGER NOT NULL DEFAULT 0,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT chk_button_mapping_has_trigger CHECK (button_text <> '')
+);
+-- Unique: one button_text per tenant
+CREATE UNIQUE INDEX idx_button_mappings_unique_text
+  ON chatbot_button_mappings (tenant_id, button_text) WHERE button_text <> '';
+```
+
+#### `chatbot_flows` (Future — schema exists, no API yet)
+
+Placeholder table for a future visual flow builder. Stored in the schema now for forward compatibility. `trigger_type` can be `keyword`, `button`, `first_message`, or `manual`. Not yet exposed via any API endpoint.
+
+### 22.3 Updated Columns on Existing Tables
+
+**`chatbot_config` — two new columns:**
+
+| Column | Type | Default | Description |
+|--------|------|---------|-------------|
+| `fallback_template_name` | TEXT | `''` | Template name to send when no rule matches. Empty string disables the fallback. |
+| `fallback_cooldown_hours` | INTEGER | `24` | Hours between fallback sends to the same contact. Prevents spam. |
+
+**`chatbot_rules` — two new columns:**
+
+| Column | Type | Default | Values | Description |
+|--------|------|---------|--------|-------------|
+| `response_type` | TEXT | `'text'` | `'text'`, `'template'` | Whether to send a plain text reply or a WhatsApp template |
+| `match_type` | TEXT | `'contains'` | `'exact'`, `'contains'`, `'starts_with'` | How to match the incoming message against the keyword |
+
+### 22.4 New and Updated Backend Files
+
+| File | Status | Purpose |
+|------|--------|---------|
+| `backend/db_layer/chatbot_button_mappings.py` | **NEW** | Full CRUD + 1h in-memory cache for `chatbot_button_mappings`. Methods: `list()`, `get_active_maps()`, `create()`, `update()`, `delete()`. Cache key: `button_mappings:{tenant_id}`. |
+| `backend/migration_chatbot_redesign.sql` | **NEW** | Idempotent SQL migration for Phase 17 changes. Adds columns, creates tables, migrates JSONB data, sets defaults. |
+| `backend/run_migration.py` | **NEW** | Connects via `DATABASE_URL` and runs `migration_chatbot_redesign.sql` transactionally. |
+| `backend/routers/chatbot.py` | **UPDATED** | New `ButtonMappingModel` Pydantic model. 4 new button-mapping endpoints. Settings + rules models extended. AI fields disabled. |
+| `backend/routers/webhook.py` | **UPDATED** | All three chatbot decision layers now fully dynamic: DB-backed button maps, per-rule `match_type`/`response_type`, configurable fallback cooldown. |
+| `backend/db_layer/chatbot.py` | **UPDATED** | `upsert()` handles `fallback_template_name` + `fallback_cooldown_hours`. Rules `create()`/`update()` handle `response_type` + `match_type`. |
+| `backend/store.py` | **UPDATED** | Default chatbot dict updated. `save_chatbot_settings()` invalidates button mappings cache. |
+| `backend/cache.py` | **UPDATED** | `button_mappings_key()` helper exported. |
+| `frontend/src/app/dashboard/chatbot/page.tsx` | **UPDATED** | Button mappings management panel. Fallback template searchable dropdown. |
+| `frontend/src/lib/api.ts` | **UPDATED** | `chatbot.buttonMappings.list/create/update/delete()` methods added. |
+
+### 22.5 Webhook Decision Engine (Complete Flow)
+
+```
+Incoming WhatsApp message (chatbot.is_enabled = true)
+  ¦
+  +-- Layer 1: Button?Template Mappings (highest priority)
+  ¦     text_map = get_active_maps(tenant_id)    # DB query, cached 1h
+  ¦     if message_text.strip() in text_map:
+  ¦         ? enqueue template: text_map[message_text]
+  ¦         ? DONE (layers 2 & 3 skipped)
+  ¦
+  +-- Layer 2: Keyword Rules
+  ¦     rules = get_active(tenant_id)            # DB query, cached 6h, priority DESC
+  ¦     for each rule:
+  ¦         match by rule.match_type:
+  ¦           'exact'       ? msg.lower() == keyword
+  ¦           'contains'    ? keyword in msg.lower()
+  ¦           'starts_with' ? msg.lower().startswith(keyword)
+  ¦         if matched:
+  ¦           response_type == 'template' ? enqueue template
+  ¦           response_type == 'text'     ? enqueue text message
+  ¦           ? DONE (layer 3 skipped)
+  ¦
+  +-- Layer 3: Fallback Template (lowest priority)
+        fallback_tpl   = settings['fallback_template_name']
+        cooldown_hours = settings['fallback_cooldown_hours']
+        if fallback_tpl is not empty:
+            if should_send_trigger(tenant_id, phone, cooldown_hours):
+                record_trigger(tenant_id, phone)   # updates user_triggers table
+                ? enqueue template: fallback_tpl
+```
+
+### 22.6 Cache Invalidation Map
+
+| Write Operation | Caches Invalidated |
+|----------------|-------------------|
+| `PUT /api/chatbot/settings` | `chatbot_config:{tenant_id}`, `button_mappings:{tenant_id}` |
+| `POST /api/chatbot/rules` | `chatbot_rules:{tenant_id}`, `chatbot_rules_active:{tenant_id}` |
+| `PUT /api/chatbot/rules/{id}` | All `chatbot_rules:*` and `chatbot_rules_active:*` keys (prefix invalidation) |
+| `DELETE /api/chatbot/rules/{id}` | All `chatbot_rules:*` and `chatbot_rules_active:*` keys (prefix invalidation) |
+| `POST /api/chatbot/button-mappings` | `button_mappings:{tenant_id}` |
+| `PUT /api/chatbot/button-mappings/{id}` | `button_mappings:{tenant_id}` |
+| `DELETE /api/chatbot/button-mappings/{id}` | `button_mappings:{tenant_id}` |
+
+### 22.7 Migration Runbook
+
+**Fresh installation (new database):**
+```bash
+# schema.sql already includes all Phase 17 tables:
+python backend/apply_schema.py
+```
+
+**Existing deployment (upgrading from pre-Phase 17):**
+```bash
+# Step 1: Apply base schema (idempotent)
+python backend/apply_schema.py
+
+# Step 2: Run Phase 17 migration
+python backend/run_migration.py
+```
+
+The migration uses `ADD COLUMN IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`, and `ON CONFLICT DO NOTHING` throughout — safe to run multiple times.
+
+### 22.8 Developer Gotchas
+
+| Gotcha | Explanation |
+|--------|-------------|
+| **`column does not exist` on startup** | Phase 17 migration not applied. Run `python backend/run_migration.py`. |
+| **Button text is case-sensitive** | `"Book Session"` ? `"book session"`. Match the exact text WhatsApp sends in the button payload. |
+| **Button ID no longer works** | `button_id` matching was removed entirely. Only `button_text` exact match is supported. |
+| **`use_ai=true` has no effect** | AI mode is disabled. `true` is accepted but stored as `false`. |
+| **Fallback only fires once per cooldown window** | Each phone number has its own cooldown timer in `user_triggers`. One fallback per contact per N hours. |
+| **Button mappings are tenant-scoped** | Each tenant manages their own set of button?template mappings independently. |
+| **Stale button map cache after direct DB edit** | API writes invalidate the cache immediately. Direct DB edits require a server restart or waiting up to 1 hour for cache expiry. |

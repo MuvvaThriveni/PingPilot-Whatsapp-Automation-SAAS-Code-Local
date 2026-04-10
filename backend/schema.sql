@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS chatbot_config (
   use_ai BOOLEAN NOT NULL DEFAULT FALSE,
   button_text_mappings JSONB,
   button_id_mappings JSONB,
+  fallback_template_name TEXT NOT NULL DEFAULT '',
+  fallback_cooldown_hours INTEGER NOT NULL DEFAULT 24,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -38,6 +40,10 @@ CREATE TABLE IF NOT EXISTS chatbot_rules (
   tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
   keyword TEXT NOT NULL,
   response TEXT NOT NULL,
+  response_type TEXT NOT NULL DEFAULT 'text'
+    CHECK (response_type IN ('text', 'template')),
+  match_type TEXT NOT NULL DEFAULT 'contains'
+    CHECK (match_type IN ('exact', 'contains', 'starts_with')),
   priority INTEGER NOT NULL DEFAULT 0,
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -49,6 +55,63 @@ CREATE INDEX IF NOT EXISTS idx_chatbot_rules_tenant_priority
 
 CREATE INDEX IF NOT EXISTS idx_chatbot_rules_tenant_active_priority
   ON chatbot_rules (tenant_id, is_active, priority DESC);
+
+
+-- Button→template mappings (replaces hardcoded defaults in webhook.py)
+CREATE TABLE IF NOT EXISTS chatbot_button_mappings (
+  id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+  button_text TEXT NOT NULL DEFAULT '',
+  button_id TEXT NOT NULL DEFAULT '',
+  template_name TEXT NOT NULL,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  priority INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT chk_button_mapping_has_trigger
+    CHECK (button_text <> '' OR button_id <> '')
+);
+
+CREATE INDEX IF NOT EXISTS idx_button_mappings_tenant_active_text
+  ON chatbot_button_mappings (tenant_id, button_text)
+  WHERE is_active = TRUE AND button_text <> '';
+
+CREATE INDEX IF NOT EXISTS idx_button_mappings_tenant_active_id
+  ON chatbot_button_mappings (tenant_id, button_id)
+  WHERE is_active = TRUE AND button_id <> '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_button_mappings_unique_text
+  ON chatbot_button_mappings (tenant_id, button_text)
+  WHERE button_text <> '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_button_mappings_unique_id
+  ON chatbot_button_mappings (tenant_id, button_id)
+  WHERE button_id <> '';
+
+
+-- Flow builder (future-ready)
+CREATE TABLE IF NOT EXISTS chatbot_flows (
+  id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+  name TEXT NOT NULL DEFAULT 'Untitled Flow',
+  description TEXT NOT NULL DEFAULT '',
+  flow_data JSONB NOT NULL DEFAULT '{"nodes": [], "edges": [], "variables": {}}'::jsonb,
+  trigger_type TEXT NOT NULL DEFAULT 'keyword'
+    CHECK (trigger_type IN ('keyword', 'button', 'first_message', 'manual')),
+  trigger_value TEXT NOT NULL DEFAULT '',
+  is_active BOOLEAN NOT NULL DEFAULT FALSE,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_flows_tenant_active
+  ON chatbot_flows (tenant_id, is_active)
+  WHERE is_active = TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_flows_tenant_trigger
+  ON chatbot_flows (tenant_id, trigger_type, trigger_value)
+  WHERE is_active = TRUE;
 
 
 CREATE TABLE IF NOT EXISTS campaigns (

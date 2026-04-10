@@ -49,8 +49,8 @@ class _ChatbotConfig:
                     is_enabled,
                     fallback_message,
                     use_ai,
-                    button_text_mappings,
-                    button_id_mappings,
+                    fallback_template_name,
+                    fallback_cooldown_hours,
                     created_at,
                     updated_at
                 )
@@ -59,8 +59,8 @@ class _ChatbotConfig:
                     COALESCE(%s, FALSE),
                     COALESCE(%s, ''),
                     COALESCE(%s, FALSE),
-                    %s,
-                    %s,
+                    COALESCE(%s, ''),
+                    COALESCE(%s, 24),
                     now(),
                     now()
                 )
@@ -68,24 +68,25 @@ class _ChatbotConfig:
                     is_enabled = COALESCE(%s, chatbot_config.is_enabled),
                     fallback_message = COALESCE(%s, chatbot_config.fallback_message),
                     use_ai = COALESCE(%s, chatbot_config.use_ai),
-                    button_text_mappings = COALESCE(%s, chatbot_config.button_text_mappings),
-                    button_id_mappings = COALESCE(%s, chatbot_config.button_id_mappings),
+                    fallback_template_name = COALESCE(%s, chatbot_config.fallback_template_name),
+                    fallback_cooldown_hours = COALESCE(%s, chatbot_config.fallback_cooldown_hours),
                     updated_at = now()
                 """,
                 tenant_id,
                 data.get("is_enabled"),
                 data.get("fallback_message"),
                 data.get("use_ai"),
-                data.get("button_text_mappings"),
-                data.get("button_id_mappings"),
+                data.get("fallback_template_name"),
+                data.get("fallback_cooldown_hours"),
                 data.get("is_enabled"),
                 data.get("fallback_message"),
                 data.get("use_ai"),
-                data.get("button_text_mappings"),
-                data.get("button_id_mappings"),
+                data.get("fallback_template_name"),
+                data.get("fallback_cooldown_hours"),
             )
-            # Invalidate cache
+            # Invalidate chatbot_config cache and button_mappings cache
             cache.invalidate(chatbot_config_key(tenant_id))
+            cache.invalidate(f"button_mappings:{tenant_id}")
         except Exception as e:
             log_event("db_error", detail=f"chatbot_config.upsert({tenant_id}) failed: {e}", level="ERROR")
 
@@ -106,7 +107,8 @@ class _ChatbotRules:
             try:
                 rows = await fetch(
                     """
-                    SELECT id, tenant_id, keyword, response, priority, is_active, created_at, updated_at
+                    SELECT id, tenant_id, keyword, response, response_type, match_type,
+                           priority, is_active, created_at, updated_at
                     FROM chatbot_rules
                     WHERE tenant_id = %s
                     ORDER BY priority DESC, id DESC
@@ -131,14 +133,17 @@ class _ChatbotRules:
             row = await fetchrow(
                 """
                 INSERT INTO chatbot_rules (
-                    tenant_id, keyword, response, priority, is_active, created_at, updated_at
+                    tenant_id, keyword, response, response_type, match_type,
+                    priority, is_active, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, COALESCE(%s, TRUE), now(), NULL)
+                VALUES (%s, %s, %s, %s, %s, %s, COALESCE(%s, TRUE), now(), NULL)
                 RETURNING id
                 """,
                 tenant_id,
                 (rule.get("keyword") or "").strip(),
                 (rule.get("response") or ""),
+                (rule.get("response_type") or "text"),
+                (rule.get("match_type") or "contains"),
                 int(rule.get("priority") or 0),
                 (rule.get("is_active") if rule.get("is_active") is not None else True),
             )
@@ -162,6 +167,8 @@ class _ChatbotRules:
                 SET
                     keyword = COALESCE(%s, keyword),
                     response = COALESCE(%s, response),
+                    response_type = COALESCE(%s, response_type),
+                    match_type = COALESCE(%s, match_type),
                     priority = COALESCE(%s, priority),
                     is_active = COALESCE(%s, is_active),
                     updated_at = now()
@@ -169,6 +176,8 @@ class _ChatbotRules:
                 """,
                 data.get("keyword"),
                 data.get("response"),
+                data.get("response_type"),
+                data.get("match_type"),
                 data.get("priority"),
                 (True if data.get("is_active") in (True, 1, "1") else False) if data.get("is_active") is not None else None,
                 tenant_id,
@@ -201,7 +210,7 @@ class _ChatbotRules:
             try:
                 rows = await fetch(
                     """
-                    SELECT keyword, response, priority, is_active
+                    SELECT keyword, response, response_type, match_type, priority, is_active
                     FROM chatbot_rules
                     WHERE tenant_id = %s AND is_active = TRUE
                     ORDER BY priority DESC, id DESC
