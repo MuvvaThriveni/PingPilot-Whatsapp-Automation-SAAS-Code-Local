@@ -27,11 +27,14 @@ class UsersDB:
     def _cache_key(self, tenant_id: str, phone_number: str) -> str:
         return f"user_trigger:{tenant_id}:{phone_number}"
 
-    async def should_send_trigger(self, tenant_id: str, phone_number: str) -> bool:
-        """Check if we should send a trigger (once every 24 hours).
+    async def should_send_trigger(self, tenant_id: str, phone_number: str, *, cooldown_hours: int = 24) -> bool:
+        """Check if we should send a trigger (once every N hours, default 24).
 
         Priority: in-memory cache → database → default True.
+        The cooldown_hours parameter is read from chatbot_config.fallback_cooldown_hours.
         """
+        cooldown_seconds = cooldown_hours * 3600
+
         # 1. Check in-memory cache first (fastest path)
         cache_key = self._cache_key(tenant_id, phone_number)
         cached = cache.get(cache_key)
@@ -39,7 +42,7 @@ class UsersDB:
             try:
                 last_dt = parse_iso_to_ist(cached)
                 diff = _ist_now() - last_dt
-                return diff.total_seconds() > 24 * 3600
+                return diff.total_seconds() > cooldown_seconds
             except (ValueError, TypeError) as e:
                 log_event("trigger_check_error", detail=f"cache parse: {e}", level="WARN")
                 return True
@@ -57,9 +60,9 @@ class UsersDB:
             )
             if row and row.get("last_trigger_at"):
                 last_dt = row["last_trigger_at"].astimezone(get_ist_now().tzinfo)
-                cache.set(cache_key, last_dt.isoformat(), ttl=3600.0 * 25)
+                cache.set(cache_key, last_dt.isoformat(), ttl=3600.0 * (cooldown_hours + 1))
                 diff = _ist_now() - last_dt
-                return diff.total_seconds() > 24 * 3600
+                return diff.total_seconds() > cooldown_seconds
         except Exception as e:
             log_event("trigger_check_error", detail=f"postgres: {e}", level="WARN")
 

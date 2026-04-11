@@ -38,6 +38,7 @@ from db_layer.campaign_counters import campaign_counters as _db_counters
 from database import transaction
 from services.queue_manager import enqueue_message
 from cache import cache, chat_users_key
+from db_layer.chatbot import chatbot_config as _db_chatbot_config
 
 router = APIRouter(prefix="/api/webhook", tags=["webhook"])
 
@@ -152,50 +153,17 @@ def _verify_per_tenant_signature(
     return hmac.compare_digest(computed_sig, expected_sig)
 
 
-# ── Default button→template mappings (configurable per tenant in DB) ──
-_DEFAULT_BUTTON_MAPPINGS = {
-    "Sessions": "session_template",
-    "Products": "products_template",
-    "Morning": "aruna_yoga",
-    "Afternoon": "afternoon_meet",
-    "Evening": "meet3",
-}
-_DEFAULT_BUTTON_ID_MAPPINGS = {
-    "morning_session": "aruna_yoga",
-    "afternoon_session": "afternoon_meet",
-    "evening_session": "meet3",
-}
+# ── Per-tenant button→template mappings (fully dynamic, no hardcoded defaults)
+from db_layer.chatbot_button_mappings import button_mappings as _db_button_mappings
 
 
-async def _get_button_mappings(tenant_id: str) -> tuple[dict, dict]:
-    """Get per-tenant button→template mappings from DB (cached).
+async def _get_button_mappings(tenant_id: str) -> dict:
+    """Get per-tenant button→template text_map from DB (cached).
 
-    Falls back to defaults if the tenant hasn't configured custom mappings.
+    Returns empty dict when no mappings are configured.
+    NO hardcoded defaults — fully tenant-specific.
     """
-    cache_key = f"button_mappings:{tenant_id}"
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    text_map = dict(_DEFAULT_BUTTON_MAPPINGS)
-    id_map = dict(_DEFAULT_BUTTON_ID_MAPPINGS)
-
-    try:
-        from db_layer.chatbot import chatbot_config as _db_chatbot_config
-        cfg = await _db_chatbot_config.get(tenant_id)
-        if cfg:
-            custom_text = cfg.get("button_text_mappings")
-            custom_id = cfg.get("button_id_mappings")
-            if custom_text and isinstance(custom_text, dict):
-                text_map = custom_text
-            if custom_id and isinstance(custom_id, dict):
-                id_map = custom_id
-    except Exception:
-        pass  # Use defaults on error
-
-    result = (text_map, id_map)
-    cache.set(cache_key, result, ttl=3600.0)  # Cache for 1 hour
-    return result
+    return await _db_button_mappings.get_active_maps(tenant_id)
 
 
 # ── GET: Webhook verification ────────────────────────────────────────
@@ -402,7 +370,6 @@ async def _process_webhook_body(body: dict, tenant_id_override: str | None = Non
 
                 message_type = message.get("type", "text")
                 message_text = ""
-                interactive_button_id = ""
 
                 if message_type == "text":
                     message_text = message.get("text", {}).get("body", "").strip()
@@ -415,7 +382,6 @@ async def _process_webhook_body(body: dict, tenant_id_override: str | None = Non
                     if interactive.get("type") == "button_reply":
                         button_reply_data = interactive.get("button_reply", {})
                         message_text = button_reply_data.get("title", "").strip()
-                        interactive_button_id = button_reply_data.get("id", "").strip()
 
                 now = _ist_now()
 
@@ -471,45 +437,54 @@ async def _process_webhook_body(body: dict, tenant_id_override: str | None = Non
                 matched_rule = False
 
                 if chatbot["is_enabled"]:
-                    # 1. Configurable button→template mappings (per-tenant)
-                    clean_text = message_text.strip()
-                    text_map, id_map = await _get_button_mappings(tenant_id)
-
+                    # 1. Configurable button→template mappings (per-tenant, DB-only)
                     if not matched_rule:
-                        # Check text-based button match
+                        text_map = await _get_button_mappings(tenant_id)
+                        clean_text = message_text.strip()
                         if clean_text in text_map:
                             response_template = text_map[clean_text]
                             matched_rule = True
                             log_event("button_match", tenant_id=tenant_id, phone=sender_phone,
                                       status="matched", detail=f"text={clean_text!r} → {response_template}")
 
-                        # Check button ID match
-                        elif interactive_button_id and interactive_button_id in id_map:
-                            response_template = id_map[interactive_button_id]
-                            matched_rule = True
-                            log_event("button_id_match", tenant_id=tenant_id, phone=sender_phone,
-                                      status="matched", detail=f"id={interactive_button_id!r} → {response_template}")
-
-                    # 2. Existing Chatbot Rules (DB-based)
+                    # 2. Chatbot Rules — keyword matching (DB-based, text + template)
                     if not matched_rule:
                         rules = await _db_chatbot_rules.get_active(tenant_id)
                         message_lower = message_text.lower().strip()
                         for rule in rules:
                             keyword = rule.get("keyword", "").strip().lower()
-                            if keyword and keyword in message_lower:
-                                response_text = rule.get("response", "")
-                                if response_text:
+                            match_type = rule.get("match_type", "contains")
+                            matched = False
+                            if keyword:
+                                if match_type == "exact" and message_lower == keyword:
+                                    matched = True
+                                elif match_type == "starts_with" and message_lower.startswith(keyword):
+                                    matched = True
+                                elif match_type == "contains" and keyword in message_lower:
+                                    matched = True
+
+                            if matched:
+                                resp_type = rule.get("response_type", "text")
+                                resp_value = rule.get("response", "")
+                                if resp_value:
+                                    if resp_type == "template":
+                                        response_template = resp_value
+                                    else:
+                                        response_text = resp_value
                                     matched_rule = True
                                     break
 
-                    # 3. Fallback Trigger (First Trigger) - Rate limited to once every 24 hours
+                    # 3. Fallback Trigger — per-tenant template + configurable cooldown
                     if not matched_rule:
-                        if await users_db.should_send_trigger(tenant_id, sender_phone):
-                            await users_db.record_trigger(tenant_id, sender_phone)
-                            response_template = "first_trigger"
-                            matched_rule = True
-                            log_event("fallback_trigger", tenant_id=tenant_id, phone=sender_phone,
-                                      detail="first_trigger sent (24h lock)")
+                        fallback_tpl = chatbot.get("fallback_template_name", "")
+                        if fallback_tpl:
+                            cooldown_hours = int(chatbot.get("fallback_cooldown_hours", 24))
+                            if await users_db.should_send_trigger(tenant_id, sender_phone, cooldown_hours=cooldown_hours):
+                                await users_db.record_trigger(tenant_id, sender_phone)
+                                response_template = fallback_tpl
+                                matched_rule = True
+                                log_event("fallback_trigger", tenant_id=tenant_id, phone=sender_phone,
+                                          detail=f"{fallback_tpl} sent ({cooldown_hours}h lock)")
                 else:
                     log_event("chatbot_disabled", tenant_id=tenant_id, phone=sender_phone,
                               detail="chatbot is_enabled=False — skipping all auto-reply logic")

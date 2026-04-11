@@ -120,6 +120,9 @@ def chatbot_rules_key(tenant_id: str) -> str:
 def chatbot_active_rules_key(tenant_id: str) -> str:
     return f"chatbot_rules_active:{tenant_id}"
 
+def button_mappings_key(tenant_id: str) -> str:
+    return f"button_mappings:{tenant_id}"
+
 def chat_users_key(tenant_id: str) -> str:
     return f"chat_users:{tenant_id}"
 

@@ -21,7 +21,7 @@ from db_layer.secrets import secrets as _secrets
 from db_layer.encryption import encrypt_secret
 
 # Cache layer
-from cache import cache, fetch_cached_async, tenant_key, chatbot_config_key, chatbot_rules_key, settings_key
+from cache import cache, fetch_cached_async, tenant_key, chatbot_config_key, settings_key, button_mappings_key
 from observability import log_event
 
 
@@ -38,6 +38,8 @@ _DEFAULT_CHATBOT: Dict = {
     "is_enabled": False,
     "fallback_message": "Thank you for your message. Our team will get back to you soon.",
     "use_ai": False,
+    "fallback_template_name": "",
+    "fallback_cooldown_hours": 24,
 }
 
 
@@ -75,6 +77,8 @@ async def get_chatbot_settings(tenant_id: str) -> Dict:
                 "is_enabled": cfg.get("is_enabled", False),
                 "fallback_message": cfg.get("fallback_message", _DEFAULT_CHATBOT["fallback_message"]),
                 "use_ai": False,
+                "fallback_template_name": cfg.get("fallback_template_name", ""),
+                "fallback_cooldown_hours": int(cfg.get("fallback_cooldown_hours", 24)),
             }
         return dict(_DEFAULT_CHATBOT)
 
@@ -82,11 +86,8 @@ async def get_chatbot_settings(tenant_id: str) -> Dict:
 
 
 async def get_chatbot_rules(tenant_id: str) -> list:
-    """Read chatbot rules for a specific tenant. Cached for 6 hours."""
-    return await fetch_cached_async(
-        chatbot_rules_key(tenant_id),
-        lambda: _db_chatbot_rules.list(tenant_id),
-    )
+    """Read chatbot rules for a specific tenant. Delegated to db_layer which handles caching."""
+    return await _db_chatbot_rules.list(tenant_id)
 
 
 # ── Write functions (DB via db_layer, invalidate cache) ──
@@ -146,11 +147,14 @@ async def save_chatbot_settings(tenant_id: str, chatbot_data: Dict):
         "is_enabled": chatbot_data.get("is_enabled", False),
         "fallback_message": chatbot_data.get("fallback_message", ""),
         "use_ai": False,
+        "fallback_template_name": chatbot_data.get("fallback_template_name", ""),
+        "fallback_cooldown_hours": int(chatbot_data.get("fallback_cooldown_hours", 24)),
     }
 
     await _db_chatbot_config.upsert(tenant_id, upsert_data)
-    # Invalidate cache
+    # Invalidate all related caches
     cache.invalidate(chatbot_config_key(tenant_id))
+    cache.invalidate(button_mappings_key(tenant_id))
     log_event("chatbot_settings_saved", tenant_id=tenant_id)
 
 

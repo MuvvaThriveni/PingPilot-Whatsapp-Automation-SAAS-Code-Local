@@ -110,19 +110,50 @@ export const chatbot = {
   updateSettings: (data: { 
     is_enabled: boolean; 
     fallback_message: string;
+    fallback_template_name?: string;
+    fallback_cooldown_hours?: number;
     use_ai?: boolean;
     ai_system_prompt?: string;
     openai_api_key?: string;
   }) => api.put('/chatbot/settings', data),
   getRules: () => api.get('/chatbot/rules'),
-  createRule: (data: { keyword: string; response: string; priority?: number }) =>
-    api.post('/chatbot/rules', data),
-  updateRule: (id: number, data: { keyword?: string; response?: string; is_active?: boolean; priority?: number }) =>
-    api.put(`/chatbot/rules/${id}`, data),
+  createRule: (data: {
+    keyword: string;
+    response: string;
+    response_type?: string;
+    match_type?: string;
+    priority?: number;
+  }) => api.post('/chatbot/rules', data),
+  updateRule: (id: number, data: {
+    keyword?: string;
+    response?: string;
+    response_type?: string;
+    match_type?: string;
+    is_active?: boolean;
+    priority?: number;
+  }) => api.put(`/chatbot/rules/${id}`, data),
   deleteRule: (id: number) => api.delete(`/chatbot/rules/${id}`),
   getConversations: () => api.get('/chatbot/conversations'),
   getUsers: () => api.get('/chatbot/users'),
   getUserConversations: (phone: string) => api.get(`/chatbot/conversations/${phone}`),
+
+  // Button Mappings (Phase-8)
+  getButtonMappings: () => api.get('/chatbot/button-mappings'),
+  createButtonMapping: (data: {
+    button_text?: string;
+    button_id?: string;
+    template_name: string;
+    is_active?: boolean;
+    priority?: number;
+  }) => api.post('/chatbot/button-mappings', data),
+  updateButtonMapping: (id: number, data: {
+    button_text?: string;
+    button_id?: string;
+    template_name?: string;
+    is_active?: boolean;
+    priority?: number;
+  }) => api.put(`/chatbot/button-mappings/${id}`, data),
+  deleteButtonMapping: (id: number) => api.delete(`/chatbot/button-mappings/${id}`),
 };
 
 export const logs = {

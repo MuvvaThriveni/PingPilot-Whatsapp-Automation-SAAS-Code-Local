@@ -444,10 +444,10 @@ class _Messages:
                 month_start_date_str = month_start_ist.strftime("%Y-%m-%d")
 
                 # Today: always from live table (today is never archived)
+                # total = successful + failed only (excludes intermediate statuses like 'submitted')
                 today_row = await fetchrow(
                     """
                     SELECT
-                      COUNT(*) AS total,
                       COUNT(*) FILTER (WHERE status IN ('sent','delivered','read')) AS successful,
                       COUNT(*) FILTER (WHERE status = 'failed') AS failed
                     FROM messages
@@ -479,10 +479,10 @@ class _Messages:
 
                 # Part B: live messages table for all data from month start
                 # (includes today + any days not yet aggregated)
+                # total = successful + failed only (excludes intermediate statuses like 'submitted')
                 live_month_row = await fetchrow(
                     """
                     SELECT
-                      COUNT(*) AS total,
                       COUNT(*) FILTER (WHERE status IN ('sent','delivered','read')) AS successful,
                       COUNT(*) FILTER (WHERE status = 'failed') AS failed
                     FROM messages
@@ -494,24 +494,29 @@ class _Messages:
 
                 # Combine: agg covers archived days, live covers remaining days.
                 # Before archiving starts, agg is 0 and live has everything — identical to original.
-                agg_total = int((agg_row or {}).get("total") or 0)
+                # Note: total is derived as successful + failed (terminal states only).
                 agg_successful = int((agg_row or {}).get("successful") or 0)
                 agg_failed = int((agg_row or {}).get("failed") or 0)
 
-                live_total = int((live_month_row or {}).get("total") or 0)
                 live_successful = int((live_month_row or {}).get("successful") or 0)
                 live_failed = int((live_month_row or {}).get("failed") or 0)
 
+                today_successful = int((today_row or {}).get("successful") or 0)
+                today_failed = int((today_row or {}).get("failed") or 0)
+
+                month_successful = agg_successful + live_successful
+                month_failed = agg_failed + live_failed
+
                 return {
                     "today": {
-                        "total": int((today_row or {}).get("total") or 0),
-                        "successful": int((today_row or {}).get("successful") or 0),
-                        "failed": int((today_row or {}).get("failed") or 0),
+                        "total": today_successful + today_failed,
+                        "successful": today_successful,
+                        "failed": today_failed,
                     },
                     "month": {
-                        "total": agg_total + live_total,
-                        "successful": agg_successful + live_successful,
-                        "failed": agg_failed + live_failed,
+                        "total": month_successful + month_failed,
+                        "successful": month_successful,
+                        "failed": month_failed,
                     },
                     "byProduct": [],
                 }

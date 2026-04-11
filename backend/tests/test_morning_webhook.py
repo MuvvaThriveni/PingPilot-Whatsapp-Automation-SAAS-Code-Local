@@ -1,9 +1,14 @@
 """
-Tests for Morning / Evening interactive button_reply → template flow.
+Tests for the dynamic button→template routing system (Phase-8).
 
-Covers:
-  - Morning button_reply → aruna_yoga template (including IMAGE header pipeline)
-  - Evening button_reply → meet3 template    (including IMAGE header pipeline)
+The routing logic is now FULLY DB-driven via chatbot_button_mappings.
+These tests verify:
+  - Interactive button_reply payloads are correctly parsed
+  - The routing engine correctly matches text/id against DB mappings
+  - Template dispatch works with mocked WhatsAppService
+  - Keyword rules support text + template response types
+  - Keyword match_type (exact/contains/starts_with) works correctly
+  - Deduplication via wa_message_id still works
 
 Run with:
     cd backend
@@ -123,83 +128,208 @@ class TestInteractiveButtonParsing:
 
 
 # ---------------------------------------------------------------------------
-# Unit tests: routing logic (no DB/network)
+# Unit tests: DB-driven routing logic (no actual DB – uses dict lookups)
 # ---------------------------------------------------------------------------
 
 
-class TestRoutingLogic:
-    """Verify the if/elif routing logic selects the correct response."""
+def _route_with_mappings(
+    clean_text: str,
+    interactive_button_id: str = "",
+    text_map: dict | None = None,
+    id_map: dict | None = None,
+    rules: list[dict] | None = None,
+) -> tuple[str, str]:
+    """Mirrors the Phase-8 routing block in webhook.py.
 
-    def _route(self, clean_text: str, interactive_button_id: str = "") -> tuple[str, str]:
-        """Mirrors the routing block in webhook.py. Returns (response_text, response_template)."""
-        response_text = ""
-        response_template = ""
-        matched_rule = False
+    Uses in-memory dicts instead of DB calls, exactly matching the
+    webhook decision engine:
+      1. Button text map lookup
+      2. Button ID map lookup
+      3. Keyword rules with match_type + response_type
+    """
+    text_map = text_map or {}
+    id_map = id_map or {}
+    rules = rules or []
 
-        if not matched_rule:
-            if clean_text == "Sessions":
-                response_template = "session_template"
-                matched_rule = True
-            elif clean_text == "Products":
-                response_template = "products_template"
-                matched_rule = True
-            elif clean_text == "Morning" or interactive_button_id == "morning_session":
-                response_template = "aruna_yoga"
-                matched_rule = True
-            elif clean_text == "Afternoon":
-                response_text = "🧘 Our 7:30 AM Yoga plan focuses on flexibility and core strength, perfect for mid-morning refreshment."
-                matched_rule = True
-            elif clean_text == "Evening" or interactive_button_id == "evening_session":
-                response_template = "meet3"
-                matched_rule = True
+    response_text = ""
+    response_template = ""
+    matched_rule = False
 
-        return response_text, response_template
+    # 1. Button text map
+    if not matched_rule and clean_text in text_map:
+        response_template = text_map[clean_text]
+        matched_rule = True
 
-    # -- Morning --
+    # 2. Button ID map
+    if not matched_rule and interactive_button_id and interactive_button_id in id_map:
+        response_template = id_map[interactive_button_id]
+        matched_rule = True
 
-    def test_morning_title_sends_aruna_yoga_template(self):
-        text, tpl = self._route("Morning", "morning_session")
+    # 3. Keyword rules with match_type + response_type
+    if not matched_rule:
+        message_lower = clean_text.lower().strip()
+        for rule in rules:
+            keyword = rule.get("keyword", "").strip().lower()
+            match_type = rule.get("match_type", "contains")
+            matched = False
+            if keyword:
+                if match_type == "exact" and message_lower == keyword:
+                    matched = True
+                elif match_type == "starts_with" and message_lower.startswith(keyword):
+                    matched = True
+                elif match_type == "contains" and keyword in message_lower:
+                    matched = True
+
+            if matched:
+                resp_type = rule.get("response_type", "text")
+                resp_value = rule.get("response", "")
+                if resp_value:
+                    if resp_type == "template":
+                        response_template = resp_value
+                    else:
+                        response_text = resp_value
+                    matched_rule = True
+                    break
+
+    return response_text, response_template
+
+
+# Sample tenant button mappings (what a yoga studio would configure in their DB)
+_YOGA_TEXT_MAP = {
+    "Sessions": "session_template",
+    "Products": "products_template",
+    "Morning": "aruna_yoga",
+    "Afternoon": "afternoon_meet",
+    "Evening": "meet3",
+}
+_YOGA_ID_MAP = {
+    "morning_session": "aruna_yoga",
+    "afternoon_session": "afternoon_meet",
+    "evening_session": "meet3",
+}
+
+# Sample tenant keyword rules
+_SAMPLE_RULES = [
+    {"keyword": "pricing", "response": "Our plans start at ₹999/month", "response_type": "text", "match_type": "contains"},
+    {"keyword": "catalog", "response": "product_catalog", "response_type": "template", "match_type": "exact"},
+    {"keyword": "hello", "response": "welcome_template", "response_type": "template", "match_type": "starts_with"},
+]
+
+
+class TestDynamicRoutingLogic:
+    """Verify the DB-driven routing engine selects the correct response."""
+
+    # -- Button text matches --
+
+    def test_morning_text_routes_to_template(self):
+        text, tpl = _route_with_mappings("Morning", "", _YOGA_TEXT_MAP, _YOGA_ID_MAP)
         assert tpl == "aruna_yoga"
         assert text == ""
 
-    def test_morning_id_only_sends_aruna_yoga_template(self):
-        """button_id fallback: title may be empty if Meta sends only ID."""
-        text, tpl = self._route("", "morning_session")
-        assert tpl == "aruna_yoga"
-        assert text == ""
-
-    def test_morning_case_sensitive(self):
-        """'morning' (lowercase) should NOT trigger aruna_yoga."""
-        text, tpl = self._route("morning", "")
-        assert tpl != "aruna_yoga"
-
-    # -- Afternoon / Evening isolation --
-
-    def test_afternoon_sends_text_not_template(self):
-        text, tpl = self._route("Afternoon", "afternoon_session")
-        assert tpl == ""
-        assert "7:30 AM" in text
-
-    def test_evening_sends_meet3_template(self):
-        """Evening now routes to template=meet3 (not plain text)."""
-        text, tpl = self._route("Evening", "evening_session")
+    def test_evening_text_routes_to_template(self):
+        text, tpl = _route_with_mappings("Evening", "", _YOGA_TEXT_MAP, _YOGA_ID_MAP)
         assert tpl == "meet3"
         assert text == ""
 
-    # -- Sessions / Products --
-
-    def test_sessions_sends_session_template(self):
-        _, tpl = self._route("Sessions")
+    def test_sessions_text_routes_to_template(self):
+        _, tpl = _route_with_mappings("Sessions", "", _YOGA_TEXT_MAP, _YOGA_ID_MAP)
         assert tpl == "session_template"
 
-    def test_products_sends_products_template(self):
-        _, tpl = self._route("Products")
+    def test_products_text_routes_to_template(self):
+        _, tpl = _route_with_mappings("Products", "", _YOGA_TEXT_MAP, _YOGA_ID_MAP)
         assert tpl == "products_template"
 
-    # -- No match --
+    # -- Button ID fallback matches --
 
-    def test_unknown_message_no_match(self):
-        text, tpl = self._route("hello world", "")
+    def test_morning_id_only_routes_to_template(self):
+        """button_id fallback: title may be empty if Meta sends only ID."""
+        text, tpl = _route_with_mappings("", "morning_session", _YOGA_TEXT_MAP, _YOGA_ID_MAP)
+        assert tpl == "aruna_yoga"
+        assert text == ""
+
+    def test_evening_id_only_routes_to_template(self):
+        text, tpl = _route_with_mappings("", "evening_session", _YOGA_TEXT_MAP, _YOGA_ID_MAP)
+        assert tpl == "meet3"
+        assert text == ""
+
+    # -- Empty tenant (no mappings configured) --
+
+    def test_no_mappings_returns_empty(self):
+        """A tenant with no button mappings should get NO response (not yoga defaults)."""
+        text, tpl = _route_with_mappings("Morning", "morning_session", {}, {})
+        assert tpl == ""
+        assert text == ""
+
+    def test_unknown_button_returns_empty(self):
+        text, tpl = _route_with_mappings("CustomButton", "custom_id", _YOGA_TEXT_MAP, _YOGA_ID_MAP)
+        assert text == "" and tpl == ""
+
+    # -- Case sensitivity --
+
+    def test_button_text_is_case_sensitive(self):
+        """'morning' (lowercase) should NOT match 'Morning' in text_map."""
+        text, tpl = _route_with_mappings("morning", "", _YOGA_TEXT_MAP, _YOGA_ID_MAP)
+        assert tpl != "aruna_yoga"
+
+    def test_button_id_is_case_sensitive(self):
+        """'Morning_Session' should NOT match 'morning_session' in id_map."""
+        text, tpl = _route_with_mappings("", "Morning_Session", _YOGA_TEXT_MAP, _YOGA_ID_MAP)
+        assert tpl == ""
+
+
+class TestKeywordRuleRouting:
+    """Verify keyword rules with response_type and match_type."""
+
+    def test_contains_match(self):
+        """'pricing' keyword with 'contains' should match 'what is your pricing plan'."""
+        text, tpl = _route_with_mappings("what is your pricing plan", "", {}, {}, _SAMPLE_RULES)
+        assert text == "Our plans start at ₹999/month"
+        assert tpl == ""
+
+    def test_exact_match_succeeds(self):
+        """'catalog' with 'exact' should match exactly 'catalog'."""
+        text, tpl = _route_with_mappings("catalog", "", {}, {}, _SAMPLE_RULES)
+        assert tpl == "product_catalog"
+        assert text == ""
+
+    def test_exact_match_fails_on_partial(self):
+        """'catalog' with 'exact' should NOT match 'show me catalog please'."""
+        text, tpl = _route_with_mappings("show me catalog please", "", {}, {}, _SAMPLE_RULES)
+        # 'catalog' rule is exact, so it won't match — no other rule matches either
+        assert tpl == ""
+        assert text == ""
+
+    def test_starts_with_match(self):
+        """'hello' with 'starts_with' should match 'hello there'."""
+        text, tpl = _route_with_mappings("hello there", "", {}, {}, _SAMPLE_RULES)
+        assert tpl == "welcome_template"
+
+    def test_starts_with_fails_on_middle(self):
+        """'hello' with 'starts_with' should NOT match 'say hello'."""
+        text, tpl = _route_with_mappings("say hello", "", {}, {}, _SAMPLE_RULES)
+        assert tpl == ""
+
+    def test_template_response_type(self):
+        """Rules with response_type='template' should set response_template, not response_text."""
+        text, tpl = _route_with_mappings("catalog", "", {}, {}, _SAMPLE_RULES)
+        assert tpl == "product_catalog"
+        assert text == ""
+
+    def test_text_response_type(self):
+        """Rules with response_type='text' should set response_text, not response_template."""
+        text, tpl = _route_with_mappings("pricing info", "", {}, {}, _SAMPLE_RULES)
+        assert text == "Our plans start at ₹999/month"
+        assert tpl == ""
+
+    def test_button_mapping_takes_priority_over_rules(self):
+        """If both text_map match and rule match, text_map wins (priority 1)."""
+        rules = [{"keyword": "morning", "response": "text_reply", "response_type": "text", "match_type": "contains"}]
+        text, tpl = _route_with_mappings("Morning", "", _YOGA_TEXT_MAP, _YOGA_ID_MAP, rules)
+        assert tpl == "aruna_yoga"
+        assert text == ""
+
+    def test_no_rules_returns_empty(self):
+        text, tpl = _route_with_mappings("random message", "", {}, {}, [])
         assert text == "" and tpl == ""
 
 
@@ -209,17 +339,18 @@ class TestRoutingLogic:
 
 
 class TestMockTemplateCall:
-    """Verify send_template_message is called with correct args for Morning."""
+    """Verify send_template_message is called with correct args."""
 
     @pytest.mark.asyncio
-    async def test_aruna_yoga_called_with_correct_params(self):
-        """Mock WhatsAppService and confirm aruna_yoga is dispatched."""
+    async def test_template_called_with_correct_params(self):
+        """Mock WhatsAppService and confirm template dispatch works."""
         mock_wa = MagicMock()
         mock_wa.send_template_message = AsyncMock(
             return_value={"success": True, "messageId": "fake-msg-id"}
         )
 
         sender_phone = "919876543210"
+        # Simulate: tenant has "Morning" → "aruna_yoga" in their button mappings
         response_template = "aruna_yoga"
         language = "en"
 
@@ -254,7 +385,7 @@ class TestMockTemplateCall:
 
 
 class TestDeduplication:
-    """Ensure the same wa_message_id cannot trigger Morning twice."""
+    """Ensure the same wa_message_id cannot trigger a button response twice."""
 
     def test_same_event_id_deduplicated(self):
         """Simulate the webhook_events.exists() guard."""
@@ -277,50 +408,20 @@ class TestDeduplication:
 
 
 # ---------------------------------------------------------------------------
-# Evening Session tests
+# Template pipeline test: IMAGE header handling
 # ---------------------------------------------------------------------------
 
 
-class TestEveningTemplate:
-    """Verify Evening button click sends the meet3 template via the shared pipeline."""
-
-    # -- Routing --
-
-    def test_evening_title_routes_to_meet3(self):
-        text, tpl = _route_mirror("Evening", "")
-        assert tpl == "meet3"
-        assert text == ""
-
-    def test_evening_id_fallback_routes_to_meet3(self):
-        """button_id alone (without title) must still trigger meet3."""
-        text, tpl = _route_mirror("", "evening_session")
-        assert tpl == "meet3"
-        assert text == ""
-
-    def test_evening_case_sensitive(self):
-        """'evening' (lowercase) must NOT trigger meet3."""
-        text, tpl = _route_mirror("evening", "")
-        assert tpl != "meet3"
-
-    # -- Payload extraction --
-
-    def test_extracts_evening_button_title(self):
-        payload = _make_interactive_payload(button_title="Evening", button_id="evening_session")
-        message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
-        interactive = message.get("interactive", {})
-        button_reply = interactive.get("button_reply", {})
-        assert button_reply.get("title") == "Evening"
-        assert button_reply.get("id") == "evening_session"
-
-    # -- Mocked WhatsApp template pipeline --
+class TestTemplateImageHeader:
+    """Verify that templates with IMAGE headers are built correctly."""
 
     @pytest.mark.asyncio
-    async def test_meet3_called_with_image_header(self):
-        """When meet3 has IMAGE header, components must include image with media id."""
+    async def test_template_with_image_header(self):
+        """When template has IMAGE header, components must include image with media id."""
         import services.template_builder as tb
 
-        # Seed cache with a meet3 IMAGE-header template
-        meet3_comps = [
+        # Seed cache with a template that has an IMAGE header
+        test_comps = [
             {
                 "type": "HEADER",
                 "format": "IMAGE",
@@ -328,16 +429,16 @@ class TestEveningTemplate:
             },
             {
                 "type": "BODY",
-                "text": "Hello {{1}}, join us for the evening session.",
+                "text": "Hello {{1}}, join us for the session.",
                 "example": {"body_text": [["Friend"]]},
             },
         ]
-        tb._template_components["meet3|en_US"] = meet3_comps
+        tb._template_components["test_template|en_US"] = test_comps
 
         components = tb.build_components(
-            "meet3|en_US",
+            "test_template|en_US",
             contact={"name": "Ravi", "phone": "919876543210"},
-            header_media_id="EVENING_MEDIA_ID",
+            header_media_id="TEST_MEDIA_ID",
         )
 
         # Header component must carry IMAGE with the supplied media id
@@ -345,7 +446,7 @@ class TestEveningTemplate:
         assert header is not None, "Expected a header component"
         assert header["parameters"][0] == {
             "type": "image",
-            "image": {"id": "EVENING_MEDIA_ID"},
+            "image": {"id": "TEST_MEDIA_ID"},
         }
 
         # Body must use contact name for {{1}}
@@ -354,86 +455,34 @@ class TestEveningTemplate:
         assert body["parameters"][0]["text"] == "Ravi"
 
         # Clean up
-        tb._template_components.pop("meet3|en_US", None)
+        tb._template_components.pop("test_template|en_US", None)
 
-    @pytest.mark.asyncio
-    async def test_meet3_send_template_called_correctly(self):
-        """Mock WhatsAppService and confirm meet3 is dispatched with correct args."""
-        mock_wa = MagicMock()
-        mock_wa.send_template_message = AsyncMock(
-            return_value={"success": True, "messageId": "evening-msg-id"}
-        )
 
-        sender_phone = "919876543210"
-        result = await mock_wa.send_template_message(
-            sender_phone, "meet3", language="en_US", components=[
-                {"type": "header", "parameters": [{"type": "image", "image": {"id": "MID"}}]},
-                {"type": "body", "parameters": [{"type": "text", "text": "Ravi"}]},
-            ]
-        )
+# ---------------------------------------------------------------------------
+# Tenant isolation test
+# ---------------------------------------------------------------------------
 
-        mock_wa.send_template_message.assert_called_once()
-        call_args = mock_wa.send_template_message.call_args
-        assert call_args.args[1] == "meet3"
-        assert call_args.kwargs["language"] == "en_US"
-        comps = call_args.kwargs["components"]
-        assert any(c["type"] == "header" for c in comps)
-        assert result["success"] is True
-        assert result["messageId"] == "evening-msg-id"
 
-    @pytest.mark.asyncio
-    async def test_api_failure_handled_for_meet3(self):
-        """If Meta API returns failure for meet3, result dict contains error."""
-        mock_wa = MagicMock()
-        mock_wa.send_template_message = AsyncMock(
-            return_value={"success": False, "error": "Template not approved"}
-        )
+class TestTenantIsolation:
+    """Verify that different tenants get different routing results."""
 
-        result = await mock_wa.send_template_message(
-            "919876543210", "meet3", language="en_US", components=None
-        )
-        assert result["success"] is False
-        assert "Template not approved" in result["error"]
+    def test_different_tenants_different_mappings(self):
+        """Two tenants with different mappings should get different results."""
+        # Tenant A: yoga studio
+        tenant_a_text_map = {"Morning": "aruna_yoga"}
+        text_a, tpl_a = _route_with_mappings("Morning", "", tenant_a_text_map)
+        assert tpl_a == "aruna_yoga"
 
-    # -- Morning isolation: ensure Morning tests still pass --
+        # Tenant B: restaurant
+        tenant_b_text_map = {"Morning": "breakfast_menu"}
+        text_b, tpl_b = _route_with_mappings("Morning", "", tenant_b_text_map)
+        assert tpl_b == "breakfast_menu"
 
-    def test_morning_unaffected_by_evening_change(self):
-        """Morning must still route to aruna_yoga after the Evening change."""
-        text, tpl = _route_mirror("Morning", "morning_session")
-        assert tpl == "aruna_yoga"
+        # They must NOT be the same
+        assert tpl_a != tpl_b
+
+    def test_unconfigured_tenant_gets_nothing(self):
+        """A tenant with NO mappings must not inherit another tenant's config."""
+        text, tpl = _route_with_mappings("Morning", "morning_session", {}, {})
+        assert tpl == ""
         assert text == ""
-
-    def test_morning_id_fallback_unaffected(self):
-        text, tpl = _route_mirror("", "morning_session")
-        assert tpl == "aruna_yoga"
-
-
-# ---------------------------------------------------------------------------
-# Shared routing mirror (used by multiple test classes above)
-# ---------------------------------------------------------------------------
-
-
-def _route_mirror(clean_text: str, interactive_button_id: str = "") -> tuple[str, str]:
-    """Exact mirror of the webhook.py routing block (including Evening → meet3)."""
-    response_text = ""
-    response_template = ""
-    matched_rule = False
-
-    if not matched_rule:
-        if clean_text == "Sessions":
-            response_template = "session_template"
-            matched_rule = True
-        elif clean_text == "Products":
-            response_template = "products_template"
-            matched_rule = True
-        elif clean_text == "Morning" or interactive_button_id == "morning_session":
-            response_template = "aruna_yoga"
-            matched_rule = True
-        elif clean_text == "Afternoon":
-            response_text = "🧘 Our 7:30 AM Yoga plan focuses on flexibility and core strength, perfect for mid-morning refreshment."
-            matched_rule = True
-        elif clean_text == "Evening" or interactive_button_id == "evening_session":
-            response_template = "meet3"
-            matched_rule = True
-
-    return response_text, response_template

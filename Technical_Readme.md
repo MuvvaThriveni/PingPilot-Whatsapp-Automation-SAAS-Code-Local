@@ -1,6 +1,6 @@
 # WappFlow — Technical Architecture & System Summary
 
-> **Version:** 3.0.0 | **Last Updated:** 2026-04-09  
+> **Version:** 4.0.0 | **Last Updated:** 2026-04-10  
 > **Full Details:** [Architecture_Overview.md](Architecture_Overview.md) | **API Reference:** [API_Developer_Doc.md](API_Developer_Doc.md)
 
 ---
@@ -40,17 +40,19 @@
 | `main.py` | FastAPI entrypoint, middleware stack, lifespan, health check |
 | `worker_main.py` | BullMQ workers (campaign + message processing, quota enforcement) |
 | `database.py` | Async Postgres pool (psycopg3), transaction helper |
-| `schema.sql` | Complete database DDL (18+ tables) |
+| `schema.sql` | Complete database DDL (20+ tables, Phase 17 schema included) |
+| `migration_chatbot_redesign.sql` | **Phase 17 — NEW:** Idempotent migration. Adds columns, creates `chatbot_button_mappings` + `chatbot_flows`, migrates JSONB data. |
+| `run_migration.py` | **Phase 17 — NEW:** Runs `migration_chatbot_redesign.sql` via `DATABASE_URL`. |
 | `retention_schema.sql` | Archive tables + `daily_message_stats` DDL |
 | `retention.py` | Data retention engine (archive + purge) + CLI |
 | `auth_middleware.py` | Firebase Auth token verification middleware |
 | `rate_limit.py` | Redis rate limiter (API sliding window + worker token bucket + global cooldown) |
-| `cache.py` | In-memory TTL caching (6h default) |
-| `store.py` | Cached read/write layer for settings + chatbot config |
+| `cache.py` | In-memory TTL caching (6h default). Keys: `chatbot_config`, `chatbot_rules`, `button_mappings` |
+| `store.py` | Cached read/write layer for settings + chatbot config (`fallback_template_name`, `fallback_cooldown_hours`) |
 | `observability.py` | Structured JSON logging |
 | `startup_checks.py` | Environment validation on boot |
 | `startup_cache.py` | Pre-warm caches on startup |
-| `db_layer/` | 15 Postgres repository adapter modules |
+| `db_layer/` | 16 Postgres repository adapter modules (incl. new `chatbot_button_mappings.py`) |
 | `services/` | Business logic (queue_manager, whatsapp, template_builder, chatgpt) |
 | `routers/` | 6 API endpoint modules (settings, bulk_message, file_forward, chatbot, logs, webhook) |
 | `utils/` | Shared utilities: phone normalization (E.164), image compression (≤5 MB), IST time helpers |
@@ -96,10 +98,14 @@
 - Send documents, images, and PDFs to individual or bulk recipients
 - Files uploaded once, then URL shared with all recipients via queue
 
-### Webhook Chatbot
+### Webhook Chatbot (Phase 17 Redesign)
 - Per-tenant webhook URLs with HMAC-SHA256 signature verification
-- Three-layer chatbot response engine: button→template mappings → keyword rules → first-trigger fallback
+- **Fully dynamic, DB-driven** three-layer response engine (no hardcoded defaults):
+  1. **Button→Template Mappings** — exact text match against `chatbot_button_mappings` table (per-tenant, 1h cache)
+  2. **Keyword Rules** — configurable `match_type` (`exact`/`contains`/`starts_with`) + `response_type` (`text`/`template`)
+  3. **Fallback Template** — tenant-configurable `fallback_template_name` with `fallback_cooldown_hours` (default 24h)
 - Priority queue routing (chatbot replies bypass bulk campaign traffic)
+- Button ID matching **removed** — text-only matching
 
 ### Settings
 - Tenant WhatsApp credentials CRUD with connectivity testing
@@ -155,12 +161,16 @@
 ### Chatbot Endpoints
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/api/chatbot/settings` | Get chatbot config |
+| GET | `/api/chatbot/settings` | Get chatbot config (incl. `fallback_template_name`, `fallback_cooldown_hours`) |
 | PUT | `/api/chatbot/settings` | Update chatbot config |
-| GET | `/api/chatbot/rules` | Get all rules |
+| GET | `/api/chatbot/rules` | Get all rules (incl. `response_type`, `match_type`) |
 | POST | `/api/chatbot/rules` | Create rule |
 | PUT | `/api/chatbot/rules/{id}` | Update rule |
 | DELETE | `/api/chatbot/rules/{id}` | Delete rule |
+| **GET** | **`/api/chatbot/button-mappings`** | **List button→template mappings (Phase 17)** |
+| **POST** | **`/api/chatbot/button-mappings`** | **Create button mapping (Phase 17)** |
+| **PUT** | **`/api/chatbot/button-mappings/{id}`** | **Update button mapping (Phase 17)** |
+| **DELETE** | **`/api/chatbot/button-mappings/{id}`** | **Delete button mapping (Phase 17)** |
 | GET | `/api/chatbot/users` | List chat users (cached 15s) |
 | GET | `/api/chatbot/conversations` | All conversations |
 | GET | `/api/chatbot/conversations/{phone}` | User conversations |
@@ -182,11 +192,16 @@
 | Table | Purpose | Key Design |
 |-------|---------|------------|
 | `tenants` | Tenant config + credentials | PK: `tenant_id`, includes `bulk_quota_limit` |
+| `chatbot_config` | Per-tenant chatbot settings | 1:1 with `tenants`. Columns: `fallback_template_name`, `fallback_cooldown_hours` |
+| `chatbot_rules` | Keyword auto-reply rules | Columns: `response_type` (`text`/`template`), `match_type` (`exact`/`contains`/`starts_with`) |
+| `chatbot_button_mappings` | **NEW (Phase 17)** Button→template mappings | Unique index on `(tenant_id, button_text)`. Replaces JSONB columns. |
+| `chatbot_flows` | **NEW (Phase 17, future)** Visual flow builder | `flow_data` JSONB. Not yet exposed via API. |
 | `campaigns` | Campaign metadata | Composite PK: `(tenant_id, campaign_id)` |
 | `campaign_recipients` | Per-recipient status | Composite PK: `(tenant_id, campaign_id, contact_phone)` |
 | `messages` | Unified message log | Unique index on `(tenant_id, wa_message_id)` |
 | `chat_messages` | Conversation history | Indexed by phone + timestamp |
 | `webhook_events` | Deduplication | Composite PK: `(tenant_id, event_id)` |
+| `user_triggers` | Fallback cooldown tracking | One row per `(tenant_id, phone)`. TTL controlled by `fallback_cooldown_hours`. |
 | `tenant_quota_usage` | Monthly quota tracking | Composite PK: `(tenant_id, month_key)` |
 | `daily_message_stats` | Pre-aggregated analytics | Permanent, powers dashboard after archival |
 
@@ -330,3 +345,4 @@ Docker Compose available for local development (Redis + API + Worker).
 | **14** | Redis command optimization: BullMQ limiter removal, in-worker sleep throttle, Lua token bucket for API, in-memory caching for rate limiters, BullMQ polling tuning |
 | **15** | Campaign counter accuracy: `count_by_status()` replaces incremental counters, new `pending_count` + `quota_exceeded_count` API fields |
 | **16** | Quota counting fix: only first attempt consumes quota (retries skip), eliminates inflated usage counts |
+| **17** | **Chatbot system redesign:** `chatbot_button_mappings` table replaces JSONB columns + hardcoded Python dicts. Button ID matching removed. Keyword rules enhanced with `response_type` + `match_type`. Fallback template + cooldown configurable per tenant. New files: `db_layer/chatbot_button_mappings.py`, `migration_chatbot_redesign.sql`, `run_migration.py`. 4 new API endpoints for button mappings. |

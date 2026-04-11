@@ -6,6 +6,7 @@ Backed by Neon Postgres via `psycopg` (see `database.py`) and optionally cached 
 
 from db_layer.tenants import tenants
 from db_layer.chatbot import chatbot_config, chatbot_rules
+from db_layer.chatbot_button_mappings import button_mappings
 from db_layer.chat_messages import chat_messages
 from db_layer.messages import messages
 from db_layer.campaigns import campaigns
@@ -20,6 +21,7 @@ __all__ = [
     "tenants",
     "chatbot_config",
     "chatbot_rules",
+    "button_mappings",
     "chat_messages",
     "messages",
     "campaigns",
@@ -30,3 +32,4 @@ __all__ = [
     "template_cache_db",
     "secrets",
 ]
+

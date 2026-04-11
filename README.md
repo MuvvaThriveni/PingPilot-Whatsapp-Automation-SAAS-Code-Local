@@ -10,7 +10,7 @@
 
 ## 📖 Project Overview
 
-WappFlow is designed to handle thousands of WhatsApp messages per minute without dropping requests or hitting API rate limits. By combining **FastAPI**, **Next.js**, and **BullMQ/Redis**, it separates the fast user-facing API from the heavy, IO-bound message delivery pipeline. 
+WappFlow is designed to handle thousands of WhatsApp messages per minute without dropping requests or hitting API rate limits. By combining **FastAPI**, **Next.js**, and **BullMQ/Redis**, it separates the fast user-facing API from the heavy, IO-bound message delivery pipeline.
 
 Whether you are dispatching a 10,000-contact campaign or instantly responding to an incoming interactive webhook, the system handles retry logic, exponential backoff, deduplication, and dead-letter routing automatically.
 
@@ -27,6 +27,7 @@ Whether you are dispatching a 10,000-contact campaign or instantly responding to
 - **Per-Tenant Bulk Quotas**: Monthly message caps with atomic three-layer enforcement (API → worker fan-out → per-message). Retry-aware: only first attempts consume quota.
 - **Contact Limit Enforcement**: Configurable per-campaign limit (default 500) with early-stop parsing and dual `/parse` + `/start` enforcement.
 - **Redis Optimization**: Minimal Redis command footprint via in-worker throttling, Lua token buckets, in-memory caching, and tuned BullMQ polling intervals.
+- **Dynamic Chatbot System** *(Phase 17)*: Fully database-driven button→template mappings, enhanced keyword rules with `match_type` + `response_type`, and per-tenant fallback template with configurable cooldown hours. No hardcoded defaults.
 
 ---
 
@@ -68,7 +69,7 @@ WappFlow separates concerns into three primary domains: **Frontend**, **API Serv
 
 ## 📬 Messaging Pipeline
 
-The core value of WappFlow lies in its non-blocking message pipeline. 
+The core value of WappFlow lies in its non-blocking message pipeline.
 
 ### 1. The Bulk Campaign Flow
 
@@ -112,7 +113,10 @@ WhatsApp API
 API (FastAPI)
  │ 2. Verifies HMAC-SHA256 signature (per-tenant encrypted secret)
  │ 3. Deduplicates by Message ID
- │ 4. Evaluates Chatbot Rules (button mappings → keyword rules → first-trigger fallback)
+ │ 4. Evaluates 3-layer Chatbot Engine:
+ │      Layer 1 — Button→Template Mappings (DB-backed, cached 1h)
+ │      Layer 2 — Keyword Rules (exact/contains/starts_with, cached 6h)
+ │      Layer 3 — Fallback Template (configurable cooldown per tenant)
  │ 5. Enqueues a HIGH-PRIORITY (Priority: 0) job to 'message_queue'
  ▼
 Worker (message_queue)
@@ -124,13 +128,55 @@ User receives instant reply
 
 ---
 
+## 🤖 Chatbot System (Phase 17)
+
+The chatbot has been completely redesigned in Phase 17 from hardcoded Python dicts to a fully dynamic, database-driven architecture.
+
+### 3-Layer Decision Engine
+
+| Priority | Layer | Source | Cache TTL |
+|----------|-------|--------|-----------|
+| **1 (Highest)** | Button→Template Mappings | `chatbot_button_mappings` table | 1 hour |
+| **2** | Keyword Rules | `chatbot_rules` table | 6 hours |
+| **3 (Fallback)** | Fallback Template | `chatbot_config.fallback_template_name` | 6 hours |
+
+### Button Mappings
+
+- Stored in the `chatbot_button_mappings` table — fully per-tenant, zero hardcoded defaults.
+- Match is performed on `button_text` (exact string match, case-sensitive after `.strip()`).
+- CRUD API: `GET/POST/PUT/DELETE /api/chatbot/button-mappings`
+- Priority-ordered: higher `priority` value wins when multiple mappings exist.
+- Cache is invalidated immediately on any create/update/delete.
+
+### Keyword Rules
+
+Enhanced in Phase 17 with two new fields:
+
+| Field | Values | Description |
+|-------|--------|-------------|
+| `match_type` | `exact`, `contains`, `starts_with` | How to match the incoming message against the keyword |
+| `response_type` | `text`, `template` | Whether to reply with raw text or a WhatsApp template |
+
+### Fallback Template
+
+Configured in `chatbot_config` per tenant:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `fallback_template_name` | `""` (disabled) | Template to send when no rule matches. Empty = no fallback. |
+| `fallback_cooldown_hours` | `24` | Minimum hours between fallback sends to the same contact |
+
+The fallback cooldown is enforced via the `user_triggers` table — each contact gets at most 1 fallback message per cooldown window.
+
+---
+
 ## 🗄 Queue Architecture (Redis + BullMQ)
 
-WappFlow embraces asynchronous job processing to overcome common Node/Python bottlenecks. 
+WappFlow embraces asynchronous job processing to overcome common Node/Python bottlenecks.
 
 We use **3 primary queues**:
 
-1. **`campaign_queue`**: A lightweight queue. A job here represents "Launch Campaign X". The worker picks this up, reads quota remaining, caps fan-out, and floods the message queue. 
+1. **`campaign_queue`**: A lightweight queue. A job here represents "Launch Campaign X". The worker picks this up, reads quota remaining, caps fan-out, and floods the message queue.
 2. **`message_queue`**: The heavy-lifter. Processes individual API calls to Meta. Features:
    - **In-Worker Throttle**: `asyncio.sleep(WORKER_RATE_DELAY)` between jobs (~5 msg/sec default). Replaces the former BullMQ limiter for minimal Redis overhead.
    - **Retry & Backoff**: Configured for 3 attempts (default) with `exponential` delay starting at 5 seconds.
@@ -157,7 +203,7 @@ You can spin up the full WappFlow environment within minutes.
 ### 1. Clone & Install
 ```bash
 git clone <your-repo>
-cd SaaS-Product-
+cd wappflow-neon
 
 # Using our custom concurrent install script:
 npm run install:all
@@ -177,6 +223,12 @@ ENCRYPTION_KEY=<generate with: python -c "from cryptography.fernet import Fernet
 
 REDIS_HOST=localhost
 REDIS_PORT=6379
+
+# Optional tuning
+MAX_VALID_CONTACTS=500        # Max contacts per campaign (default: 500)
+WORKER_RATE_DELAY=0.2         # Seconds between messages in worker (default: 0.2)
+RETENTION_ENABLED=true        # Enable data archival background job
+PURGE_ENABLED=true            # Enable archive purge (run after 90+ days of retention)
 ```
 
 **Frontend (`frontend/.env.local`)**
@@ -192,8 +244,20 @@ NEXT_PUBLIC_FIREBASE_PROJECT_ID=xxx
 ### 3. Apply Database Schema
 ```bash
 cd backend
+
+# Apply full schema (creates all tables including Phase 17)
 python apply_schema.py
+
+# Apply Phase 17 chatbot migration (safe to run on both fresh and existing DBs)
+python run_migration.py
 ```
+
+> **Note:** `run_migration.py` applies `migration_chatbot_redesign.sql` which:
+> - Adds `fallback_template_name` + `fallback_cooldown_hours` to `chatbot_config`
+> - Adds `response_type` + `match_type` to `chatbot_rules`
+> - Creates the `chatbot_button_mappings` table
+> - Creates the `chatbot_flows` table (future flow builder)
+> - Migrates any existing JSONB button mappings from `chatbot_config` to the new table
 
 ### 4. Start Infrastructure
 
@@ -250,6 +314,8 @@ The backend is best deployed via **Docker** on a VPS (AWS EC2, DigitalOcean) or 
 4. **Worker Service**: Run the Python worker as an independent background process.
    `python worker_main.py`
 
+> **Important:** Both the API service and the Worker service must have `MAX_VALID_CONTACTS` set to the same value for consistent contact limit enforcement.
+
 ### 📈 Scaling the System
 - **Scale the API** horizontally to handle thousands of incoming Webhooks per second without sweating.
 - **Scale Workers**: To increase campaign sending speed (assuming Meta lifts your rate limits), simply run multiple `python worker_main.py` containers. BullMQ safely distributes jobs across all active workers.
@@ -264,8 +330,11 @@ The backend is best deployed via **Docker** on a VPS (AWS EC2, DigitalOcean) or 
 | **Webhooks not triggering** | Meta Cloud cannot reach localhost. Run `ngrok http 5000` and update your Meta App Webhook URL to `https://<ngrok>/api/webhook/{tenant_id}`. |
 | **Invalid Signature (401)** | `meta_app_secret` does not match the Meta dashboard, or the trailing whitespace is polluting the `.env`. Check `webhook_sig_rejected` logs. |
 | **Redis TLS Errors** | Cloud Redis (Upstash, Redis Cloud) requires TLS. Use `rediss://` (double `s`) in `REDIS_URL`, not `redis://`. |
-| **Stale Settings/Rules** | Settings and chatbot rules are cached for 6 hours. After manual DB changes, restart the server or wait for cache expiry. |
+| **Stale Settings/Rules** | Settings and chatbot rules are cached for 6 hours. After manual DB changes, restart the server or wait for cache expiry. Button mappings cache expires in 1 hour. |
 | **Quota Not Updating** | Quota is tracked per `YYYY-MM` month key. Frontend auto-refreshes every 10 seconds. |
+| **Button Mapping Not Triggering** | The match is exact and case-sensitive (after `.strip()`). Ensure the `button_text` in the DB exactly matches the text received in the WhatsApp payload. Check logs for `button_match` events. |
+| **Migration Errors (`column does not exist`)** | Run `python run_migration.py` to apply the Phase 17 schema changes. If the error persists, check `information_schema.columns` for `chatbot_config` to verify the migration was applied. |
+| **Fallback Template Sends Too Often** | Adjust `fallback_cooldown_hours` in chatbot settings (default: 24). Check the `user_triggers` table for existing cooldown records. |
 
 ---
 
@@ -273,33 +342,64 @@ The backend is best deployed via **Docker** on a VPS (AWS EC2, DigitalOcean) or 
 
 ```text
 ├── backend/
-│   ├── main.py               # FastAPI entry point, CORS, Health Checks, Lifespan
-│   ├── worker_main.py        # BullMQ Worker definition (campaign + message processing)
-│   ├── database.py           # Async Postgres pool (psycopg3), transaction helper
-│   ├── schema.sql            # Complete DDL for all live tables
-│   ├── retention_schema.sql  # DDL for archive tables + daily_message_stats
-│   ├── retention.py          # Data retention engine (archive + purge) + CLI
-│   ├── auth_middleware.py    # Firebase Auth token verification middleware
-│   ├── rate_limit.py         # Redis rate limiter (API + worker token bucket)
-│   ├── cache.py              # In-memory TTL cache (6h default)
-│   ├── store.py              # Cached read/write layer for settings + chatbot config
-│   ├── observability.py      # Structured JSON logging
-│   ├── routers/              # Controllers (settings, bulk_message, file_forward, chatbot, logs, webhook)
-│   ├── services/             # Abstractions (queue_manager, whatsapp, template_builder, chatgpt)
-│   ├── db_layer/             # Postgres repository adapters (15 modules)
-│   ├── utils/                # Shared utilities (phone_utils, image_utils, time_utils)
-│   └── requirements.txt      
-├── frontend/                 # Next.js 14 Web Application
-│   ├── src/app/              # App Router pages (dashboard, login, register)
-│   ├── src/components/       # Reusable UI components (shadcn/ui based)
-│   ├── src/contexts/         # React contexts (auth)
-│   ├── src/lib/              # API client, Firebase config, utilities
-│   ├── package.json          
-│   └── tailwind.config.ts    
-├── docker-compose.yml        # Local Redis + Full stack orchestration
-├── API_Developer_Doc.md      # Complete API reference (all endpoints, schemas, errors)
-├── Architecture_Overview.md  # Deep architecture documentation (for onboarding)
-└── package.json              # Global dependency runner
+│   ├── main.py                      # FastAPI entry point, CORS, Health Checks, Lifespan
+│   ├── worker_main.py               # BullMQ Worker definition (campaign + message processing)
+│   ├── database.py                  # Async Postgres pool (psycopg3), transaction helper
+│   ├── schema.sql                   # Complete DDL for all live tables (Phase 17 schema)
+│   ├── migration_chatbot_redesign.sql  # Phase 17 migration: new columns, tables, data migration
+│   ├── run_migration.py             # Runs migration_chatbot_redesign.sql against DATABASE_URL
+│   ├── retention_schema.sql         # DDL for archive tables + daily_message_stats
+│   ├── apply_schema.py              # Applies schema.sql + retention_schema.sql to database
+│   ├── retention.py                 # Data retention engine (archive + purge) + CLI
+│   ├── auth_middleware.py           # Firebase Auth token verification middleware
+│   ├── rate_limit.py                # Redis rate limiter (API + worker token bucket)
+│   ├── cache.py                     # In-memory TTL cache (6h default); includes button_mappings_key
+│   ├── store.py                     # Cached read/write layer for settings + chatbot config
+│   ├── observability.py             # Structured JSON logging
+│   ├── routers/                     # Controllers
+│   │   ├── settings.py              # WhatsApp API credentials CRUD
+│   │   ├── bulk_message.py          # Campaign lifecycle (start/stop/status/delete/quota)
+│   │   ├── file_forward.py          # Single + bulk file sending
+│   │   ├── chatbot.py               # Rules, settings, button mappings (Phase 17: fully dynamic)
+│   │   ├── logs.py                  # Message log retrieval + CSV export
+│   │   └── webhook.py               # Per-tenant + legacy webhook routes, 3-layer chatbot engine
+│   ├── services/                    # Abstractions
+│   │   ├── whatsapp.py              # WhatsApp Cloud API client (retry, rate-limit aware)
+│   │   ├── queue_manager.py         # BullMQ queue helpers (campaign/message/file-forward/DLQ)
+│   │   ├── template_builder.py      # Template component cache + parameter builder
+│   │   └── chatgpt.py               # (Reserved) ChatGPT integration
+│   ├── db_layer/                    # Postgres repository adapters
+│   │   ├── tenants.py               # Tenant CRUD + webhook token lookup
+│   │   ├── campaigns.py             # Campaign CRUD + status transitions
+│   │   ├── campaign_recipients.py   # Recipient status machine + count_by_status()
+│   │   ├── campaign_counters.py     # Sharded sent/failed counters (legacy — kept for compat)
+│   │   ├── messages.py              # Unified message log + archive fallback
+│   │   ├── chat_messages.py         # Conversation history
+│   │   ├── chatbot.py               # Chatbot config + rules (response_type, match_type)
+│   │   ├── chatbot_button_mappings.py  # Phase 17: CRUD + 1h cache for button→template mappings
+│   │   ├── webhook_events.py        # Webhook deduplication
+│   │   ├── usage_events.py          # Billable usage tracking
+│   │   ├── template_cache.py        # Persistent template metadata
+│   │   ├── secrets.py               # Runtime token resolution (DB → env fallback)
+│   │   ├── encryption.py            # Fernet encrypt/decrypt for secrets at rest
+│   │   ├── users.py                 # User trigger rate limiting (configurable cooldown)
+│   │   └── quota.py                 # Per-tenant monthly bulk message quota
+│   └── utils/
+│       ├── phone_utils.py           # E.164 phone normalization (international + India fallback)
+│       ├── image_utils.py           # Automatic image compression to ≤5 MB
+│       └── time_utils.py            # IST timestamp helpers
+├── frontend/                        # Next.js 14 Web Application
+│   ├── src/app/                     # App Router pages (dashboard, login, register)
+│   ├── src/components/              # Reusable UI components (shadcn/ui based)
+│   ├── src/contexts/                # React contexts (auth)
+│   ├── src/lib/                     # API client, Firebase config, utilities
+│   ├── package.json
+│   └── tailwind.config.ts
+├── docker-compose.yml               # Local Redis + Full stack orchestration
+├── API_Developer_Doc.md             # Complete API reference (all endpoints, schemas, errors)
+├── Architecture_Overview.md         # Deep architecture documentation (for onboarding)
+├── Technical_Readme.md              # Concise technical summary of every system component
+└── package.json                     # Global dependency runner
 ```
 
 ---
@@ -309,7 +409,7 @@ The backend is best deployed via **Docker** on a VPS (AWS EC2, DigitalOcean) or 
 | Document | Purpose | Audience |
 |----------|---------|----------|
 | **[API_Developer_Doc.md](API_Developer_Doc.md)** | Complete API reference with request/response schemas, error codes, rate limits, encryption details, data retention, quota system, and onboarding quick-start | Backend developers, frontend integrators |
-| **[Architecture_Overview.md](Architecture_Overview.md)** | Deep system architecture — multi-tenancy model, request lifecycle, data flows, security layers, queue architecture, retention system, and phase history | New team members, architects |
+| **[Architecture_Overview.md](Architecture_Overview.md)** | Deep system architecture — multi-tenancy model, request lifecycle, data flows, security layers, queue architecture, retention system, Phase 17 chatbot redesign, and phase history | New team members, architects |
 | **[Technical_Readme.md](Technical_Readme.md)** | Concise technical summary of every system component | Quick reference |
 
 ---
@@ -319,9 +419,30 @@ The backend is best deployed via **Docker** on a VPS (AWS EC2, DigitalOcean) or 
 - **Firebase Auth** on every request (except webhooks/health)
 - **Row-level tenant isolation** on all DB tables
 - **Per-tenant HMAC webhook verification** (X-Hub-Signature-256)
-- **Fernet encryption at rest** for sensitive secrets
+- **Fernet encryption at rest** for sensitive secrets (`meta_app_secret`)
 - **Redis token-bucket rate limiting** (Lua-based, 1 command per request) + in-worker throttle
 - **Input validation** via Pydantic models
-- **Contact limit enforcement** (configurable max per campaign)
+- **Contact limit enforcement** (configurable max per campaign via `MAX_VALID_CONTACTS`)
 - **CSV injection protection** on exports
 - **OpenAPI/Swagger disabled** in production
+- **No hardcoded chatbot defaults** — all button mappings and rules are tenant-scoped and DB-driven
+
+---
+
+## 🔄 Phase History (Summary)
+
+| Phase | Key Change |
+|-------|------------|
+| 1–3 | Core platform: FastAPI, Firebase Auth, BullMQ, chatbot rules |
+| 4–6 | Startup validation, Postgres migration, security hardening |
+| 7 | Redis rate limiting (sliding window + token bucket) |
+| 8 | Data retention: archive tables, `daily_message_stats`, purge system |
+| 9 | Per-tenant webhooks, HMAC verification, Fernet encryption |
+| 10 | Per-tenant monthly bulk quota: 3-layer atomic enforcement |
+| 11 | Documentation refresh |
+| 12 | Phone normalization (E.164), image compression (Pillow ≤5 MB), template hardening |
+| 13 | Contact limit enforcement: `MAX_VALID_CONTACTS`, Redis contact cache, `/limits` endpoint |
+| 14 | Redis command optimization: BullMQ limiter→`asyncio.sleep`, Lua token bucket, in-memory caches |
+| 15 | Campaign counter accuracy: `count_by_status()` replaces incremental shards |
+| 16 | Retry-aware quota: only first attempt consumes quota |
+| **17** | **Chatbot system redesign**: dynamic `chatbot_button_mappings` table, button-text-only matching, `response_type`/`match_type` on rules, per-tenant fallback template + cooldown, `migration_chatbot_redesign.sql`, `run_migration.py`, new button mapping API endpoints |

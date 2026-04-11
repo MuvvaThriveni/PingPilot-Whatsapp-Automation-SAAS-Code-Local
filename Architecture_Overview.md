@@ -1,8 +1,8 @@
 # WappFlow — Architecture Overview
 
 > **Product:** Multi-tenant WhatsApp Business Automation SaaS  
-> **Version:** 3.0.0 (Phase 16 — Contact Limits, Redis Optimization, Counter Accuracy & Quota Fix)  
-> **Last Updated:** 2026-04-09
+> **Version:** 4.0.0 (Phase 17 — Dynamic Chatbot System, Button Mappings, Fallback Templates)  
+> **Last Updated:** 2026-04-10
 
 > **📖 How to Use This Document:** If you are new to the team, start with [Section 21 (Onboarding Guide)](#21-onboarding-guide-for-new-developers) for a structured path. Then dive into specific sections as needed. For API endpoint details, see [API_Developer_Doc.md](API_Developer_Doc.md).
 
@@ -14,7 +14,7 @@ WappFlow is a **multi-tenant SaaS platform** that automates WhatsApp Business me
 
 1. **Bulk Messaging** — Send template-based WhatsApp messages to thousands of contacts via Excel/CSV upload. Supports scheduled campaigns, real-time progress tracking, automatic retries, resend-failed workflows, and **per-tenant monthly message quotas** with atomic enforcement at both API and worker levels.
 2. **File Forwarding** — Send documents, images, and PDFs to single or multiple recipients via the WhatsApp Cloud API.
-3. **Auto-Reply Chatbot** — Keyword-based rule engine that automatically responds to incoming WhatsApp messages. Supports configurable button→template mappings and a first-trigger fallback system.
+3. **Auto-Reply Chatbot** — Fully dynamic, DB-driven keyword rule engine that automatically responds to incoming WhatsApp messages. Features configurable button→template mappings (per-tenant, stored in `chatbot_button_mappings`), multi-strategy keyword matching (`exact`/`contains`/`starts_with`), template or text responses, and a configurable per-tenant fallback template with adjustable cooldown hours.
 
 Every tenant is fully isolated: separate WhatsApp credentials, separate webhook URLs with per-tenant HMAC signature verification, and secrets encrypted at rest via Fernet.
 
@@ -61,8 +61,9 @@ Every tenant is fully isolated: separate WhatsApp credentials, separate webhook 
 │    - message_queue  │       │  webhook_events · usage_events            │
 │    - dead_letter_q  │       │  template_cache · user_triggers           │
 │  • Rate limit keys  │       │  chatbot_config · campaign_counters       │
-│  • Token buckets    │       │  messages_archive · chat_messages_archive │
-│  • Global cooldown  │       │  webhook_events_archive · usage_events_ar │
+│  • Token buckets    │       │  chatbot_button_mappings · chatbot_flows  │
+│  • Global cooldown  │       │  messages_archive · chat_messages_archive │
+│                     │       │  webhook_events_archive · usage_events_ar │
 │                     │       │  daily_message_stats                      │
 │                     │       │  tenant_quota_usage                       │
 │                     │       │                                           │
@@ -268,15 +269,17 @@ backend/
 ├── worker_main.py           # BullMQ workers (campaign + message processing)
 ├── run_server.py            # Uvicorn launcher
 ├── database.py              # Async Postgres pool (psycopg3), transaction helper
-├── schema.sql               # Complete DDL for all live tables
+├── schema.sql               # Complete DDL for all live tables (Phase 17 schema included)
+├── migration_chatbot_redesign.sql  # Phase 17 migration: new columns, new tables, data migration
+├── run_migration.py         # Runs migration_chatbot_redesign.sql against DATABASE_URL
 ├── retention_schema.sql     # DDL for archive tables + daily_message_stats
-├── apply_schema.py          # Applies retention_schema.sql to database
+├── apply_schema.py          # Applies schema.sql + retention_schema.sql to database
 ├── retention.py             # Data retention engine (archive + purge) + CLI
 │
 ├── auth_middleware.py        # Firebase Auth token verification middleware
 ├── rate_limit.py             # Redis rate limiter (API + worker token bucket)
-├── cache.py                  # In-memory TTL cache (6h default)
-├── store.py                  # Cached read/write layer for settings + chatbot config
+├── cache.py                  # In-memory TTL cache (6h default); keys: tenant, chatbot_config, chatbot_rules, button_mappings
+├── store.py                  # Cached read/write layer for settings + chatbot config (fallback_template_name, fallback_cooldown_hours)
 ├── observability.py          # Structured JSON logging (no sensitive data)
 ├── startup_checks.py         # Environment validation on boot
 ├── startup_cache.py          # Pre-warm caches on startup
@@ -286,9 +289,9 @@ backend/
 │   ├── settings.py           # WhatsApp API credentials CRUD
 │   ├── bulk_message.py       # Campaign lifecycle (start/stop/status/delete)
 │   ├── file_forward.py       # Single + bulk file sending
-│   ├── chatbot.py            # Rules, settings, conversations
+│   ├── chatbot.py            # Rules, settings, button mappings, conversations (Phase 17: fully dynamic)
 │   ├── logs.py               # Message log retrieval + CSV export
-│   └── webhook.py            # Per-tenant + legacy webhook routes, HMAC sig verification
+│   └── webhook.py            # Per-tenant + legacy webhook routes, HMAC sig verification, 3-layer chatbot engine
 │
 ├── services/
 │   ├── whatsapp.py           # WhatsApp Cloud API client (retry, rate-limit aware)
@@ -303,13 +306,14 @@ backend/
 │   ├── campaign_counters.py  # Sharded sent/failed counters
 │   ├── messages.py           # Unified message log (all products) + archive fallback
 │   ├── chat_messages.py      # Conversation history
-│   ├── chatbot.py            # Chatbot config + rules + button mappings
+│   ├── chatbot.py            # Chatbot config + rules (Phase 17: response_type, match_type, fallback fields)
+│   ├── chatbot_button_mappings.py  # Phase 17 NEW: CRUD + 1h cache for chatbot_button_mappings table
 │   ├── webhook_events.py     # Webhook deduplication
 │   ├── usage_events.py       # Billable usage tracking
 │   ├── template_cache.py     # Persistent template metadata
 │   ├── secrets.py            # Runtime token resolution (DB → env fallback)
 │   ├── encryption.py         # Fernet encrypt/decrypt for secrets at rest
-│   ├── users.py              # User trigger rate limiting (24h)
+│   ├── users.py              # User trigger rate limiting (configurable cooldown)
 │   └── quota.py              # Per-tenant monthly bulk message quota (read + atomic consume)
 │
 ├── utils/
@@ -416,7 +420,7 @@ The API heavy tier matches on **(HTTP method + path)**, not just path prefix. Th
 | Chat users list | In-memory | 15 seconds | Reduce polling load on conversations page |
 | Template components | In-memory + Postgres | Indefinite (memory) / persistent (DB) | Template parameter metadata (tenant-scoped key: `{tenant_id}:{name}|{lang}`) |
 | Uploaded media IDs | In-memory | Process lifetime | Avoid re-uploading same template header image on every webhook trigger. Invalidated on `#132012` errors. |
-| Button mappings | In-memory | 1 hour | Per-tenant button→template mappings |
+| Button mappings | In-memory | 1 hour | Per-tenant button→template mappings (DB-backed, `chatbot_button_mappings` table) |
 | Rate limit counters | Redis | Sliding window | API and worker rate limiting |
 | Token buckets | Redis | 60s auto-expire | Per-tenant message sending fairness |
 
@@ -428,8 +432,10 @@ Cache invalidation: Write operations explicitly call `cache.invalidate()` for af
 
 ```
 tenants (1)  ← includes bulk_quota_limit (default 100)
-  ├──< chatbot_config (1:1)
-  ├──< chatbot_rules (1:N)
+  ├──< chatbot_config (1:1)  ← fallback_template_name, fallback_cooldown_hours
+  ├──< chatbot_rules (1:N)   ← response_type, match_type, keyword, priority
+  ├──< chatbot_button_mappings (1:N)  [NEW Phase 17] ← button_text, template_name, is_active, priority
+  ├──< chatbot_flows (1:N)   [NEW Phase 17, future] ← flow_data JSONB, trigger_type
   ├──< campaigns (1:N)
   │      └──< campaign_recipients (1:N)
   ├──< messages (1:N)  ───archive───>  messages_archive
@@ -437,7 +443,7 @@ tenants (1)  ← includes bulk_quota_limit (default 100)
   ├──< webhook_events (1:N)  ──────>  webhook_events_archive
   ├──< usage_events (1:N)  ────────>  usage_events_archive
   ├──< template_cache (1:N)
-  ├──< user_triggers (1:N)
+  ├──< user_triggers (1:N)  ← configurable fallback cooldown per contact
   └──< tenant_quota_usage (1:N per month_key)
 
 daily_message_stats (pre-aggregated from messages before archival)
@@ -694,21 +700,33 @@ POST /api/webhook/{tenant_id}
 
 ### 19.3 Chatbot Decision Engine
 
-When an incoming message is received, the chatbot processes it through three layers:
+When an incoming message is received and the chatbot is enabled, it processes through **three priority layers** (Phase 17: fully dynamic, no hardcoded defaults):
 
 ```
-Incoming message
+Incoming message (chatbot.is_enabled = true)
   │
-  ├─ Layer 1: Button→Template Mappings (per-tenant, cached 1h)
-  │    Text match: e.g. "Sessions" → session_template
-  │    Button ID match: e.g. "morning_session" → aruna_yoga
+  ├─ Layer 1: Button→Template Mappings (highest priority)
+  │    text_map = get_active_maps(tenant_id)     # DB query, cached 1h
+  │    Exact-match message_text against text_map keys
+  │    e.g. "Book Session" → session_booking_template
+  │    → enqueue template, STOP
   │
   ├─ Layer 2: Keyword Rules (DB-backed, priority-ordered)
-  │    Contains-match: e.g. "pricing" in message → custom response text
+  │    rules = get_active(tenant_id)             # DB query, cached 6h
+  │    for each rule (ordered priority DESC):
+  │      match_type == 'exact'       → msg.lower() == keyword
+  │      match_type == 'contains'    → keyword in msg.lower()
+  │      match_type == 'starts_with' → msg.lower().startswith(keyword)
+  │      response_type == 'text'     → enqueue text reply
+  │      response_type == 'template' → enqueue template
+  │    → first match wins, STOP
   │
-  └─ Layer 3: First-Trigger Fallback (24h rate-limited per sender)
-       If no rule matched and sender hasn't been triggered in 24h
-       → Send "first_trigger" template
+  └─ Layer 3: Fallback Template (configurable per tenant)
+       fallback_tpl   = chatbot['fallback_template_name']   # from chatbot_config
+       cooldown_hours = chatbot['fallback_cooldown_hours']   # default 24
+       if fallback_tpl and should_send_trigger(tenant_id, phone, cooldown_hours):
+           record_trigger(tenant_id, phone)     # writes user_triggers table
+           → enqueue template: fallback_tpl
 ```
 
 All replies are enqueued to `message_queue` with **priority 0** (highest), ensuring chatbot responses are never delayed by bulk campaign traffic.
@@ -835,7 +853,7 @@ This section provides a structured path for new team members to understand the e
 | **Day 2** | Campaign lifecycle (most complex flow) | `routers/bulk_message.py`, `worker_main.py`, `db_layer/campaigns.py`, `db_layer/campaign_recipients.py`, `db_layer/quota.py` |
 | **Day 2** | Queue architecture + phone normalization | `services/queue_manager.py`, `rate_limit.py`, `utils/phone_utils.py` |
 | **Day 2** | Template building + media pipeline | `services/template_builder.py`, `services/whatsapp.py`, `utils/image_utils.py` |
-| **Day 3** | Webhook + chatbot | `routers/webhook.py`, `db_layer/encryption.py`, `db_layer/secrets.py` |
+| **Day 3** | Webhook + chatbot (Phase 17 architecture) | `routers/webhook.py`, `routers/chatbot.py`, `db_layer/chatbot.py`, `db_layer/chatbot_button_mappings.py`, `db_layer/encryption.py`, `db_layer/secrets.py` |
 | **Day 3** | Data retention | `retention.py`, `retention_schema.sql` |
 | **Day 4** | Frontend | `frontend/src/lib/api.ts`, `frontend/src/app/dashboard/`, `frontend/src/contexts/` |
 
@@ -851,7 +869,8 @@ docker-compose up redis -d
 cd backend
 pip install -r requirements.txt
 cp .env.example .env    # Fill in DATABASE_URL, ENCRYPTION_KEY, WEBHOOK_VERIFY_TOKEN
-python apply_schema.py  # Create all tables
+python apply_schema.py  # Create all tables (includes Phase 17 schema)
+python run_migration.py # Apply Phase 17 chatbot redesign migration (safe on fresh DB)
 python run_server.py    # Terminal 1: API on port 5000
 
 # 3. Worker
@@ -874,6 +893,7 @@ npm run dev             # Terminal 3: Next.js on port 3000
 | `WEBHOOK_VERIFY_TOKEN` | Backend | Legacy webhook verification (per-tenant tokens preferred) |
 | `REDIS_URL` | Backend | Full Redis URL. Use `rediss://` for TLS (required by Upstash). Overrides `REDIS_HOST`/`REDIS_PORT` |
 | `REDIS_HOST` / `REDIS_PORT` | Backend | Redis host/port for local dev (only used if `REDIS_URL` is not set) |
+| `MAX_VALID_CONTACTS` | Backend | Max contacts per campaign (default `500`). Controls `/parse` early-stop limit. |
 | `NEXT_PUBLIC_API_URL` | Frontend | Backend URL (e.g., `http://localhost:5000`) |
 | `NEXT_PUBLIC_FIREBASE_*` | Frontend | Firebase Auth configuration |
 
@@ -887,11 +907,18 @@ npm run dev             # Terminal 3: Next.js on port 3000
 5. Watch `worker_main.py` logs for `worker_send_prepare` and `worker_finalize_sent`
 6. Check campaign status in the UI or via `GET /api/bulk-message/status/{id}`
 
-**Webhook flow (requires ngrok):**
+**Webhook + chatbot flow (requires ngrok):**
 1. Run `ngrok http 5000` to get a public URL
 2. In Meta App Dashboard → Webhooks, set callback URL to `https://<ngrok>/api/webhook/{tenant_id}`
-3. Send a WhatsApp message to your business number
-4. Watch backend logs for `webhook_per_tenant`, `button_match`, or `fallback_trigger`
+3. Go to Chatbot → enable chatbot and add button mappings / keyword rules
+4. Send a WhatsApp message to your business number
+5. Watch backend logs for `webhook_per_tenant`, `button_match`, `rule_match`, or `fallback_trigger`
+
+**Button mapping test:**
+1. Create a mapping: `POST /api/chatbot/button-mappings` with `{"button_text": "Hello", "template_name": "welcome"}`
+2. Send the message `"Hello"` from WhatsApp to your number
+3. The chatbot should respond with the `welcome` template
+4. Check logs for `button_match` event
 
 ### 21.6 Common Gotchas
 
@@ -922,8 +949,13 @@ npm run dev             # Terminal 3: Next.js on port 3000
 | **Phase 8** | Data retention: archive tables, daily_message_stats, background cron, purge system |
 | **Phase 9** | Per-tenant webhooks, HMAC signature verification, Fernet encryption at rest, `meta_app_secret` per tenant |
 | **Phase 10** | Per-tenant monthly bulk message quota: schema (`tenant_quota_usage`), atomic consumption (`db_layer/quota.py`), API pre-check, worker enforcement (capped fan-out + per-message consume), frontend quota bar + button guard |
-| **Phase 11** | Comprehensive documentation refresh: README rewrite (Firestore→Postgres alignment), API doc glossary, cross-referencing between docs, fresher onboarding improvements |
-| **Phase 12** | Phone normalization (`utils/phone_utils.py`): E.164-compliant, international support, India (+91) fallback, scientific notation (Excel float) handling, graceful `None` on invalid. Image compression (`utils/image_utils.py`): Pillow-based automatic compression to ≤5 MB before WhatsApp upload (JPEG quality reduction, PNG optimize, progressive resize). Media upload fix (`services/whatsapp.py`): correct multipart/form-data with MIME-derived filename. Template hardening: named + positional variable support, pre-send `validate_components()`, tenant-scoped template + media ID cache, CDN URL expiry detection, non-retryable error code classification (`#132000`, `#132001`, `#132012`, `#100`). |
+| **Phase 11** | Comprehensive documentation refresh: README rewrite, API doc glossary, cross-referencing, fresher onboarding |
+| **Phase 12** | Phone normalization (`utils/phone_utils.py`): E.164-compliant, international support, India fallback, scientific notation. Image compression (`utils/image_utils.py`): Pillow-based, ≤5 MB enforcement. Template hardening: named+positional variable support, pre-send `validate_components()`, non-retryable error codes. |
+| **Phase 13** | Contact limit enforcement: `MAX_VALID_CONTACTS` env var (default 500), early-stop parsing optimization, Redis contact cache between `/parse` and `/start`, `GET /api/bulk-message/limits` endpoint. |
+| **Phase 14** | Redis command optimization: BullMQ limiter removed (replaced with `asyncio.sleep`), worker polling tuned (stalledInterval 30s→300s), in-memory caches for token bucket + cooldown checks, Lua token bucket for API rate limiting. |
+| **Phase 15** | Campaign counter accuracy: `count_by_status()` authoritative counts from `campaign_recipients` table replace incremental counter shards. `sent_count`, `failed_count`, `pending_count`, `quota_exceeded_count` all sourced from single SQL aggregate. |
+| **Phase 16** | Quota counting fix: retry-aware quota consumption — only first attempt (`attempt_count == 0`) consumes quota. Retries skip quota. Prevents inflated usage counts for messages with transient failures. |
+| **Phase 17** | **Chatbot system redesign:** Dynamic `chatbot_button_mappings` table (replaces hardcoded Python dicts + JSONB columns). Button ID matching removed; button text-only matching. Keyword rules enhanced with `response_type` (text/template) + `match_type` (exact/contains/starts_with). Fallback template + configurable cooldown hours per tenant. AI mode fully disabled. New: `db_layer/chatbot_button_mappings.py`, `migration_chatbot_redesign.sql`, `run_migration.py`. New chatbot API endpoints: GET/POST/PUT/DELETE `/api/chatbot/button-mappings`. Frontend chatbot dashboard redesigned. |
 
 ---
 
