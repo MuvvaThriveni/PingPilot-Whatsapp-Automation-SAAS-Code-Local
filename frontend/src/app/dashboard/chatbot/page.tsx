@@ -23,6 +23,119 @@ import {
 } from 'lucide-react'
 
 
+// ── Searchable Template Selector (top-level to avoid remount issues) ──
+
+interface SearchableTemplateSelectorProps {
+  value: string
+  onChange: (v: string) => void
+  search: string
+  setSearch: (s: string) => void
+  open: boolean
+  setOpen: (o: boolean) => void
+  containerRef: React.RefObject<HTMLDivElement>
+  templates: WATemplate[]
+  templatesLoading: boolean
+  placeholder?: string
+}
+
+function SearchableTemplateSelector({
+  value,
+  onChange,
+  search,
+  setSearch,
+  open,
+  setOpen,
+  containerRef,
+  templates,
+  templatesLoading,
+  placeholder = 'Select a template',
+}: SearchableTemplateSelectorProps) {
+  const filtered = templates.filter(
+    (t) =>
+      t.name.toLowerCase().includes(search.toLowerCase()) ||
+      t.language.toLowerCase().includes(search.toLowerCase())
+  )
+  const currentLabel = value
+    ? templates.find((t) => t.name === value)
+      ? `${value} (${templates.find((t) => t.name === value)?.language})`
+      : value
+    : null
+
+  return (
+    <div className="relative" ref={containerRef}>
+      {/* Trigger */}
+      <button
+        type="button"
+        onClick={() => {
+          setOpen(!open)
+          if (!open) setSearch('')
+        }}
+        className="flex h-10 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <span className={currentLabel ? 'text-foreground' : 'text-muted-foreground'}>
+          {templatesLoading ? 'Loading templates…' : currentLabel ?? placeholder}
+        </span>
+        <ChevronDown className={`h-4 w-4 opacity-50 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+
+      {/* Dropdown */}
+      {open && (
+        <div
+          className="absolute z-50 mt-1 w-full rounded-md border bg-popover text-popover-foreground shadow-lg"
+          style={{ maxHeight: '280px', display: 'flex', flexDirection: 'column' }}
+        >
+          {/* Search input */}
+          <div className="flex items-center border-b px-3 py-2 gap-2">
+            <Search className="h-4 w-4 text-muted-foreground shrink-0" />
+            <input
+              autoFocus
+              className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+              placeholder="Search template…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+            {search && (
+              <button onClick={() => setSearch('')} className="text-muted-foreground hover:text-foreground">
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+
+          {/* List */}
+          <div className="overflow-y-auto flex-1 py-1">
+            {templatesLoading && (
+              <p className="px-3 py-2 text-sm text-muted-foreground">Loading…</p>
+            )}
+            {!templatesLoading && filtered.length === 0 && (
+              <p className="px-3 py-2 text-sm text-muted-foreground">
+                {templates.length === 0 ? 'No approved templates found' : 'No results'}
+              </p>
+            )}
+            {filtered.map((t) => (
+              <button
+                key={`${t.name}-${t.language}`}
+                type="button"
+                className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-accent hover:text-accent-foreground ${value === t.name ? 'bg-accent/50 font-medium' : ''
+                  }`}
+                onClick={() => {
+                  onChange(t.name)
+                  setOpen(false)
+                  setSearch('')
+                }}
+              >
+                <span className="inline-flex items-center justify-center w-4 h-4 rounded bg-green-100 text-green-700 text-[10px] font-bold">T</span>
+                <span>{t.name}</span>
+                <span className="ml-auto text-xs text-muted-foreground">{t.language}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
 // ── Types ─────────────────────────────────────────────────────────
 
 interface ChatbotSettings {
@@ -100,6 +213,16 @@ export default function ChatbotPage() {
   const [fallbackSearch, setFallbackSearch] = useState('')
   const [fallbackOpen, setFallbackOpen] = useState(false)
   const fallbackRef = useRef<HTMLDivElement>(null)
+
+  // Rule template searchable dropdown state
+  const [ruleTemplateSearch, setRuleTemplateSearch] = useState('')
+  const [ruleTemplateOpen, setRuleTemplateOpen] = useState(false)
+  const ruleTemplateRef = useRef<HTMLDivElement>(null)
+
+  // Mapping template searchable dropdown state
+  const [mappingTemplateSearch, setMappingTemplateSearch] = useState('')
+  const [mappingTemplateOpen, setMappingTemplateOpen] = useState(false)
+  const mappingTemplateRef = useRef<HTMLDivElement>(null)
 
   // ── Data Fetching ─────────────────────────────────────────────
 
@@ -404,9 +527,8 @@ export default function ChatbotPage() {
               {/* None option */}
               <button
                 type="button"
-                className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-accent hover:text-accent-foreground ${
-                  !settings.fallback_template_name ? 'bg-accent/50 font-medium' : ''
-                }`}
+                className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-accent hover:text-accent-foreground ${!settings.fallback_template_name ? 'bg-accent/50 font-medium' : ''
+                  }`}
                 onClick={() => {
                   setSettings({ ...settings, fallback_template_name: '' })
                   setFallbackOpen(false)
@@ -433,9 +555,8 @@ export default function ChatbotPage() {
                 <button
                   key={`${t.name}-${t.language}`}
                   type="button"
-                  className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-accent hover:text-accent-foreground ${
-                    settings.fallback_template_name === t.name ? 'bg-accent/50 font-medium' : ''
-                  }`}
+                  className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-accent hover:text-accent-foreground ${settings.fallback_template_name === t.name ? 'bg-accent/50 font-medium' : ''
+                    }`}
                   onClick={() => {
                     setSettings({ ...settings, fallback_template_name: t.name })
                     setFallbackOpen(false)
@@ -459,6 +580,28 @@ export default function ChatbotPage() {
     const handler = (e: MouseEvent) => {
       if (fallbackRef.current && !fallbackRef.current.contains(e.target as Node)) {
         setFallbackOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  // Close rule template dropdown when clicking outside
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ruleTemplateRef.current && !ruleTemplateRef.current.contains(e.target as Node)) {
+        setRuleTemplateOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  // Close mapping template dropdown when clicking outside
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (mappingTemplateRef.current && !mappingTemplateRef.current.contains(e.target as Node)) {
+        setMappingTemplateOpen(false)
       }
     }
     document.addEventListener('mousedown', handler)
@@ -513,10 +656,34 @@ export default function ChatbotPage() {
           <h1 className="text-2xl font-bold text-gray-900">WhatsApp Chatbot</h1>
           <p className="text-gray-500 mt-1">Configure auto-reply rules, button mappings, and fallback triggers</p>
         </div>
-        <Button variant="outline" size="sm" onClick={handleRefresh} disabled={refreshing}>
-          <RefreshCw className={`h-4 w-4 mr-1 ${refreshing ? 'animate-spin' : ''}`} />
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleRefresh}
+            disabled={refreshing}
+            aria-label="Refresh"
+            title="Refresh"
+            className="h-9 w-9 p-0"
+          >
+            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleSaveSettings}
+            disabled={saving}
+            aria-label="Save Settings"
+            title="Save Settings"
+            className="h-9 w-9 p-0"
+          >
+            {saving ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Save className="h-4 w-4" />
+            )}
+          </Button>
+        </div>
       </div>
 
       <div className="grid gap-6 xl:grid-cols-2">
@@ -570,10 +737,7 @@ export default function ChatbotPage() {
               </p>
             </div>
 
-            <Button onClick={handleSaveSettings} disabled={saving} className="w-full">
-              {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
-              Save Settings
-            </Button>
+
           </CardContent>
         </Card>
 
@@ -589,7 +753,7 @@ export default function ChatbotPage() {
                 <CardDescription>Map WhatsApp button clicks to template responses</CardDescription>
               </div>
               <Button size="sm" onClick={() => openMappingForm()}>
-                <Plus className="h-4 w-4 mr-1" /> Add
+                <Plus className="h-4 w-4 mr-1" />
               </Button>
             </div>
           </CardHeader>
@@ -608,9 +772,8 @@ export default function ChatbotPage() {
                 {mappings.map((m) => (
                   <div
                     key={m.id}
-                    className={`flex items-center justify-between p-3 rounded-lg border ${
-                      m.is_active ? 'bg-white border-gray-200' : 'bg-gray-50 border-gray-100 opacity-60'
-                    }`}
+                    className={`flex items-center justify-between p-3 rounded-lg border ${m.is_active ? 'bg-white border-gray-200' : 'bg-gray-50 border-gray-100 opacity-60'
+                      }`}
                   >
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
@@ -660,9 +823,17 @@ export default function ChatbotPage() {
                 </div>
                 <div className="space-y-1">
                   <Label className="text-xs">Template</Label>
-                  <TemplateSelector
+                  <SearchableTemplateSelector
                     value={mappingForm.template_name}
                     onChange={(v) => setMappingForm({ ...mappingForm, template_name: v })}
+                    search={mappingTemplateSearch}
+                    setSearch={setMappingTemplateSearch}
+                    open={mappingTemplateOpen}
+                    setOpen={setMappingTemplateOpen}
+                    containerRef={mappingTemplateRef}
+                    templates={templates}
+                    templatesLoading={templatesLoading}
+                    placeholder="Select a template"
                   />
                 </div>
                 <div className="flex justify-end gap-2">
@@ -694,7 +865,7 @@ export default function ChatbotPage() {
               </CardDescription>
             </div>
             <Button size="sm" onClick={() => openRuleForm()}>
-              <Plus className="h-4 w-4 mr-1" /> Add Rule
+              <Plus className="h-4 w-4 mr-1" />
             </Button>
           </div>
         </CardHeader>
@@ -715,9 +886,8 @@ export default function ChatbotPage() {
                 return (
                   <div
                     key={r.id}
-                    className={`flex items-center justify-between p-3 rounded-lg border ${
-                      active ? 'bg-white border-gray-200' : 'bg-gray-50 border-gray-100 opacity-60'
-                    }`}
+                    className={`flex items-center justify-between p-3 rounded-lg border ${active ? 'bg-white border-gray-200' : 'bg-gray-50 border-gray-100 opacity-60'
+                      }`}
                   >
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
@@ -811,9 +981,17 @@ export default function ChatbotPage() {
                   {ruleForm.response_type === 'template' ? 'Template' : 'Response Text'}
                 </Label>
                 {ruleForm.response_type === 'template' ? (
-                  <TemplateSelector
+                  <SearchableTemplateSelector
                     value={ruleForm.response}
                     onChange={(v) => setRuleForm({ ...ruleForm, response: v })}
+                    search={ruleTemplateSearch}
+                    setSearch={setRuleTemplateSearch}
+                    open={ruleTemplateOpen}
+                    setOpen={setRuleTemplateOpen}
+                    containerRef={ruleTemplateRef}
+                    templates={templates}
+                    templatesLoading={templatesLoading}
+                    placeholder="Select a template"
                   />
                 ) : (
                   <Textarea
