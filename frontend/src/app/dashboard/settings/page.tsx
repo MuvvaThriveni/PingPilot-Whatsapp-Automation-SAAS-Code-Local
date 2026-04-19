@@ -187,8 +187,8 @@ export default function SettingsPage() {
   return (
     <div className="max-w-2xl mx-auto space-y-6">
       <div>
-        <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
-        <p className="text-gray-500 mt-1">Configure your WhatsApp Business API connection</p>
+        <h1 className="text-[26px] font-semibold tracking-[-0.03em] text-white">Settings</h1>
+        <p className="text-[14px] text-[rgba(255,255,255,0.52)] mt-1">Configure your WhatsApp Business API connection</p>
       </div>
 
       <Card>
@@ -328,7 +328,7 @@ export default function SettingsPage() {
                 <Input
                   readOnly
                   value={webhookUrl}
-                  className="bg-gray-50 text-sm font-mono"
+                  className="bg-[#111111] text-[13px] text-[rgba(255,255,255,0.70)] border-[0.5px] border-white/[0.12] rounded-[8px] px-[14px] py-[10px] h-auto font-mono cursor-default"
                 />
                 <Button
                   type="button"
@@ -336,6 +336,7 @@ export default function SettingsPage() {
                   size="icon"
                   onClick={handleCopyWebhookUrl}
                   title="Copy webhook URL"
+                  className="bg-[#1a1a1a] border-[0.5px] border-white/[0.10] text-[rgba(255,255,255,0.50)] rounded-[6px] hover:text-white hover:border-white/[0.25]"
                 >
                   {copied ? <Check className="h-4 w-4 text-green-600" /> : <Copy className="h-4 w-4" />}
                 </Button>
@@ -364,12 +365,12 @@ export default function SettingsPage() {
       {/* Help Card */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Need Help?</CardTitle>
+          <CardTitle className="text-[16px] font-semibold text-white">Need Help?</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">
-            <h4 className="font-medium">How to get your credentials:</h4>
-            <ol className="list-decimal list-inside text-sm text-gray-600 space-y-1">
+            <h4 className="text-[13px] font-medium text-[rgba(255,255,255,0.70)] mb-[10px]">How to get your credentials:</h4>
+            <ol className="list-decimal pl-4 text-[13px] leading-[1.8] text-[rgba(255,255,255,0.55)] space-y-1">
               <li>Go to Meta Business Suite and create a WhatsApp Business account</li>
               <li>Navigate to WhatsApp Manager to find your Business Account ID</li>
               <li>Add a phone number and note the Phone Number ID</li>
@@ -380,13 +381,22 @@ export default function SettingsPage() {
             href="https://developers.facebook.com/docs/whatsapp/cloud-api/get-started"
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center text-sm text-green-600 hover:underline"
+            className="inline-flex items-center gap-1 text-[13px] text-[#25D366] no-underline hover:underline"
           >
             View WhatsApp Cloud API Documentation
             <ExternalLink className="ml-1 h-3 w-3" />
           </a>
         </CardContent>
       </Card>
+      <style jsx>{`
+        input[readonly],
+        input:disabled {
+          background: #111111 !important;
+          color: rgba(255, 255, 255, 0.65) !important;
+          -webkit-text-fill-color: rgba(255, 255, 255, 0.65) !important;
+          opacity: 1 !important;
+        }
+      `}</style>
     </div>
   )
 }

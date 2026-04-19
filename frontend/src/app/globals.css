@@ -4,48 +4,45 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
-    --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 142.1 76.2% 36.3%;
-    --primary-foreground: 355.7 100% 97.3%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 142.1 76.2% 36.3%;
-    --radius: 0.5rem;
-  }
+    /* Apple aesthetic dark theme */
+    --background: 0 0% 0%;
+    --foreground: 0 0% 100%;
 
-  .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 142.1 70.6% 45.3%;
-    --primary-foreground: 144.9 80.4% 10%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 142.4 71.8% 29.2%;
+    /* Card surfaces */
+    --card: 0 0% 5%;
+    --card-foreground: 0 0% 100%;
+
+    /* Popovers */
+    --popover: 0 0% 5%;
+    --popover-foreground: 0 0% 100%;
+
+    /* Primary - WhatsApp green */
+    --primary: 142 76% 52%;
+    --primary-foreground: 0 0% 0%;
+
+    /* Secondary */
+    --secondary: 0 0% 7%;
+    --secondary-foreground: 0 0% 100%;
+
+    /* Muted */
+    --muted: 0 0% 7%;
+    --muted-foreground: 0 0% 38%;
+
+    /* Accent */
+    --accent: 0 0% 7%;
+    --accent-foreground: 0 0% 100%;
+
+    /* Destructive */
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Borders */
+    --border: 0 0% 100% / 0.07;
+    --input: 0 0% 100% / 0.07;
+    --ring: 142 76% 52%;
+
+    /* Radius */
+    --radius: 0.75rem;
   }
 }
 
@@ -53,7 +50,159 @@
   * {
     @apply border-border;
   }
+
   body {
-    @apply bg-background text-foreground;
+    @apply bg-black text-white;
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
+
+  /* Typography - Apple style */
+  h1, h2, h3, h4, h5, h6 {
+    letter-spacing: -0.02em;
+    font-weight: 600;
+  }
+
+  h1 {
+    letter-spacing: -0.04em;
+    font-weight: 700;
+  }
+}
+
+@layer utilities {
+  /* Text hierarchy utilities */
+  .text-hero {
+    font-size: 48px;
+    line-height: 1.1;
+    font-weight: 700;
+    letter-spacing: -0.04em;
+  }
+
+  .text-section-title {
+    font-size: 28px;
+    line-height: 1.2;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
+  .text-card-title {
+    font-size: 15px;
+    line-height: 1.4;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
+  .text-body {
+    font-size: 13px;
+    line-height: 1.65;
+    font-weight: 400;
+    color: rgba(255, 255, 255, 0.42);
+  }
+
+  .text-label {
+    font-size: 11px;
+    line-height: 1.4;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.62);
+  }
+
+  .text-secondary {
+    color: rgba(255, 255, 255, 0.62);
+  }
+
+  .hover\:text-secondary:hover {
+    color: rgba(255, 255, 255, 0.62);
+  }
+
+  .text-tertiary {
+    color: rgba(255, 255, 255, 0.42);
+  }
+
+  .text-hint {
+    color: rgba(255, 255, 255, 0.28);
+  }
+
+  .text-eyebrow {
+    font-size: 12px;
+    line-height: 1.4;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #25D366;
+  }
+
+  /* Gradient text */
+  .text-gradient {
+    background-clip: text;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  /* Border utilities */
+  .border-subtle {
+    border: 0.5px solid rgba(255, 255, 255, 0.07);
+  }
+
+  .border-subtle-hover {
+    transition: border-color 0.2s ease;
+  }
+
+  .border-subtle-hover:hover {
+    border-color: rgba(255, 255, 255, 0.14);
+  }
+
+  /* Card backgrounds */
+  .bg-surface {
+    background-color: #0a0a0a;
+  }
+
+  .bg-card-apple {
+    background-color: #0d0d0d;
+  }
+
+  .bg-elevated {
+    background-color: #111111;
+  }
+
+  .bg-hover {
+    background-color: #161616;
+  }
+
+  /* Blur navbar */
+  .blur-navbar {
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+  }
+
+  /* Pill button */
+  .btn-pill {
+    border-radius: 980px;
+  }
+
+  /* Smooth transitions */
+  .transition-apple {
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
 }
