@@ -187,15 +187,15 @@ export default function SettingsPage() {
   return (
     <div className="max-w-2xl mx-auto space-y-6">
       <div>
-        <h1 className="text-[26px] font-semibold tracking-[-0.03em] text-white">Settings</h1>
-        <p className="text-[14px] text-[rgba(255,255,255,0.52)] mt-1">Configure your WhatsApp Business API connection</p>
+        <h1 className="text-[26px] font-semibold tracking-[-0.03em] text-primary">Settings</h1>
+        <p className="text-[14px] mt-1 text-tertiary">Configure your WhatsApp Business API connection</p>
       </div>
 
       <Card>
         <CardHeader>
           <div className="flex items-center space-x-3">
-            <div className="p-2 bg-green-100 rounded-lg">
-              <Settings className="h-5 w-5 text-green-600" />
+            <div className="p-2 bg-[var(--accent-dim)] rounded-lg">
+              <Settings className="h-5 w-5 text-[var(--accent-text)]" />
             </div>
             <div>
               <CardTitle>WhatsApp Business API</CardTitle>
@@ -206,19 +206,18 @@ export default function SettingsPage() {
         <CardContent className="space-y-6">
           {/* Connection Status */}
           {connectionStatus !== 'unknown' && (
-            <div className={`flex items-center space-x-3 p-4 rounded-lg ${connectionStatus === 'success' ? 'bg-green-50' : 'bg-red-50'
-              }`}>
+            <div className={`flex items-center space-x-3 p-4 rounded-lg ${connectionStatus === 'success' ? 'bg-[rgba(37,211,102,0.10)]' : 'bg-[rgba(239,68,68,0.10)]'}`}>
               {connectionStatus === 'success' ? (
-                <CheckCircle className="h-5 w-5 text-green-600" />
+                <CheckCircle className="h-5 w-5 text-[var(--accent-text)]" />
               ) : (
-                <XCircle className="h-5 w-5 text-red-600" />
+                <XCircle className="h-5 w-5 text-red-500" />
               )}
               <div>
-                <p className={`font-medium ${connectionStatus === 'success' ? 'text-green-800' : 'text-red-800'}`}>
+                <p className={`font-medium ${connectionStatus === 'success' ? 'text-[#25D366]' : 'text-[#ef4444]'}`}>
                   {connectionStatus === 'success' ? 'Connected' : 'Connection Failed'}
                 </p>
                 {connectionInfo && connectionStatus === 'success' && (
-                  <p className="text-sm text-green-600">
+                  <p className="text-sm text-[var(--accent-text)]">
                     {connectionInfo.verifiedName} ({connectionInfo.phoneNumber})
                   </p>
                 )}
@@ -228,28 +227,28 @@ export default function SettingsPage() {
 
           {/* Business Account ID */}
           <div className="space-y-2">
-            <Label htmlFor="business_account_id">Business Account ID *</Label>
+            <Label htmlFor="business_account_id">Business Account ID <span className="text-[var(--accent)]">*</span></Label>
             <Input
               id="business_account_id"
               placeholder="e.g., 123456789012345"
               value={formData.business_account_id}
               onChange={(e) => setFormData({ ...formData, business_account_id: e.target.value })}
             />
-            <p className="text-xs text-gray-500">
+            <p className="text-helper">
               Found in Meta Business Suite under WhatsApp Manager
             </p>
           </div>
 
           {/* Phone Number ID */}
           <div className="space-y-2">
-            <Label htmlFor="phone_number_id">Phone Number ID *</Label>
+            <Label htmlFor="phone_number_id">Phone Number ID <span className="text-[var(--accent)]">*</span></Label>
             <Input
               id="phone_number_id"
               placeholder="e.g., 123456789012345"
               value={formData.phone_number_id}
               onChange={(e) => setFormData({ ...formData, phone_number_id: e.target.value })}
             />
-            <p className="text-xs text-gray-500">
+            <p className="text-helper">
               The ID of your WhatsApp Business phone number
             </p>
           </div>
@@ -268,13 +267,13 @@ export default function SettingsPage() {
               />
               <button
                 type="button"
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-tertiary hover:text-primary transition-colors"
                 onClick={() => setShowToken(!showToken)}
               >
                 {showToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
               </button>
             </div>
-            <p className="text-xs text-gray-500">
+            <p className="text-helper">
               {hasExistingToken ? 'A token is already saved. Only enter a new one if you want to update it.' : 'Generate a permanent token in Meta Developer Portal'}
             </p>
           </div>
@@ -288,7 +287,7 @@ export default function SettingsPage() {
               value={formData.webhook_verify_token}
               onChange={(e) => setFormData({ ...formData, webhook_verify_token: e.target.value })}
             />
-            <p className="text-xs text-gray-500">
+            <p className="text-helper">
               Used to verify webhook requests from WhatsApp (for chatbot feature)
             </p>
           </div>
@@ -307,13 +306,13 @@ export default function SettingsPage() {
               />
               <button
                 type="button"
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-tertiary hover:text-primary transition-colors"
                 onClick={() => setShowMetaAppSecret(!showMetaAppSecret)}
               >
                 {showMetaAppSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
               </button>
             </div>
-            <p className="text-xs text-gray-500">
+            <p className="text-helper">
               {hasExistingMetaAppSecret
                 ? 'A secret is already saved. Only enter a new one if you want to update it.'
                 : 'Found in Meta Developer Portal → App Settings → Basic. Used to verify webhook signatures.'}
@@ -328,7 +327,7 @@ export default function SettingsPage() {
                 <Input
                   readOnly
                   value={webhookUrl}
-                  className="bg-[#111111] text-[13px] text-[rgba(255,255,255,0.70)] border-[0.5px] border-white/[0.12] rounded-[8px] px-[14px] py-[10px] h-auto font-mono cursor-default"
+                  className="h-10 bg-[var(--bg-card)] text-secondary border-[var(--border-default)] cursor-default"
                 />
                 <Button
                   type="button"
@@ -336,12 +335,12 @@ export default function SettingsPage() {
                   size="icon"
                   onClick={handleCopyWebhookUrl}
                   title="Copy webhook URL"
-                  className="bg-[#1a1a1a] border-[0.5px] border-white/[0.10] text-[rgba(255,255,255,0.50)] rounded-[6px] hover:text-white hover:border-white/[0.25]"
+                  className="bg-[var(--bg-elevated)] border-[var(--border-default)] text-tertiary hover:text-primary hover:border-[var(--border-strong)]"
                 >
-                  {copied ? <Check className="h-4 w-4 text-green-600" /> : <Copy className="h-4 w-4" />}
+                  {copied ? <Check className="h-4 w-4 text-[#25D366]" /> : <Copy className="h-4 w-4" />}
                 </Button>
               </div>
-              <p className="text-xs text-gray-500">
+              <p className="text-helper">
                 Use this URL in your Meta App → Webhooks configuration. Requests are verified using your Meta App Secret.
                 This URL is environment-specific (development vs production).
               </p>
@@ -365,12 +364,12 @@ export default function SettingsPage() {
       {/* Help Card */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-[16px] font-semibold text-white">Need Help?</CardTitle>
+          <CardTitle className="text-[16px] font-semibold">Need Help?</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">
-            <h4 className="text-[13px] font-medium text-[rgba(255,255,255,0.70)] mb-[10px]">How to get your credentials:</h4>
-            <ol className="list-decimal pl-4 text-[13px] leading-[1.8] text-[rgba(255,255,255,0.55)] space-y-1">
+            <h4 className="text-[13px] font-medium mb-[10px] text-secondary">How to get your credentials:</h4>
+            <ol className="list-decimal pl-4 text-[13px] leading-[1.8] text-tertiary space-y-1">
               <li>Go to Meta Business Suite and create a WhatsApp Business account</li>
               <li>Navigate to WhatsApp Manager to find your Business Account ID</li>
               <li>Add a phone number and note the Phone Number ID</li>
@@ -381,22 +380,14 @@ export default function SettingsPage() {
             href="https://developers.facebook.com/docs/whatsapp/cloud-api/get-started"
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-[13px] text-[#25D366] no-underline hover:underline"
+            className="inline-flex items-center gap-1 text-[13px] no-underline hover:underline text-[var(--accent-text)]"
           >
             View WhatsApp Cloud API Documentation
             <ExternalLink className="ml-1 h-3 w-3" />
           </a>
         </CardContent>
       </Card>
-      <style jsx>{`
-        input[readonly],
-        input:disabled {
-          background: #111111 !important;
-          color: rgba(255, 255, 255, 0.65) !important;
-          -webkit-text-fill-color: rgba(255, 255, 255, 0.65) !important;
-          opacity: 1 !important;
-        }
-      `}</style>
     </div>
   )
 }
+

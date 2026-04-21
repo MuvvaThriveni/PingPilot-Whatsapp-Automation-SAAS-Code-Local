@@ -275,15 +275,15 @@ export default function ChatbotPage() {
 
   const TemplateSelector = ({ value, onChange }: { value: string; onChange: (v: string) => void }) => (
     <Select value={value} onValueChange={onChange}>
-      <SelectTrigger className="bg-[#111111] border-white/[0.07] text-white">
+      <SelectTrigger className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] text-primary focus:ring-0 focus:border-[var(--accent-border)]">
         <SelectValue placeholder={templatesLoading ? 'Loading templates...' : 'Select a template'} />
       </SelectTrigger>
-      <SelectContent className="bg-[#111111] border-white/[0.07]">
+      <SelectContent className="bg-[var(--bg-surface)] border-[var(--border-default)]">
         {templates.length === 0 && !templatesLoading && (
           <SelectItem value="_none" disabled>No approved templates found</SelectItem>
         )}
         {templates.map((t) => (
-          <SelectItem key={`${t.name}-${t.language}`} value={t.name} className="text-white">
+          <SelectItem key={`${t.name}-${t.language}`} value={t.name} className="text-primary">
             {t.name} ({t.language})
           </SelectItem>
         ))}
@@ -307,27 +307,27 @@ export default function ChatbotPage() {
         <button
           type="button"
           onClick={() => { setFallbackOpen((o) => !o); if (!fallbackOpen) setFallbackSearch('') }}
-          className="flex h-10 w-full items-center justify-between rounded-lg border border-white/[0.07] bg-[#111111] px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-[#25D366]/20"
+          className="flex h-10 w-full items-center justify-between rounded-lg border-[0.5px] border-[var(--border-default)] bg-[var(--bg-surface)] px-3 py-2 text-sm text-primary focus:outline-none focus:ring-0 focus:border-[var(--accent-border)]"
         >
-          <span className={currentLabel ? 'text-white' : 'text-tertiary'}>
-            {templatesLoading ? 'Loading templates…' : currentLabel ?? 'Select a template (or None)'}
+          <span className={currentLabel ? 'text-primary' : 'text-tertiary'}>
+            {templatesLoading ? 'Loading templates...' : currentLabel ?? 'Select a template (or None)'}
           </span>
           <ChevronDown className={`h-4 w-4 opacity-50 transition-transform ${fallbackOpen ? 'rotate-180' : ''}`} />
         </button>
 
         {fallbackOpen && (
-          <div className="absolute z-50 mt-1 w-full rounded-lg border border-white/[0.07] bg-[#111111] shadow-lg" style={{ maxHeight: '280px', display: 'flex', flexDirection: 'column' }}>
-            <div className="flex items-center border-b border-white/[0.07] px-3 py-2 gap-2">
+          <div className="absolute z-50 mt-1 w-full rounded-lg border border-[var(--border-default)] bg-[var(--bg-surface)] shadow-lg" style={{ maxHeight: '280px', display: 'flex', flexDirection: 'column' }}>
+            <div className="flex items-center border-b border-[var(--border-default)] px-3 py-2 gap-2">
               <Search className="h-4 w-4 text-tertiary shrink-0" />
               <input
                 autoFocus
-                className="flex-1 bg-transparent text-sm outline-none placeholder:text-tertiary text-white"
-                placeholder="Search template…"
+                className="flex-1 bg-transparent text-sm outline-none placeholder:text-hint text-primary"
+                placeholder="Search template..."
                 value={fallbackSearch}
                 onChange={(e) => setFallbackSearch(e.target.value)}
               />
               {fallbackSearch && (
-                <button onClick={() => setFallbackSearch('')} className="text-tertiary hover:text-white">
+                <button onClick={() => setFallbackSearch('')} className="text-tertiary hover:text-primary">
                   <X className="h-3.5 w-3.5" />
                 </button>
               )}
@@ -336,16 +336,16 @@ export default function ChatbotPage() {
             <div className="overflow-y-auto flex-1 py-1">
               <button
                 type="button"
-                className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-white/[0.06] ${!settings.fallback_template_name ? 'bg-white/[0.06] font-medium' : ''}`}
+                className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[var(--bg-hover)] ${!settings.fallback_template_name ? 'bg-[var(--bg-hover)] font-medium' : ''}`}
                 onClick={() => { setSettings({ ...settings, fallback_template_name: '' }); setFallbackOpen(false); setFallbackSearch('') }}
               >
                 <Ban className="h-3.5 w-3.5 text-tertiary" />
-                <span className="text-tertiary italic">None – no fallback template</span>
+                <span className="text-tertiary italic">None - no fallback template</span>
               </button>
 
-              <div className="mx-2 my-1 border-t border-white/[0.07]" />
+              <div className="mx-2 my-1 border-t border-[var(--border-default)]" />
 
-              {templatesLoading && <p className="px-3 py-2 text-sm text-tertiary">Loading…</p>}
+              {templatesLoading && <p className="px-3 py-2 text-sm text-tertiary">Loading...</p>}
               {!templatesLoading && filteredFallbackTemplates.length === 0 && (
                 <p className="px-3 py-2 text-sm text-tertiary">{templates.length === 0 ? 'No approved templates found' : 'No results'}</p>
               )}
@@ -353,11 +353,11 @@ export default function ChatbotPage() {
                 <button
                   key={`${t.name}-${t.language}`}
                   type="button"
-                  className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-white/[0.06] ${settings.fallback_template_name === t.name ? 'bg-white/[0.06] font-medium' : ''}`}
+                  className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[var(--bg-hover)] ${settings.fallback_template_name === t.name ? 'bg-[var(--bg-hover)] font-medium' : ''}`}
                   onClick={() => { setSettings({ ...settings, fallback_template_name: t.name }); setFallbackOpen(false); setFallbackSearch('') }}
                 >
                   <span className="inline-flex items-center justify-center w-4 h-4 rounded bg-[#25D366]/20 text-[#25D366] text-[10px] font-bold">T</span>
-                  <span className="text-white">{t.name}</span>
+                  <span className="text-primary">{t.name}</span>
                   <span className="ml-auto text-xs text-tertiary">{t.language}</span>
                 </button>
               ))}
@@ -417,10 +417,10 @@ export default function ChatbotPage() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col items-center text-center gap-3">
         <div>
           <p className="text-eyebrow mb-2">Automation & AI</p>
-          <h1 className="text-section-title text-white">WhatsApp Chatbot</h1>
+          <h1 className="text-section-title">WhatsApp Chatbot</h1>
           <p className="text-body text-[14px] mt-1">Configure auto-reply rules, button mappings, and fallback triggers</p>
         </div>
         <Button variant="outline" size="sm" onClick={handleRefresh} disabled={refreshing} className="h-9">
@@ -445,7 +445,7 @@ export default function ChatbotPage() {
             </div>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="flex items-center space-x-2 p-3 rounded-lg bg-[#111111] border border-white/[0.07]">
+            <div className="flex items-center space-x-2 p-3 rounded-lg bg-[var(--bg-surface)] border border-[var(--border-default)]">
               <Bot className={`h-5 w-5 ${isEnabled ? 'text-[#25D366]' : 'text-tertiary'}`} />
               <span className={isEnabled ? 'text-[#25D366] font-medium text-[13px]' : 'text-tertiary text-[13px]'}>
                 {isEnabled ? 'Chatbot is active' : 'Chatbot is disabled'}
@@ -469,7 +469,7 @@ export default function ChatbotPage() {
                 max={720}
                 value={settings.fallback_cooldown_hours || 24}
                 onChange={(e) => setSettings({ ...settings, fallback_cooldown_hours: parseInt(e.target.value) || 24 })}
-                className="bg-[#111111] border-white/[0.07] placeholder:text-tertiary text-white text-[14px] focus:ring-[#25D366]/20"
+                className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] placeholder:text-hint text-primary text-[14px] focus-visible:border-[var(--accent-border)] focus-visible:ring-0"
               />
               <p className="text-xs text-tertiary">How many hours to wait before sending the fallback template again to the same contact</p>
             </div>
@@ -511,7 +511,7 @@ export default function ChatbotPage() {
                 {mappings.map((m) => (
                   <div
                     key={m.id}
-                    className={`flex items-center justify-between p-3 rounded-lg border ${m.is_active ? 'bg-[#111111] border-white/[0.07]' : 'bg-white/[0.02] border-white/[0.04] opacity-60'}`}
+                    className={`flex items-center justify-between p-3 rounded-lg border ${m.is_active ? 'bg-[var(--bg-surface)] border-[var(--border-default)]' : 'bg-[var(--bg-hover)] border-[var(--border-subtle)] opacity-60'}`}
                   >
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
@@ -541,9 +541,9 @@ export default function ChatbotPage() {
 
             {/* Mapping Form */}
             {showMappingForm && (
-              <div className="border border-white/[0.07] rounded-lg p-4 space-y-3 bg-[#0a0a0a]">
+              <div className="border border-[var(--border-default)] rounded-lg p-4 space-y-3 bg-[var(--bg-surface)]">
                 <div className="flex items-center justify-between">
-                  <h4 className="font-medium text-[13px] text-white">{editingMapping ? 'Edit Mapping' : 'New Button Mapping'}</h4>
+                  <h4 className="font-medium text-[13px] text-primary">{editingMapping ? 'Edit Mapping' : 'New Button Mapping'}</h4>
                   <Button variant="ghost" size="sm" onClick={() => { setShowMappingForm(false); setEditingMapping(null) }} className="h-8 w-8">
                     <X className="h-4 w-4" />
                   </Button>
@@ -554,7 +554,7 @@ export default function ChatbotPage() {
                     placeholder="e.g. Morning"
                     value={mappingForm.button_text}
                     onChange={(e) => setMappingForm({ ...mappingForm, button_text: e.target.value })}
-                    className="bg-[#111111] border-white/[0.07] placeholder:text-tertiary text-white text-[14px] focus:ring-[#25D366]/20"
+                    className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] placeholder:text-hint text-primary text-[14px] focus-visible:border-[var(--accent-border)] focus-visible:ring-0"
                   />
                 </div>
                 <div className="space-y-1">
@@ -606,14 +606,14 @@ export default function ChatbotPage() {
                 return (
                   <div
                     key={r.id}
-                    className={`flex items-center justify-between p-3 rounded-lg border ${active ? 'bg-[#111111] border-white/[0.07]' : 'bg-white/[0.02] border-white/[0.04] opacity-60'}`}
+                    className={`flex items-center justify-between p-3 rounded-lg border ${active ? 'bg-[var(--bg-surface)] border-[var(--border-default)]' : 'bg-[var(--bg-hover)] border-[var(--border-subtle)] opacity-60'}`}
                   >
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-orange-500/10 text-orange-400 border border-orange-500/20">
                           {r.match_type || 'contains'}
                         </span>
-                        <span className="font-mono text-[13px] font-medium text-white">&quot;{r.keyword}&quot;</span>
+                        <span className="font-mono text-[13px] font-medium text-primary">&quot;{r.keyword}&quot;</span>
                         <span className="text-tertiary">→</span>
                         {r.response_type === 'template' ? (
                           <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-[#25D366]/10 text-[#25D366] border border-[#25D366]/20">
@@ -641,9 +641,9 @@ export default function ChatbotPage() {
 
           {/* Rule Form */}
           {showRuleForm && (
-            <div className="border border-white/[0.07] rounded-lg p-4 space-y-3 bg-[#0a0a0a]">
+            <div className="border border-[var(--border-default)] rounded-lg p-4 space-y-3 bg-[var(--bg-surface)]">
               <div className="flex items-center justify-between">
-                <h4 className="font-medium text-[13px] text-white">{editingRule ? 'Edit Rule' : 'New Keyword Rule'}</h4>
+                <h4 className="font-medium text-[13px] text-primary">{editingRule ? 'Edit Rule' : 'New Keyword Rule'}</h4>
                 <Button variant="ghost" size="sm" onClick={() => { setShowRuleForm(false); setEditingRule(null) }} className="h-8 w-8">
                   <X className="h-4 w-4" />
                 </Button>
@@ -656,19 +656,19 @@ export default function ChatbotPage() {
                     placeholder="e.g. pricing"
                     value={ruleForm.keyword}
                     onChange={(e) => setRuleForm({ ...ruleForm, keyword: e.target.value })}
-                    className="bg-[#111111] border-white/[0.07] placeholder:text-tertiary text-white text-[14px] focus:ring-[#25D366]/20"
+                    className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] placeholder:text-hint text-primary text-[14px] focus-visible:border-[var(--accent-border)] focus-visible:ring-0"
                   />
                 </div>
                 <div className="space-y-1">
                   <Label className="text-[12px] text-secondary">Match Type</Label>
                   <Select value={ruleForm.match_type} onValueChange={(v) => setRuleForm({ ...ruleForm, match_type: v })}>
-                    <SelectTrigger className="bg-[#111111] border-white/[0.07] text-white">
+                    <SelectTrigger className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] text-primary focus:ring-0 focus:border-[var(--accent-border)]">
                       <SelectValue />
                     </SelectTrigger>
-                    <SelectContent className="bg-[#111111] border-white/[0.07]">
-                      <SelectItem value="contains" className="text-white">Contains</SelectItem>
-                      <SelectItem value="exact" className="text-white">Exact Match</SelectItem>
-                      <SelectItem value="starts_with" className="text-white">Starts With</SelectItem>
+                    <SelectContent className="bg-[var(--bg-surface)] border-[var(--border-default)]">
+                      <SelectItem value="contains" className="text-primary">Contains</SelectItem>
+                      <SelectItem value="exact" className="text-primary">Exact Match</SelectItem>
+                      <SelectItem value="starts_with" className="text-primary">Starts With</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -677,12 +677,12 @@ export default function ChatbotPage() {
               <div className="space-y-1">
                 <Label className="text-[12px] text-secondary">Response Type</Label>
                 <Select value={ruleForm.response_type} onValueChange={(v) => setRuleForm({ ...ruleForm, response_type: v, response: '' })}>
-                  <SelectTrigger className="bg-[#111111] border-white/[0.07] text-white">
+                  <SelectTrigger className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] text-primary focus:ring-0 focus:border-[var(--accent-border)]">
                     <SelectValue />
                   </SelectTrigger>
-                  <SelectContent className="bg-[#111111] border-white/[0.07]">
-                    <SelectItem value="text" className="text-white">💬 Text Message</SelectItem>
-                    <SelectItem value="template" className="text-white">📋 Template</SelectItem>
+                  <SelectContent className="bg-[var(--bg-surface)] border-[var(--border-default)]">
+                    <SelectItem value="text" className="text-primary">💬 Text Message</SelectItem>
+                    <SelectItem value="template" className="text-primary">📋 Template</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -697,7 +697,7 @@ export default function ChatbotPage() {
                     value={ruleForm.response}
                     onChange={(e) => setRuleForm({ ...ruleForm, response: e.target.value })}
                     rows={3}
-                    className="bg-[#111111] border-white/[0.07] placeholder:text-tertiary text-white text-[14px] focus:ring-[#25D366]/20"
+                    className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] placeholder:text-hint text-primary text-[14px] focus-visible:border-[var(--accent-border)] focus-visible:ring-0"
                   />
                 )}
               </div>
@@ -709,7 +709,7 @@ export default function ChatbotPage() {
                   min={0}
                   value={ruleForm.priority}
                   onChange={(e) => setRuleForm({ ...ruleForm, priority: parseInt(e.target.value) || 0 })}
-                  className="bg-[#111111] border-white/[0.07] placeholder:text-tertiary text-white text-[14px] focus:ring-[#25D366]/20"
+                  className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] placeholder:text-hint text-primary text-[14px] focus-visible:border-[var(--accent-border)] focus-visible:ring-0"
                 />
               </div>
 
@@ -727,3 +727,5 @@ export default function ChatbotPage() {
     </div>
   )
 }
+
+

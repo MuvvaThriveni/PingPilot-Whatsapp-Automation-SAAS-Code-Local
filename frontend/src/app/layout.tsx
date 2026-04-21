@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import './globals.css'
 import { Toaster } from '@/components/ui/toaster'
 import { AuthProvider } from '@/contexts/AuthContext'
+import ThemeInitializer from '@/components/ThemeInitializer'
 
 export const metadata: Metadata = {
   title: 'WappFlow - WhatsApp Automation Platform',
@@ -14,8 +15,9 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" className="dark">
-      <body className="bg-black text-white antialiased">
+    <html lang="en" data-theme="dark" suppressHydrationWarning>
+      <body className="antialiased">
+        <ThemeInitializer />
         <AuthProvider>
           {children}
         </AuthProvider>

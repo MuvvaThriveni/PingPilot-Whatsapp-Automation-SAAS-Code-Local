@@ -286,9 +286,9 @@ export default function BulkMessagePage() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div>
+      <div className="text-center max-w-3xl mx-auto">
         <p className="text-eyebrow mb-2">Marketing Automation</p>
-        <h1 className="text-section-title text-white">Bulk WhatsApp Messaging</h1>
+        <h1 className="text-section-title">Bulk WhatsApp Messaging</h1>
         <p className="text-body text-[14px] mt-1">
           Send messages to multiple contacts using Excel or CSV files
         </p>
@@ -300,7 +300,7 @@ export default function BulkMessagePage() {
           <CardContent className="pt-6 pb-4">
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
-                <span className="text-[13px] font-medium text-white">Monthly Message Quota</span>
+                <span className="text-[13px] font-medium text-primary">Monthly Message Quota</span>
                 {quota.remaining <= 0 && (
                   <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-red-500/10 text-red-400 border border-red-500/20">
                     <AlertTriangle className="h-3 w-3" />
@@ -312,7 +312,7 @@ export default function BulkMessagePage() {
                 {quota.used} / {quota.limit} used
               </span>
             </div>
-            <div className="w-full bg-white/[0.06] rounded-full h-2">
+            <div className="w-full bg-[var(--bg-hover)] rounded-full h-2">
               <div
                 className={`h-2 rounded-full transition-all ${
                   quota.percent_used >= 100
@@ -325,7 +325,7 @@ export default function BulkMessagePage() {
               />
             </div>
             <p className="text-[12px] text-tertiary mt-2">
-              {quota.remaining} remaining • Resets {new Date(quota.resets_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
+              {quota.remaining} remaining - Resets {new Date(quota.resets_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
             </p>
           </CardContent>
         </Card>
@@ -347,7 +347,7 @@ export default function BulkMessagePage() {
                   {...getRootProps()}
                   className={`
                     border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-apple
-                    ${isDragActive ? 'border-[#25D366] bg-[#25D366]/[0.04]' : 'border-white/[0.07] hover:border-white/[0.14] hover:bg-white/[0.02]'}
+                    ${isDragActive ? 'border-[#25D366] bg-[var(--accent-dim)]' : 'border-[var(--border-default)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]'}
                   `}
                 >
                   <input {...getInputProps()} />
@@ -361,11 +361,11 @@ export default function BulkMessagePage() {
                 </div>
               ) : (
                 <>
-                  <div className="flex items-center justify-between p-3 bg-[#111111] rounded-xl border border-white/[0.07]">
+                  <div className="flex items-center justify-between p-3 bg-[var(--bg-surface)] rounded-xl border-[0.5px] border-[var(--border-default)]">
                     <div className="flex items-center space-x-3">
                       <FileSpreadsheet className="h-6 w-6 text-[#25D366]" />
                       <div>
-                        <p className="font-medium text-[13px] text-white">{file.name}</p>
+                        <p className="font-medium text-[13px] text-primary">{file.name}</p>
                         <p className="text-xs text-tertiary">
                           {parsing ? 'Parsing...' : `${totalContacts} valid contacts`}
                         </p>
@@ -394,7 +394,7 @@ export default function BulkMessagePage() {
                 <>
                   <select
                     id="template"
-                    className="flex h-10 w-full rounded-lg border border-white/[0.07] bg-[#111111] px-3 py-2 text-sm text-white ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#25D366]/20"
+                    className="flex h-10 w-full rounded-lg border-[0.5px] border-[var(--border-default)] bg-[var(--bg-surface)] px-3 py-2 text-sm text-primary ring-offset-background focus-visible:border-[var(--accent-border)] focus-visible:outline-none focus-visible:ring-0"
                     value={templateName}
                     onChange={(e) => setTemplateName(e.target.value)}
                   >
@@ -425,7 +425,7 @@ export default function BulkMessagePage() {
                     placeholder="e.g., hello_world|en_US"
                     value={templateName}
                     onChange={(e) => setTemplateName(e.target.value)}
-                    className="bg-[#111111] border-white/[0.07] placeholder:text-tertiary text-white text-[14px] focus:ring-[#25D366]/20"
+                    className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] placeholder:text-hint text-primary text-[14px] focus-visible:border-[var(--accent-border)] focus-visible:ring-0"
                   />
                   <p className="text-xs text-tertiary">
                     {loadingTemplates ? 'Loading templates...' : 'Enter template name or configure WhatsApp in Settings to load templates'}
@@ -442,7 +442,7 @@ export default function BulkMessagePage() {
                 placeholder="e.g., January Promo"
                 value={campaignName}
                 onChange={(e) => setCampaignName(e.target.value)}
-                className="bg-[#111111] border-white/[0.07] placeholder:text-tertiary text-white text-[14px] focus:ring-[#25D366]/20"
+                className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] placeholder:text-hint text-primary text-[14px] focus-visible:border-[var(--accent-border)] focus-visible:ring-0"
               />
             </div>
 
@@ -456,7 +456,7 @@ export default function BulkMessagePage() {
                 max="10000"
                 value={delayMs}
                 onChange={(e) => setDelayMs(e.target.value)}
-                className="bg-[#111111] border-white/[0.07] placeholder:text-tertiary text-white text-[14px] focus:ring-[#25D366]/20"
+                className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] placeholder:text-hint text-primary text-[14px] focus-visible:border-[var(--accent-border)] focus-visible:ring-0"
               />
               <p className="text-xs text-tertiary">
                 Recommended: 1000-2000ms to avoid rate limiting
@@ -464,10 +464,10 @@ export default function BulkMessagePage() {
             </div>
 
             {/* Scheduling */}
-            <div className="space-y-3 p-4 border border-white/[0.07] rounded-xl bg-[#0a0a0a]">
+            <div className="space-y-3 p-4 border-[0.5px] border-[var(--border-default)] rounded-xl bg-[var(--bg-surface)]">
               <div className="flex items-center justify-between">
                 <div className="space-y-0.5">
-                  <Label className="text-[13px] font-semibold text-white">Schedule for later</Label>
+                  <Label className="text-[13px] font-semibold text-primary">Schedule for later</Label>
                   <p className="text-xs text-secondary">Pick a time to automatically start sending</p>
                 </div>
                 <Switch
@@ -483,7 +483,7 @@ export default function BulkMessagePage() {
                     value={scheduledAt}
                     onChange={(e) => setScheduledAt(e.target.value)}
                     min={new Date().toISOString().slice(0, 16)}
-                    className="bg-[#111111] border-white/[0.07] placeholder:text-tertiary text-white text-[14px] focus:ring-[#25D366]/20"
+                    className="bg-[var(--bg-surface)] border-[0.5px] border-[var(--border-default)] placeholder:text-hint text-primary text-[14px] focus-visible:border-[var(--accent-border)] focus-visible:ring-0"
                   />
                   <p className="text-xs text-orange-400 flex items-center gap-1">
                     <Clock className="h-3 w-3" />
@@ -540,9 +540,9 @@ export default function BulkMessagePage() {
             {contacts.length > 0 ? (
               <div className="space-y-2 max-h-80 overflow-y-auto">
                 {contacts.slice(0, 10).map((contact) => (
-                  <div key={contact.index} className="flex items-center justify-between p-3 bg-[#111111] rounded-xl border border-white/[0.07]">
+                  <div key={contact.index} className="flex items-center justify-between p-3 bg-[var(--bg-surface)] rounded-xl border-[0.5px] border-[var(--border-default)]">
                     <div>
-                      <p className="font-medium text-[13px] text-white">{contact.name || 'No name'}</p>
+                      <p className="font-medium text-[13px] text-primary">{contact.name || 'No name'}</p>
                       <p className="text-xs text-tertiary">{contact.phone}</p>
                     </div>
                     {contact.imageUrl && (
@@ -572,7 +572,7 @@ export default function BulkMessagePage() {
           {loadingCampaigns ? (
             <div className="space-y-3">
               {Array.from({ length: 3 }).map((_, i) => (
-                <div key={i} className="flex items-center justify-between p-4 border border-white/[0.07] rounded-xl">
+                <div key={i} className="flex items-center justify-between p-4 border border-[var(--border-default)] rounded-xl">
                   <div className="flex items-center space-x-4">
                     <Skeleton className="h-4 w-4 rounded-full" />
                     <div>
@@ -596,20 +596,20 @@ export default function BulkMessagePage() {
               {campaigns.map((campaign) => (
                 <div
                   key={campaign.campaign_id}
-                  className="flex items-center justify-between p-4 border border-white/[0.07] rounded-xl cursor-pointer hover:border-white/[0.14] hover:bg-white/[0.02] transition-apple"
+                  className="flex items-center justify-between p-4 border border-[var(--border-default)] rounded-xl cursor-pointer hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)] transition-apple"
                   onClick={() => router.push(`/dashboard/bulk-message/${campaign.campaign_id}`)}
                 >
                   <div className="flex items-center space-x-4">
                     {getStatusIcon(campaign.status)}
                     <div>
-                      <p className="font-medium text-[14px] text-white">{campaign.name}</p>
+                      <p className="font-medium text-[14px] text-primary">{campaign.name}</p>
                       <p className="text-xs text-secondary">
                         {campaign.status === 'scheduled' && campaign.scheduled_at ? (
                           <span className="text-orange-400 font-medium">
                             Scheduled: {new Date(campaign.scheduled_at).toLocaleString()}
                           </span>
                         ) : (
-                          <>Template: {campaign.template_name} • {new Date(campaign.created_at).toLocaleDateString()}</>
+                          <>Template: {campaign.template_name} - {new Date(campaign.created_at).toLocaleDateString()}</>
                         )}
                       </p>
                     </div>
@@ -660,3 +660,4 @@ export default function BulkMessagePage() {
     </div>
   )
 }
+

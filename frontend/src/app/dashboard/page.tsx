@@ -11,9 +11,7 @@ import {
   ArrowRight,
   CheckCircle,
   AlertCircle,
-  TrendingUp,
-  Activity,
-  BarChart3
+  TrendingUp
 } from 'lucide-react'
 
 interface UsageStats {
@@ -30,7 +28,6 @@ const products = [
     icon: MessageSquare,
     href: '/dashboard/file-forward',
     accentColor: '#25D366',
-    accentLight: 'rgba(37,211,102,0.08)',
   },
   {
     id: 'bulk-message',
@@ -39,7 +36,6 @@ const products = [
     icon: Users,
     href: '/dashboard/bulk-message',
     accentColor: '#a855f7',
-    accentLight: 'rgba(168,85,247,0.08)',
   },
   {
     id: 'chatbot',
@@ -48,7 +44,6 @@ const products = [
     icon: Bot,
     href: '/dashboard/chatbot',
     accentColor: '#f97316',
-    accentLight: 'rgba(249,115,22,0.08)',
   }
 ]
 
@@ -76,7 +71,7 @@ export default function DashboardPage() {
   }, [])
 
   return (
-    <div className="min-h-screen bg-black">
+    <div className="min-h-screen bg-page">
       {/* Hero Section */}
       <section className="relative px-6 py-16 md:py-24">
         <div className="max-w-4xl mx-auto text-center space-y-6">
@@ -86,7 +81,7 @@ export default function DashboardPage() {
           </p>
 
           {/* Headline */}
-          <h1 className="text-hero text-white">
+          <h1 className="text-hero">
             Automate your WhatsApp<br />
             communications at scale
           </h1>
@@ -100,12 +95,12 @@ export default function DashboardPage() {
           {/* CTA Buttons */}
           <div className="flex items-center justify-center gap-3 pt-4">
             <Link href="/dashboard/file-forward">
-              <button className="btn-pill px-6 py-2.5 bg-[#25D366] text-black text-sm font-semibold hover:opacity-88 transition-apple active:scale-98">
+              <button className="btn-pill px-6 py-2.5 bg-[var(--accent)] text-[var(--accent-contrast)] text-sm font-semibold hover:scale-[1.01] transition-apple active:scale-[0.99]">
                 Start Messaging
               </button>
             </Link>
             <Link href="/dashboard/settings">
-              <button className="btn-pill px-6 py-2.5 bg-white/[0.06] text-white text-sm font-semibold border border-white/[0.08] hover:bg-white/[0.08] transition-apple active:scale-98">
+              <button className="btn-pill px-6 py-2.5 bg-[var(--bg-elevated)] text-secondary text-sm font-semibold border-[0.5px] border-[var(--border-default)] hover:text-primary hover:scale-[1.01] transition-apple active:scale-[0.99]">
                 Configure API
               </button>
             </Link>
@@ -116,8 +111,8 @@ export default function DashboardPage() {
       {/* Stats Bar */}
       <section className="px-6 pb-8">
         <div className="max-w-6xl mx-auto">
-          <div className="bg-[#111111] rounded-2xl border-[0.5px] border-white/[0.10] overflow-hidden">
-            <div className="grid grid-cols-1 md:grid-cols-3 divide-y md:divide-y-0 md:divide-x divide-white/[0.06]">
+          <div className="bg-[var(--bg-card)] rounded-[var(--radius-xl)] border-[0.5px] border-[var(--border-default)] overflow-hidden">
+            <div className="grid grid-cols-1 md:grid-cols-3 divide-y md:divide-y-0 md:divide-x divide-[var(--border-subtle)]">
               {/* Today's Messages */}
               <div className="p-6 text-center">
                 {loading ? (
@@ -127,10 +122,10 @@ export default function DashboardPage() {
                   </div>
                 ) : (
                   <>
-                    <div className="text-[32px] font-bold text-white tracking-tight">
+                    <div className="text-stat-number">
                       {usage?.today.total ?? 0}
                     </div>
-                    <div className="text-label text-[rgba(255,255,255,0.60)] mt-1">
+                    <div className="text-label mt-1">
                       Today&apos;s Messages
                     </div>
                     <div className="flex items-center justify-center gap-1 mt-2">
@@ -151,10 +146,10 @@ export default function DashboardPage() {
                   </div>
                 ) : (
                   <>
-                    <div className="text-[32px] font-bold text-white tracking-tight">
+                    <div className="text-stat-number">
                       {usage?.month.total ?? 0}
                     </div>
-                    <div className="text-label text-[rgba(255,255,255,0.60)] mt-1">
+                    <div className="text-label mt-1">
                       This Month
                     </div>
                     <div className="flex items-center justify-center gap-1 mt-2">
@@ -175,12 +170,12 @@ export default function DashboardPage() {
                   </div>
                 ) : (
                   <>
-                    <div className="text-[32px] font-bold text-white tracking-tight">
+                    <div className="text-stat-number">
                       {usage?.month.total && usage?.month.successful
                         ? Math.round((usage.month.successful / usage.month.total) * 100)
                         : 100}%
                     </div>
-                    <div className="text-label text-[rgba(255,255,255,0.60)] mt-1">
+                    <div className="text-label mt-1">
                       Success Rate
                     </div>
                     <div className="flex items-center justify-center gap-1 mt-2">
@@ -207,16 +202,16 @@ export default function DashboardPage() {
       ) : isConfigured === false ? (
         <section className="px-6 pb-8">
           <div className="max-w-6xl mx-auto">
-            <div className="bg-[#1a1a1a] rounded-xl border border-[#2a2a2a] p-4 flex items-center justify-between">
+            <div className="bg-[var(--bg-elevated)] rounded-[var(--radius-lg)] border-[0.5px] border-[var(--border-default)] p-4 flex items-center justify-between">
               <div className="flex items-center gap-3">
                 <AlertCircle className="w-5 h-5 text-[#f97316]" />
                 <div>
-                  <p className="text-[14px] font-semibold text-white">WhatsApp not configured</p>
-                  <p className="text-[13px] text-[rgba(255,255,255,0.55)]">Configure your WhatsApp Business API to start sending messages</p>
+                  <p className="text-[14px] font-semibold text-primary">WhatsApp not configured</p>
+                  <p className="text-[13px] text-secondary">Configure your WhatsApp Business API to start sending messages</p>
                 </div>
               </div>
               <Link href="/dashboard/settings">
-                <button className="btn-pill px-4 py-2 text-[13px] font-semibold bg-white/[0.06] border border-white/[0.08] hover:bg-white/[0.08] transition-apple">
+                <button className="btn-pill px-4 py-2 text-[13px] font-semibold bg-[var(--bg-card)] border-[0.5px] border-[var(--border-default)] text-secondary hover:text-primary hover:scale-[1.01] transition-apple">
                   Configure Now
                 </button>
               </Link>
@@ -226,9 +221,9 @@ export default function DashboardPage() {
       ) : isConfigured === true ? (
         <section className="px-6 pb-8">
           <div className="max-w-6xl mx-auto">
-            <div className="bg-[#0a1a0f] rounded-xl border border-[#1a3a2a] p-4 flex items-center gap-3">
+            <div className="bg-[var(--bg-surface)] rounded-[var(--radius-lg)] border-[0.5px] border-[var(--accent-border)] p-4 flex items-center gap-3">
               <CheckCircle className="w-5 h-5 text-[#25D366]" />
-              <p className="text-[14px] font-semibold text-white">WhatsApp Business API connected and ready</p>
+              <p className="text-[14px] font-semibold text-primary">WhatsApp Business API connected and ready</p>
             </div>
           </div>
         </section>
@@ -240,7 +235,7 @@ export default function DashboardPage() {
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {loading
               ? Array.from({ length: 3 }).map((_, i) => (
-                  <div key={i} className="bg-card-apple rounded-2xl border border-white/[0.07] p-6">
+                  <div key={i} className="bg-card-apple rounded-[var(--radius-xl)] border-[0.5px] border-[var(--border-subtle)] p-6">
                     <Skeleton className="w-11 h-11 rounded-xl mb-4" />
                     <Skeleton className="h-5 w-48 mb-2" />
                     <Skeleton className="h-4 w-full mb-1" />
@@ -252,11 +247,10 @@ export default function DashboardPage() {
                   const Icon = product.icon
                   return (
                     <Link key={product.id} href={product.href}>
-                      <div className="group bg-card-apple rounded-2xl border border-white/[0.07] p-6 hover:border-white/[0.14] hover:bg-elevated transition-apple h-full">
+                      <div className="group bg-card-apple rounded-[var(--radius-xl)] border-[0.5px] border-[var(--border-subtle)] p-6 hover:border-[var(--border-strong)] hover:bg-elevated transition-apple h-full">
                         {/* Icon */}
                         <div
-                          className="w-11 h-11 rounded-xl flex items-center justify-center mb-4"
-                          style={{ backgroundColor: product.accentLight }}
+                          className="w-11 h-11 rounded-[var(--radius-md)] flex items-center justify-center mb-4 bg-[var(--bg-elevated)] border-[0.5px] border-[var(--border-subtle)]"
                         >
                           <Icon
                             className="w-5 h-5"
@@ -266,7 +260,7 @@ export default function DashboardPage() {
 
                         {/* Badge */}
                         <div className="flex items-center justify-between mb-3">
-                          <h3 className="text-card-title text-white">
+                          <h3 className="text-card-title">
                             {product.title}
                           </h3>
                         </div>
